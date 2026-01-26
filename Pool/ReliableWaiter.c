@@ -46,6 +46,7 @@ struct FastRingDescriptor* SubmitReliableWaiter(struct FastRing* ring, struct Re
 void CancelReliableWaiter(struct FastRingDescriptor* descriptor)
 {
   if ((descriptor != NULL) &&
+      (descriptor->function == HandleWaiterCompletion) &&
       (descriptor->submission.opcode == IORING_OP_FUTEX_WAIT))
   {
     descriptor->function = NULL;
