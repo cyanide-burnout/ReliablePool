@@ -20,8 +20,6 @@ ReliablePool is a memory/pool subsystem designed around long-lived, stable memor
 
 ReliablePool is commonly used together with:
 
-ReliablePool is commonly used together with:
-
 - **ReliableMonitor** — a pluggable monitor/replication chain (supports multiple providers):
   - **ReliableIndexer** — indexes blocks and pools for cross-host replication providers.
   - **ReliableTracker** — tracks modified pages via `userfaultfd` write-protection (WP) and maintains a dirty bitmap; flushes in an idempotent state; can notify monitors about changes:
