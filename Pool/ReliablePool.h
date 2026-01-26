@@ -32,7 +32,7 @@ extern "C"
 #define RELIABLE_TYPE_RECOVERABLE      1
 #define RELIABLE_TYPE_NON_RECOVERABLE  2
 
-#define RELIABLE_FLAG_RESET  (1 << 0)
+#define RELIABLE_FLAG_RESET  (1UL << 0)
 
 #define RELIABLE_MONITOR_POOL_CREATE     0
 #define RELIABLE_MONITOR_POOL_RELEASE    1
@@ -46,6 +46,9 @@ extern "C"
 #define RELIABLE_MONITOR_BLOCK_FREE      9
 
 #define RELIABLE_MONITOR_CLOSURE_COUNT  4
+
+#define RELIABLE_WEIGHT_WEAK    (1UL << 0)
+#define RELIABLE_WEIGHT_STRONG  (1UL << 32)
 
 struct ReliablePool;
 struct ReliableShare;
@@ -84,7 +87,7 @@ struct ReliableShare
 {
   struct ReliableMemory* memory;                   // mmap-ed address
   size_t size;                                     // mmap-ed memory size
-  ATOMIC(uint64_t) count;                          // Count of references
+  ATOMIC(uint64_t) weight;                         // Weight of references
   void* closures[RELIABLE_MONITOR_CLOSURE_COUNT];  // Reserved for monitor/replicator
 };
 
@@ -103,7 +106,7 @@ struct ReliablePool
   size_t grain;                                    // Growth of expansion
   struct ReliableShare* share;                     // Active memory share
   pthread_rwlock_t lock;                           // Lock for expand operation
-  ATOMIC(uint64_t) count;                          // Count of references
+  ATOMIC(uint32_t) count;                          // Count of references
   ATOMIC(struct ReliableMonitor*) monitor;         // First monitor
   void* closures[RELIABLE_MONITOR_CLOSURE_COUNT];  // Reserved for monitor/replicator
 };

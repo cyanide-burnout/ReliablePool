@@ -97,10 +97,12 @@ int main(int count, char** arguments)
   struct ReliableMonitor monitor;
   struct ReliableTracker* tracker;
   struct ReliableIndexer* indexer;
+  struct InstantReplicator* replicator;
 
   struct FastRing* ring;
   struct FastRingDescriptor* waiter;
   struct FastRingDescriptor* timeout;
+  struct InstantDiscovery* discovery;
 
   AvahiPoll* poll;
 
@@ -117,15 +119,38 @@ int main(int count, char** arguments)
 
   monitor.function = HandleMonitorEvent;
 
-  handle  = memfd_create("Test", MFD_CLOEXEC);
-  indexer = CreateReliableIndexer(&monitor);
-  tracker = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
-  pool    = CreateReliablePool(handle, "Test", 50, 0, &tracker->super, NULL, NULL);
+  handle     = memfd_create("Test", MFD_CLOEXEC);
+  replicator = CreateInstantReplicator(0, "Test", "Secret", &monitor);
+  indexer    = CreateReliableIndexer(&replicator->super);
+  tracker    = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
+  pool       = CreateReliablePool(handle, "Test", 50, 0, &tracker->super, NULL, NULL);
 
-  ring    = CreateFastRing(0);
-  poll    = CreateFastAvahiPoll(ring);
-  waiter  = SubmitReliableWaiter(ring, tracker);
-  timeout = SetFastRingTimeout(ring, NULL, 100, TIMEOUT_FLAG_REPEAT, HandleTimeoutCompletion, pool);
+  ring      = CreateFastRing(0);
+  poll      = CreateFastAvahiPoll(ring);
+  waiter    = SubmitReliableWaiter(ring, tracker);
+  discovery = CreateInstantDiscovery(poll, replicator);
+  timeout   = SetFastRingTimeout(ring, NULL, 100, TIMEOUT_FLAG_REPEAT, HandleTimeoutCompletion, pool);
+
+  if (~atomic_load_explicit(&tracker->state, memory_order_relaxed) & RELIABLE_TRACKER_STATE_ACTIVE)
+  {
+    printf(
+      "It seems like the process has not enough capabilities to use ReliableTracker\n"
+      "Please execute 'sudo setcap cap_sys_ptrace=ep %s' or run under root\n\n",
+      arguments[0]);
+    atomic_store_explicit(&state, 0, memory_order_relaxed);
+  }
+
+  if (replicator->listener == NULL)
+  {
+    printf("Failed to open RDMA port\n\n");
+    atomic_store_explicit(&state, 0, memory_order_relaxed);
+  }
+
+  if (discovery == NULL)
+  {
+    printf("Failed to create avahi-client\n\n");
+    atomic_store_explicit(&state, 0, memory_order_relaxed);
+  }
 
   printf("Started\n");
 
@@ -134,7 +159,10 @@ int main(int count, char** arguments)
 
   printf("Stopped\n");
 
+  FlushReliableTracker(tracker);
+
   SetFastRingTimeout(ring, timeout, -1, 0, NULL, NULL);
+  ReleaseInstantDiscovery(discovery);
   CancelReliableWaiter(waiter);
   ReleaseFastAvahiPoll(poll);
   ReleaseFastRing(ring);
@@ -142,6 +170,7 @@ int main(int count, char** arguments)
   ReleaseReliablePool(pool);
   ReleaseReliableTracker(tracker);
   ReleaseReliableIndexer(indexer);
+  ReleaseInstantReplicator(replicator);
   close(handle);
 
   return 0;

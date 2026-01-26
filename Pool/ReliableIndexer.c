@@ -7,14 +7,14 @@
 
 _Static_assert(offsetof(struct ReliableIndexer, super) == 0, "ReliableIndexer must embed ReliableMonitor as first field");
 
-static const char* ReliableIndexerName = "ReliableIndexer";
+static const char* MonitorName = "ReliableIndexer";
 
-static void ReleaseReliableIndexKey(void* key, void* data)
+static void ReleaseIndexKey(void* key, void* data)
 {
   free(key);
 }
 
-static int CompareReliableIndexKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2)
+static int CompareIndexKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2)
 {
   return memcmp(key1, key2, sizeof(struct ReliableIndexKey));
 }
@@ -24,7 +24,7 @@ static void ReleaseReliableIndexRecord(struct RedBlackTree* tree, void* value)
   free(value);
 }
 
-static int AddReliablePool(struct ReliableIndexer* indexer, struct ReliablePool* pool, struct ReliableShare* share)
+static int AddPool(struct ReliableIndexer* indexer, struct ReliablePool* pool, struct ReliableShare* share)
 {
   struct ReliableMemory* memory;
   int result;
@@ -51,7 +51,7 @@ static int AddReliablePool(struct ReliableIndexer* indexer, struct ReliablePool*
   return result;
 }
 
-static void RemoveReliablePool(struct ReliableIndexer* indexer, struct ReliablePool* pool, struct ReliableShare* share)
+static void RemovePool(struct ReliableIndexer* indexer, struct ReliablePool* pool, struct ReliableShare* share)
 {
   struct ReliableMemory* memory;
 
@@ -62,7 +62,7 @@ static void RemoveReliablePool(struct ReliableIndexer* indexer, struct ReliableP
   pthread_rwlock_unlock(&indexer->lock);
 }
 
-static int AddReliableBlock(struct ReliableIndexer* indexer, struct ReliableShare* share, struct ReliableBlock* block)
+static int AddBlock(struct ReliableIndexer* indexer, struct ReliableShare* share, struct ReliableBlock* block)
 {
   struct ReliableIndexRecord* record;
   struct ReliableMemory* memory;
@@ -92,7 +92,7 @@ static int AddReliableBlock(struct ReliableIndexer* indexer, struct ReliableShar
   return result;
 }
 
-static void RemoveReliableBlock(struct ReliableIndexer* indexer, struct ReliableShare* share, struct ReliableBlock* block)
+static void RemoveBlock(struct ReliableIndexer* indexer, struct ReliableShare* share, struct ReliableBlock* block)
 {
   struct ReliableIndexKey key;
   struct ReliableMemory* memory;
@@ -108,7 +108,7 @@ static void RemoveReliableBlock(struct ReliableIndexer* indexer, struct Reliable
   pthread_rwlock_unlock(&indexer->lock);
 }
 
-static void RemoveReliableBlockList(struct ReliableIndexer* indexer, struct ReliableShare* share)
+static void RemoveBlockList(struct ReliableIndexer* indexer, struct ReliableShare* share)
 {
   struct ReliableIndexKey key;
   struct ReliableMemory* memory;
@@ -132,7 +132,7 @@ static void RemoveReliableBlockList(struct ReliableIndexer* indexer, struct Reli
   pthread_rwlock_unlock(&indexer->lock);
 }
 
-static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
+static void HandlePoolEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
 {
   struct ReliableIndexer* indexer;
 
@@ -141,12 +141,12 @@ static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct
   switch (event)
   {
     case RELIABLE_MONITOR_POOL_CREATE:
-      AddReliablePool(indexer, pool, share);
+      AddPool(indexer, pool, share);
       break;
 
     case RELIABLE_MONITOR_POOL_RELEASE:
-      RemoveReliableBlockList(indexer, share);
-      RemoveReliablePool(indexer, pool, share);
+      RemoveBlockList(indexer, share);
+      RemovePool(indexer, pool, share);
       break;
 
     case RELIABLE_MONITOR_BLOCK_ALLOCATE:
@@ -154,12 +154,12 @@ static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct
 
     case RELIABLE_MONITOR_BLOCK_RECOVER:
     case RELIABLE_MONITOR_BLOCK_RESERVE:
-      AddReliableBlock(indexer, share, block);
+      AddBlock(indexer, share, block);
       break;
 
     case RELIABLE_MONITOR_BLOCK_RELEASE:
     case RELIABLE_MONITOR_BLOCK_FREE:
-      RemoveReliableBlock(indexer, share, block);
+      RemoveBlock(indexer, share, block);
       break;
   }
 }
@@ -172,11 +172,11 @@ struct ReliableIndexer* CreateReliableIndexer(struct ReliableMonitor* next)
   {
     indexer->super.next     = next;
     indexer->super.closure  = indexer;
-    indexer->super.function = HandleReliablePoolEvent;
-    indexer->super.name     = ReliableIndexerName;
+    indexer->super.function = HandlePoolEvent;
+    indexer->super.name     = MonitorName;
 
-    indexer->map  = CreateHashMap(ReleaseReliableIndexKey);
-    indexer->tree = CreateRedBlackTree(CompareReliableIndexKeys, ReleaseReliableIndexRecord, indexer);
+    indexer->map  = CreateHashMap(ReleaseIndexKey);
+    indexer->tree = CreateRedBlackTree(CompareIndexKeys, ReleaseReliableIndexRecord, indexer);
 
     pthread_rwlock_init(&indexer->lock, NULL);
   }
@@ -191,7 +191,7 @@ struct ReliableIndexer* GetReliableIndexer(struct ReliablePool* pool)
   monitor = atomic_load_explicit(&pool->monitor, memory_order_relaxed);
 
   while ((monitor       != NULL) &&
-         (monitor->name != ReliableIndexerName))
+         (monitor->name != MonitorName))
   {
     //
     monitor = monitor->next;
@@ -267,7 +267,7 @@ uint32_t* CollectReliableBlockList(struct ReliableIndexer* indexer, struct Relia
   pthread_rwlock_rdlock(&pool->lock);
   share  = pool->share;
   memory = share->memory;
-  atomic_fetch_add_explicit(&share->count, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&share->weight, RELIABLE_WEIGHT_WEAK, memory_order_relaxed);
   pthread_rwlock_unlock(&pool->lock);
 
   memset(&key, 0, sizeof(struct ReliableIndexKey));
@@ -308,12 +308,7 @@ uint32_t* CollectReliableBlockList(struct ReliableIndexer* indexer, struct Relia
 
   pthread_rwlock_unlock(&indexer->lock);
 
-  if (atomic_fetch_sub_explicit(&share->count, 1, memory_order_relaxed) == 1)
-  {
-    CallReliableMonitor(RELIABLE_MONITOR_SHARE_DESTROY, pool, share, NULL);
-    munmap(share->memory, share->size);
-    free(share);
-  }
+  ReleaseReliableShare(share);
 
   return list;
 }

@@ -120,12 +120,23 @@ int main(int count, char** arguments)
   waiter  = SubmitReliableWaiter(ring, tracker);
   timeout = SetFastRingTimeout(ring, NULL, 100, TIMEOUT_FLAG_REPEAT, HandleTimeoutCompletion, pool);
 
+  if (~atomic_load_explicit(&tracker->state, memory_order_relaxed) & RELIABLE_TRACKER_STATE_ACTIVE)
+  {
+    printf(
+      "It seems like the process has not enough capabilities to use ReliableTracker\n"
+      "Please execute 'sudo setcap cap_sys_ptrace=ep %s' or run under root\n",
+      arguments[0]);
+    atomic_store_explicit(&state, 0, memory_order_relaxed);
+  }
+
   printf("Started\n");
 
   while ((atomic_load_explicit(&state, memory_order_relaxed) == STATE_RUNNING) &&
          (WaitForFastRing(ring, 200, NULL) >= 0));
 
   printf("Stopped\n");
+
+  FlushReliableTracker(tracker);
 
   SetFastRingTimeout(ring, timeout, -1, 0, NULL, NULL);
   CancelReliableWaiter(waiter);
