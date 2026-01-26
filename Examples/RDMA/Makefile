@@ -27,6 +27,8 @@ OBJECTS := \
 	../../Pool/ReliableTracker.o \
 	../../Pool/ReliableIndexer.o \
 	../../Pool/ReliableWaiter.o \
+	../../Pool/InstantDiscovery.o \
+	../../Pool/InstantReplicator.o \
 	Test.o
 
 FLAGS += \

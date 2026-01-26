@@ -1,61 +1,80 @@
+#define _GNU_SOURCE
+
+#include <malloc.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/mman.h>
+
+#include "FastRing.h"
+#include "FastAvahiPoll.h"
 
 #include "ReliablePool.h"
+#include "ReliableTracker.h"
+#include "ReliableIndexer.h"
+#include "ReliableWaiter.h"
 
-int recover(struct ReliablePool* pool, struct ReliableBlock* block, void* closure)
+#include "InstantReplicator.h"
+#include "InstantDiscovery.h"
+
+#define STATE_RUNNING  -1
+
+atomic_int state = { STATE_RUNNING };
+
+static void HandleSignal(int signal)
 {
-  char* buffer;
-  struct ReliableDescriptor desc;
-
-  buffer = (char*)RecoverReliableBlock(&desc, pool, block);
-
-  printf("Recover block: %s\n", buffer);
-  *((int*)closure) += 1;
-
-  return RELIABLE_TYPE_RECOVERABLE;
+  // Interrupt main loop in case of interruption signal
+  atomic_store_explicit(&state, 0, memory_order_relaxed);
 }
 
 int main(int count, char** arguments)
 {
+  struct sigaction action;
+
   int handle;
-  int number;
-  char* buffer;
   struct ReliablePool* pool;
-  struct ReliableDescriptor desc[10000];
+  struct ReliableTracker* tracker;
+  struct ReliableIndexer* indexer;
 
-  number = 0;
-  handle = open("test.dat", O_RDWR | O_CREAT, 0666);
-  pool   = CreateReliablePool(handle, "Test", 100, RELIABLE_FLAG_RESET, NULL, recover, &number);
+  struct FastRing* ring;
+  struct FastRingDescriptor* waiter;
 
-  if (pool == NULL)
-  {
-    printf("Error opening pool\n");
-    return 1;
-  }
+  AvahiPoll* poll;
 
-  printf("Pool size=%lld, recovered=%d\n", pool->share->memory->length, number);
+  action.sa_handler = HandleSignal;
+  action.sa_flags   = SA_NODEFER | SA_RESTART;
 
-  number = 0;
-  while (number < 400)
-  {
-  	buffer = (char*)AllocateReliableBlock(desc + number, pool, RELIABLE_TYPE_RECOVERABLE);
-  	sprintf(buffer, "data=%d pid=%d", number, getpid());
+  sigemptyset(&action.sa_mask);
 
-  	// printf("number=%d share=%p\n", number, desc[number].share);
-  	number ++;
-  }
+  sigaction(SIGHUP,  &action, NULL);
+  sigaction(SIGINT,  &action, NULL);
+  sigaction(SIGTERM, &action, NULL);
+  sigaction(SIGQUIT, &action, NULL);
 
-  number = 0;
-  while (number < 10)
-  {
-  	ReleaseReliableBlock(desc + number, RELIABLE_TYPE_FREE);
-  	number ++;
-  }
+  handle  = memfd_create("Test", MFD_CLOEXEC);
+  indexer = CreateReliableIndexer(NULL);
+  tracker = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
+  pool    = CreateReliablePool(handle, "Test", 100, 0, &tracker->super, NULL, NULL);
+
+  ring   = CreateFastRing(0);
+  poll   = CreateFastAvahiPoll(ring);
+  waiter = SubmitReliableWaiter(ring, tracker);
+
+  printf("Started\n");
+
+  while ((atomic_load_explicit(&state, memory_order_relaxed) == STATE_RUNNING) &&
+         (WaitForFastRing(ring, 200, NULL) >= 0));
+
+  printf("Stopped\n");
+
+  CancelReliableWaiter(waiter);
+  ReleaseFastAvahiPoll(poll);
+  ReleaseFastRing(ring);
 
   ReleaseReliablePool(pool);
-  fsync(handle);
+  ReleaseReliableTracker(tracker);
+  ReleaseReliableIndexer(indexer);
   close(handle);
+
   return 0;
 }
