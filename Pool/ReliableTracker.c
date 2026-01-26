@@ -465,6 +465,7 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
 {
   struct uffdio_writeprotect protection;
   struct ReliableTrackable* trackable;
+  struct ReliablePool* pool;
   struct timespec time;
   ptrdiff_t delta;
   uint64_t epoch;
@@ -478,6 +479,7 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
   {
     memset(&protection, 0, sizeof(struct uffdio_writeprotect));
 
+    pool  = NULL;
     epoch = MakeReliableEpoch(tracker);
 
     pthread_rwlock_rdlock(&tracker->lock);
@@ -488,6 +490,7 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
       {
         if (mask = atomic_exchange_explicit(trackable->map + index, 0ULL, memory_order_relaxed))
         {
+          pool                    = trackable->pool;
           protection.mode         = UFFDIO_WRITEPROTECT_MODE_WP;
           protection.range.start  = trackable->range.start + tracker->size * index * 64;
           protection.range.len    = tracker->size << 6;
@@ -514,7 +517,12 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
 
     pthread_rwlock_unlock(&tracker->lock);
 
-    CallReliableMonitor(RELIABLE_MONITOR_FLUSH_COMMIT, NULL, NULL, NULL);
+    if (pool != NULL)
+    {
+      // Two shots in one: [1] at least one trackable has been changed, [2] the pool is being reused reused to make CallReliableMonitor()
+      CallReliableMonitor(RELIABLE_MONITOR_FLUSH_COMMIT, pool, NULL, NULL);
+    }
+
     return 0;
   }
 

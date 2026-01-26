@@ -48,6 +48,7 @@ all: build
 
 build: $(PREREQUISITES) $(OBJECTS)
 	$(CC) $(OBJECTS) $(FLAGS) $(LIBS) -o $(EXECUTABLE)
+	sudo setcap cap_sys_ptrace=ep ./$(EXECUTABLE)
 
 clean:
 	rm -f $(EXECUTABLE) $(OBJECTS) $(wildcard $(filter %.d,$(OBJECTS:.o=.d)))
