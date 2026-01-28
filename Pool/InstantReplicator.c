@@ -8,15 +8,12 @@
 
 static void AddMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
 {
-  struct ibv_mr* region;
+  pthread_mutex_lock(&replicator->lock);
 
-  if ((replicator->protection != NULL) &&
-      (share->closures[1]     == NULL) &&
-      (region = ibv_reg_mr(replicator->protection, share->memory, share->size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ)))
-  {
-    //
-    share->closures[1] = region;
-  }
+  share->closures[1] = ibv_reg_mr(replicator->protection, share->memory, share->size,
+    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+ 
+  pthread_mutex_unlock(&replicator->lock);
 }
 
 static void RemoveMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
@@ -25,7 +22,7 @@ static void RemoveMemoryRegion(struct InstantReplicator* replicator, struct Reli
 
   if (region = (struct ibv_mr*)share->closures[1])
   {
-    share->closures[1] = NULL;
+    // ibv_dereg_mr() has no NULL-tollerance
     ibv_dereg_mr(region);
   }
 }
@@ -35,6 +32,12 @@ static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct
   struct InstantReplicator* replicator;
 
   replicator = (struct InstantReplicator*)closure;
+
+  if (replicator->protection == NULL)
+  {
+    //
+    return;
+  }
 
   switch (event)
   {
@@ -48,7 +51,6 @@ static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct
       RemoveMemoryRegion(replicator, share);
       break;
   }
-
 }
 
 struct InstantReplicator* CreateInstantReplicator(int port, const char* name, const char* secret, struct ReliableMonitor* next)
@@ -68,6 +70,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, const char* name, co
     replicator->name           = strdup(name);
 
     uuid_generate(replicator->identifier);
+    pthread_mutex_init(&replicator->lock, NULL);
 
     snprintf(service, sizeof(service), "%d", port);
     memset(&hint, 0, sizeof(struct rdma_addrinfo));
@@ -108,6 +111,7 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
     if (replicator->protection != NULL)  ibv_dealloc_pd(replicator->protection);
     if (replicator->listener   != NULL)  rdma_destroy_ep(replicator->listener);
     if (replicator->channel    != NULL)  rdma_destroy_event_channel(replicator->channel);
+    pthread_mutex_destroy(&replicator->lock);
     free(replicator->secret);
     free(replicator->name);
     free(replicator);

@@ -21,6 +21,7 @@ struct InstantReplicator
   struct rdma_cm_id* listener;
   struct ibv_context* context;
   struct ibv_pd* protection;
+  pthread_mutex_t lock;
 
   char* name;
   char* secret;
