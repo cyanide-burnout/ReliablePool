@@ -22,7 +22,7 @@ static void RemoveMemoryRegion(struct InstantReplicator* replicator, struct Reli
 
   if (region = (struct ibv_mr*)share->closures[1])
   {
-    // ibv_dereg_mr() has no NULL-tollerance
+    // ibv_dereg_mr() has no NULL-tolerance
     ibv_dereg_mr(region);
   }
 }

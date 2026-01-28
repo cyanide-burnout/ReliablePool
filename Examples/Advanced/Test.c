@@ -136,6 +136,8 @@ int main(int count, char** arguments)
 
   printf("Stopped\n");
 
+  FlushReliableTracker(tracker);
+
   SetFastRingTimeout(ring, timeout, -1, 0, NULL, NULL);
   CancelReliableWaiter(waiter);
   ReleaseFastRing(ring);

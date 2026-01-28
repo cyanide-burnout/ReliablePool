@@ -24,7 +24,7 @@ static inline int CallIOCTL(int handle, unsigned long code, void* parameter)
   return result;
 }
 
-static inline uint64_t MakeReliableEpoch(struct ReliableTracker* tracker)
+static inline uint64_t MakeEpoch(struct ReliableTracker* tracker)
 {
   uint64_t last;
   uint64_t number;
@@ -53,7 +53,7 @@ static inline uint64_t MakeReliableEpoch(struct ReliableTracker* tracker)
   return result;
 }
 
-static inline void WakeReliableListner(struct ReliableTracker* tracker)
+static inline void WakeListner(struct ReliableTracker* tracker)
 {
   if (~atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_KICK, memory_order_release) & RELIABLE_TRACKER_STATE_KICK)
   {
@@ -63,7 +63,7 @@ static inline void WakeReliableListner(struct ReliableTracker* tracker)
   }
 }
 
-static void AddReliableShareCopy(struct ReliableTracker* tracker, struct ReliablePool* pool, struct ReliableShare* share)
+static void AddShareCopy(struct ReliableTracker* tracker, struct ReliablePool* pool, struct ReliableShare* share)
 {
   struct ReliableShare* old;
   struct ReliableShare* new;
@@ -82,7 +82,7 @@ static void AddReliableShareCopy(struct ReliableTracker* tracker, struct Reliabl
   atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE, memory_order_relaxed);
 }
 
-static void RemoveReliableShareCopy(struct ReliableTracker* tracker, struct ReliablePool* pool)
+static void RemoveShareCopy(struct ReliableTracker* tracker, struct ReliablePool* pool)
 {
   struct ReliableShare* share;
 
@@ -94,7 +94,7 @@ static void RemoveReliableShareCopy(struct ReliableTracker* tracker, struct Reli
   ReleaseReliableShare(share);
 }
 
-static void AddReliableTrackable(struct ReliableTracker* tracker, struct ReliablePool* pool, struct ReliableShare* share)
+static void AddTrackable(struct ReliableTracker* tracker, struct ReliablePool* pool, struct ReliableShare* share)
 {
   struct uffdio_writeprotect protection;
   struct uffdio_register registration;
@@ -136,6 +136,8 @@ static void AddReliableTrackable(struct ReliableTracker* tracker, struct Reliabl
       return;
     }
 
+    atomic_fetch_add_explicit(&share->weight, RELIABLE_WEIGHT_WEAK, memory_order_relaxed);
+
     pthread_rwlock_wrlock(&tracker->lock);
     if (other = tracker->list)
     {
@@ -152,7 +154,7 @@ static void AddReliableTrackable(struct ReliableTracker* tracker, struct Reliabl
   atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE, memory_order_relaxed);
 }
 
-static void RemoveReliableTrackable(struct ReliableTracker* tracker, struct ReliablePool* pool, struct ReliableShare* share)
+static void RemoveTrackable(struct ReliableTracker* tracker, struct ReliablePool* pool, struct ReliableShare* share)
 {
   struct ReliableTrackable* trackable;
   struct ReliableTrackable* other;
@@ -162,6 +164,7 @@ static void RemoveReliableTrackable(struct ReliableTracker* tracker, struct Reli
   {
     share->closures[0] = NULL;
     result             = CallIOCTL(tracker->handle, UFFDIO_UNREGISTER, &trackable->range);
+    atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE * (result < 0), memory_order_relaxed);
 
     pthread_rwlock_wrlock(&tracker->lock);
     if (other = trackable->next)      other->previous = trackable->previous;
@@ -169,12 +172,12 @@ static void RemoveReliableTrackable(struct ReliableTracker* tracker, struct Reli
     else                              tracker->list   = trackable->next;
     pthread_rwlock_unlock(&tracker->lock);
 
-    atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE * (result < 0), memory_order_relaxed);
+    ReleaseReliableShare(share);
     free(trackable);
   }
 }
 
-static void RemoveAllReliableTrackable(struct ReliableTracker* tracker, struct ReliablePool* pool)
+static void RemoveAllTrackable(struct ReliableTracker* tracker, struct ReliablePool* pool)
 {
   struct ReliableTrackable* trackable;
   struct ReliableTrackable* previous;
@@ -212,13 +215,14 @@ static void RemoveAllReliableTrackable(struct ReliableTracker* tracker, struct R
   {
     next   = trackable->next;
     result = CallIOCTL(tracker->handle, UFFDIO_UNREGISTER, &trackable->range);
-
     atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE * (result < 0), memory_order_relaxed);
+
+    ReleaseReliableShare(trackable->share);
     free(trackable);
   }
 }
 
-static int HandleTrackedPageFault(struct ReliableTracker* tracker, uintptr_t address)
+static int HandleFaultyPage(struct ReliableTracker* tracker, uintptr_t address)
 {
   struct ReliableTrackable* trackable;
   size_t page;
@@ -236,7 +240,7 @@ static int HandleTrackedPageFault(struct ReliableTracker* tracker, uintptr_t add
       page = (address - (uintptr_t)trackable->range.start) / tracker->size;
       atomic_fetch_or_explicit(trackable->map + (page >> 6), 1ULL << (page & 63), memory_order_relaxed);
 
-      WakeReliableListner(tracker);
+      WakeListner(tracker);
       CallReliableMonitor(RELIABLE_MONITOR_SHARE_CHANGE, trackable->pool, trackable->share, NULL);
 
       result =
@@ -251,7 +255,7 @@ static int HandleTrackedPageFault(struct ReliableTracker* tracker, uintptr_t add
   return result;
 }
 
-static void HandleDurtyTrackedBlock(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, struct ReliableBlock* block, uint64_t epoch)
+static void HandleDurtyBlock(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, struct ReliableBlock* block, uint64_t epoch)
 {
   struct ReliableShare* share;
   struct ReliablePool* pool;
@@ -282,7 +286,7 @@ static void HandleDurtyTrackedBlock(struct ReliableTracker* tracker, struct Reli
   }
 }
 
-static void HandleDurtyTrackedPage(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, uintptr_t page, uint64_t epoch)
+static void HandleDurtyPage(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, uintptr_t page, uint64_t epoch)
 {
   struct ReliableMemory* memory;
   struct ReliableBlock* block;
@@ -312,12 +316,12 @@ static void HandleDurtyTrackedPage(struct ReliableTracker* tracker, struct Relia
            (number <  limit))
     {
       block = (struct ReliableBlock*)(memory->data + memory->size * (size_t)(number ++));
-      HandleDurtyTrackedBlock(tracker, trackable, block, epoch);
+      HandleDurtyBlock(tracker, trackable, block, epoch);
     }
   }
 }
 
-static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
+static void HandlePoolEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
 {
   struct ReliableTracker* tracker;
 
@@ -329,17 +333,13 @@ static void HandleReliablePoolEvent(int event, struct ReliablePool* pool, struct
     {
       case RELIABLE_MONITOR_POOL_CREATE:
       case RELIABLE_MONITOR_SHARE_CREATE:
-        AddReliableShareCopy(tracker, pool, share);
-        AddReliableTrackable(tracker, pool, share);
+        AddShareCopy(tracker, pool, share);
+        AddTrackable(tracker, pool, share);
         break;
 
       case RELIABLE_MONITOR_POOL_RELEASE:
-        RemoveAllReliableTrackable(tracker, pool);
-        RemoveReliableShareCopy(tracker, pool);
-        break;
-
-      case RELIABLE_MONITOR_SHARE_DESTROY:
-        RemoveReliableTrackable(tracker, pool, share);
+        RemoveAllTrackable(tracker, pool);
+        RemoveShareCopy(tracker, pool);
         break;
     }
   }
@@ -378,7 +378,7 @@ static void* DoWork(void* closure)
           (message.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP))
       {
         protection.range.start = (uintptr_t)message.arg.pagefault.address & ~(uintptr_t)(tracker->size - 1);
-        if ((HandleTrackedPageFault(tracker, protection.range.start) != 0) &&
+        if ((HandleFaultyPage(tracker, protection.range.start) != 0) &&
             (CallIOCTL(tracker->handle, UFFDIO_WRITEPROTECT, &protection) < 0))
         {
           // Unlock failed
@@ -405,7 +405,7 @@ struct ReliableTracker* CreateReliableTracker(uint32_t flags, struct ReliableMon
     process                 = getpid();
     tracker->super.next     = next;
     tracker->super.closure  = tracker;
-    tracker->super.function = HandleReliablePoolEvent;
+    tracker->super.function = HandlePoolEvent;
 
     if (flags & RELIABLE_TRACKER_FLAG_ID_HOST)     tracker->node = GetCRC32C((uint8_t*)&identifier, sizeof(sd_id128_t), tracker->node);
     if (flags & RELIABLE_TRACKER_FLAG_ID_PROCESS)  tracker->node = GetCRC32C((uint8_t*)&process, sizeof(pid_t), tracker->node);
@@ -451,7 +451,9 @@ void ReleaseReliableTracker(struct ReliableTracker* tracker)
     while (trackable = tracker->list)
     {
       tracker->list = trackable->next;
+
       CallIOCTL(tracker->handle, UFFDIO_UNREGISTER, &trackable->range);
+      ReleaseReliableShare(trackable->share);
       free(trackable);
     }
 
@@ -465,14 +467,18 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
 {
   struct uffdio_writeprotect protection;
   struct ReliableTrackable* trackable;
+  struct ReliableTrackable* previous;
+  struct ReliableTrackable* next;
+  struct ReliableTrackable* list;
+  struct ReliableShare* share;
   struct ReliablePool* pool;
-  struct timespec time;
   ptrdiff_t delta;
+  uint32_t count;
   uint64_t epoch;
-  uint64_t store;
   uint64_t mask;
   size_t index;
   size_t page;
+  int result;
 
   if ((tracker != NULL) &&
       (atomic_fetch_and_explicit(&tracker->state, ~RELIABLE_TRACKER_STATE_KICK, memory_order_relaxed) & RELIABLE_TRACKER_STATE_KICK))
@@ -480,7 +486,11 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
     memset(&protection, 0, sizeof(struct uffdio_writeprotect));
 
     pool  = NULL;
-    epoch = MakeReliableEpoch(tracker);
+    list  = NULL;
+    count = 0;
+    epoch = MakeEpoch(tracker);
+
+    // Scan for changes
 
     pthread_rwlock_rdlock(&tracker->lock);
 
@@ -509,18 +519,68 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
             mask &= mask - 1;
             page += index << 6;
 
-            HandleDurtyTrackedPage(tracker, trackable, page, epoch);
+            HandleDurtyPage(tracker, trackable, page, epoch);
           }
         }
       }
+
+      share  = trackable->share;
+      count += (atomic_load_explicit(&share->weight, memory_order_relaxed) < RELIABLE_WEIGHT_STRONG);
     }
 
     pthread_rwlock_unlock(&tracker->lock);
+
+    // Commit changes
 
     if (pool != NULL)
     {
       // Two shots in one: [1] at least one trackable has been changed, [2] the pool is being reused reused to make CallReliableMonitor()
       CallReliableMonitor(RELIABLE_MONITOR_FLUSH_COMMIT, pool, NULL, NULL);
+    }
+
+    // Cleanup unused trackables
+
+    if (count != 0)
+    {
+      pthread_rwlock_wrlock(&tracker->lock);
+
+      for (trackable = tracker->list; (trackable != NULL) && (count != 0); trackable = next)
+      {
+        next  = trackable->next;
+        share = trackable->share;
+
+        if (atomic_load_explicit(&share->weight, memory_order_relaxed) < RELIABLE_WEIGHT_STRONG)
+        {
+          for (index = 0; (index < trackable->length) && (atomic_load_explicit(trackable->map + index, memory_order_relaxed) == 0ULL); ++ index);
+
+          if (index == trackable->length)
+          {
+            previous           = trackable->previous;
+            share->closures[0] = NULL;
+
+            if (next     != NULL) next->previous = previous;
+            if (previous != NULL) previous->next = next;
+            else                  tracker->list  = next;
+
+            trackable->next = list;
+            list            = trackable;
+          }
+
+          count --;
+        }
+      }
+
+      pthread_rwlock_unlock(&tracker->lock);
+
+      for (trackable = list; trackable != NULL; trackable = next)
+      {
+        next   = trackable->next;
+        result = CallIOCTL(tracker->handle, UFFDIO_UNREGISTER, &trackable->range);
+        atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE * (result < 0), memory_order_relaxed);
+
+        ReleaseReliableShare(trackable->share);
+        free(trackable);
+      }
     }
 
     return 0;
