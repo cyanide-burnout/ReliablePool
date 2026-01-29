@@ -239,6 +239,7 @@ static int HandleFaultyPage(struct ReliableTracker* tracker, uintptr_t address)
     {
       page = (address - (uintptr_t)trackable->range.start) / tracker->size;
       atomic_fetch_or_explicit(trackable->map + (page >> 6), 1ULL << (page & 63), memory_order_relaxed);
+      atomic_fetch_or_explicit(&trackable->state, RELIABLE_TRACKABLE_STATE_DURTY, memory_order_relaxed);
 
       WakeListner(tracker);
       CallReliableMonitor(RELIABLE_MONITOR_SHARE_CHANGE, trackable->pool, trackable->share, NULL);
@@ -496,30 +497,33 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
 
     for (trackable = tracker->list; trackable != NULL; trackable = trackable->next)
     {
-      for (index = 0; index < trackable->length; ++ index)
+      if (atomic_fetch_and_explicit(&trackable->state, ~RELIABLE_TRACKABLE_STATE_DURTY, memory_order_relaxed) & RELIABLE_TRACKABLE_STATE_DURTY)
       {
-        if (mask = atomic_exchange_explicit(trackable->map + index, 0ULL, memory_order_relaxed))
+        for (index = 0; index < trackable->length; ++ index)
         {
-          pool                    = trackable->pool;
-          protection.mode         = UFFDIO_WRITEPROTECT_MODE_WP;
-          protection.range.start  = trackable->range.start + tracker->size * index * 64;
-          protection.range.len    = tracker->size << 6;
-          delta                   = (protection.range.start + protection.range.len) - (trackable->range.start + trackable->range.len);
-          protection.range.len   -= (delta > 0) ? delta : 0;
-
-          if (CallIOCTL(tracker->handle, UFFDIO_WRITEPROTECT, &protection) < 0)
+          if (mask = atomic_exchange_explicit(trackable->map + index, 0ULL, memory_order_relaxed))
           {
-            atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE | RELIABLE_TRACKER_STATE_KICK, memory_order_relaxed);
-            atomic_fetch_or_explicit(trackable->map + index, mask, memory_order_relaxed);
-          }
+            pool                    = trackable->pool;
+            protection.mode         = UFFDIO_WRITEPROTECT_MODE_WP;
+            protection.range.start  = trackable->range.start + tracker->size * index * 64;
+            protection.range.len    = tracker->size << 6;
+            delta                   = (protection.range.start + protection.range.len) - (trackable->range.start + trackable->range.len);
+            protection.range.len   -= (delta > 0) ? delta : 0;
 
-          while (mask != 0ULL)
-          {
-            page  = __builtin_ctzll(mask);
-            mask &= mask - 1;
-            page += index << 6;
+            if (CallIOCTL(tracker->handle, UFFDIO_WRITEPROTECT, &protection) < 0)
+            {
+              atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_FAILURE | RELIABLE_TRACKER_STATE_KICK, memory_order_relaxed);
+              atomic_fetch_or_explicit(trackable->map + index, mask, memory_order_relaxed);
+            }
 
-            HandleDurtyPage(tracker, trackable, page, epoch);
+            while (mask != 0ULL)
+            {
+              page  = __builtin_ctzll(mask);
+              mask &= mask - 1;
+              page += index << 6;
+
+              HandleDurtyPage(tracker, trackable, page, epoch);
+            }
           }
         }
       }
@@ -551,9 +555,7 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
 
         if (atomic_load_explicit(&share->weight, memory_order_relaxed) < RELIABLE_WEIGHT_STRONG)
         {
-          for (index = 0; (index < trackable->length) && (atomic_load_explicit(trackable->map + index, memory_order_relaxed) == 0ULL); ++ index);
-
-          if (index == trackable->length)
+          if (~atomic_load_explicit(&trackable->state, memory_order_relaxed) & RELIABLE_TRACKABLE_STATE_DURTY)
           {
             previous           = trackable->previous;
             share->closures[0] = NULL;
