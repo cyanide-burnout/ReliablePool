@@ -27,7 +27,8 @@ extern "C"
 #define RELIABLE_TRACKER_FLAG_ID_UNIQUE   (1 << 2)   // └
 #define RELIABLE_TRACKER_FLAG_FORCE_MARK  (1 << 16)  // Mark blocks on every flash to reduce CRC checks, иге makes negative influence on remote replication
 
-#define RELIABLE_TRACKABLE_STATE_LOCK  (1 << 0)
+#define RELIABLE_TRACKABLE_STATE_DURTY  (1 << 0)
+#define RELIABLE_TRACKABLE_STATE_LOCK   (1 << 1)
 
 struct ReliableTracker;
 struct ReliableTrackedPool;
