@@ -33,6 +33,7 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
 {
   char buffer[64];
 
+  /*
   switch (event)
   {
      case RELIABLE_MONITOR_BLOCK_ALLOCATE:
@@ -51,6 +52,7 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
       printf("Block %u (%s) changed: %s\n", block->number, buffer, block->data);
       break;
   }
+  */
 }
 
 static void GeenetateActivity(struct ReliablePool* pool)
@@ -120,7 +122,7 @@ int main(int count, char** arguments)
   monitor.function = HandleMonitorEvent;
 
   handle     = memfd_create("Test", MFD_CLOEXEC);
-  replicator = CreateInstantReplicator(0, "Test", "Secret", &monitor);
+  replicator = CreateInstantReplicator(0, NULL, "Test", "Secret", &monitor);
   indexer    = CreateReliableIndexer(&replicator->super);
   tracker    = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
   pool       = CreateReliablePool(handle, "Test", 50, 0, &tracker->super, NULL, NULL);
@@ -140,7 +142,7 @@ int main(int count, char** arguments)
     atomic_store_explicit(&state, 0, memory_order_relaxed);
   }
 
-  if (replicator->listener == NULL)
+  if (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE)
   {
     printf("Failed to open RDMA port\n\n");
     atomic_store_explicit(&state, 0, memory_order_relaxed);

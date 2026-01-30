@@ -110,7 +110,7 @@ static void RegisterLocalService(struct InstantDiscovery* discovery)
   }
 }
 
-static void BuildSocketAddress(struct sockaddr_storage* storage, const AvahiAddress* address, uint16_t port)
+static int BuildSocketAddress(struct sockaddr_storage* storage, const AvahiAddress* address, uint16_t port)
 {
   struct sockaddr_in* v4;
   struct sockaddr_in6* v6;
@@ -124,15 +124,17 @@ static void BuildSocketAddress(struct sockaddr_storage* storage, const AvahiAddr
       v4->sin_family      = AF_INET;
       v4->sin_port        = htons(port);
       v4->sin_addr.s_addr = address->data.ipv4.address;
-      break;
+      return sizeof(struct sockaddr_in);
 
     case AVAHI_PROTO_INET6:
       v6              = (struct sockaddr_in6*)storage;
       v6->sin6_family = AF_INET6;
       v6->sin6_port   = htons(port);
       memcpy(v6->sin6_addr.s6_addr, address->data.ipv6.address, sizeof(AvahiIPv6Address));
-      break;
+      return sizeof(struct sockaddr_in6);
   }
+
+  return 0;
 }
 
 static void HandleResolverEvent(AvahiServiceResolver* resolver, AvahiIfIndex interface, AvahiProtocol protocol, AvahiResolverEvent event,
@@ -164,8 +166,8 @@ static void HandleResolverEvent(AvahiServiceResolver* resolver, AvahiIfIndex int
           (item   = avahi_string_list_find(text, "instance")) && (avahi_string_list_get_pair(item, &key, &value, &length) == 0) &&
           (value != NULL)                                     && (uuid_parse(value, identifier)                           == 0))
       {
-        BuildSocketAddress(&storage, address, port);
-        RegisterRemoteInstantReplicator(discovery->replicator, identifier, (struct sockaddr*)&storage);
+        length = BuildSocketAddress(&storage, address, port);
+        RegisterRemoteInstantReplicator(discovery->replicator, identifier, (struct sockaddr*)&storage, length);
       }
   }
 
@@ -247,13 +249,13 @@ struct InstantDiscovery* CreateInstantDiscovery(AvahiPoll* poll, struct InstantR
 
   if ((poll                 != NULL) &&
       (replicator           != NULL) &&
-      (replicator->listener != NULL) &&
+      (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE) &&
       (discovery = (struct InstantDiscovery*)calloc(1, sizeof(struct InstantDiscovery))))
   {
     discovery->replicator = replicator;
     discovery->poll       = poll;
     discovery->name       = avahi_strdup(replicator->name);
-    discovery->port       = ntohs(rdma_get_src_port(replicator->listener));
+    discovery->port       = ntohs(rdma_get_src_port(replicator->descriptor));
 
     if (((discovery->client  = avahi_client_new(discovery->poll, 0, HandleClientEvent, discovery, &discovery->error)) == NULL) ||
         ((discovery->browser = avahi_service_browser_new(discovery->client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, REPLICATOR_MDNS_SERVICE, NULL, 0, HandleBrowserEvent, discovery)) == NULL))

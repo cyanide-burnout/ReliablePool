@@ -243,10 +243,7 @@ static int HandleFaultyPage(struct ReliableTracker* tracker, uintptr_t address)
 
       WakeListner(tracker);
       CallReliableMonitor(RELIABLE_MONITOR_SHARE_CHANGE, trackable->pool, trackable->share, NULL);
-
-      result =
-         ~ atomic_load_explicit(&trackable->state, memory_order_relaxed)
-         & RELIABLE_TRACKABLE_STATE_LOCK;
+      result = ~atomic_load_explicit(&trackable->state, memory_order_relaxed) & RELIABLE_TRACKABLE_STATE_LOCK;
       break;
     }
   }
@@ -322,7 +319,7 @@ static void HandleDurtyPage(struct ReliableTracker* tracker, struct ReliableTrac
   }
 }
 
-static void HandlePoolEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
+static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
 {
   struct ReliableTracker* tracker;
 
@@ -406,7 +403,7 @@ struct ReliableTracker* CreateReliableTracker(uint32_t flags, struct ReliableMon
     process                 = getpid();
     tracker->super.next     = next;
     tracker->super.closure  = tracker;
-    tracker->super.function = HandlePoolEvent;
+    tracker->super.function = HandleMonitorEvent;
 
     if (flags & RELIABLE_TRACKER_FLAG_ID_HOST)     tracker->node = GetCRC32C((uint8_t*)&identifier, sizeof(sd_id128_t), tracker->node);
     if (flags & RELIABLE_TRACKER_FLAG_ID_PROCESS)  tracker->node = GetCRC32C((uint8_t*)&process, sizeof(pid_t), tracker->node);

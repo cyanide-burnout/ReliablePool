@@ -12,6 +12,7 @@ LIBRARIES := \
 
 DEPENDENCIES := \
 	uuid \
+	openssl \
 	jemalloc \
 	liburing \
 	libsystemd \

@@ -132,7 +132,7 @@ static void RemoveBlockList(struct ReliableIndexer* indexer, struct ReliableShar
   pthread_rwlock_unlock(&indexer->lock);
 }
 
-static void HandlePoolEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
+static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
 {
   struct ReliableIndexer* indexer;
 
@@ -172,7 +172,7 @@ struct ReliableIndexer* CreateReliableIndexer(struct ReliableMonitor* next)
   {
     indexer->super.next     = next;
     indexer->super.closure  = indexer;
-    indexer->super.function = HandlePoolEvent;
+    indexer->super.function = HandleMonitorEvent;
     indexer->super.name     = MonitorName;
 
     indexer->map  = CreateHashMap(ReleaseIndexKey);
