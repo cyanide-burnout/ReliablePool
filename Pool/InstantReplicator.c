@@ -19,6 +19,8 @@
 #define QUEUE_LENGTH   4096  //
 #define ATTEMPT_COUNT  128   //
 
+#define COUNT(array)  (sizeof(array) / sizeof(array[0]))
+
 /*
 static void AddMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
 {
@@ -52,6 +54,9 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
 
 static void HandleApplicationEvent(struct InstantReplicator* replicator)
 {
+  uint64_t value;
+
+  read(replicator->handle, &value, sizeof(uint64_t));
 
 }
 
@@ -59,7 +64,32 @@ static void HandleApplicationEvent(struct InstantReplicator* replicator)
 
 static void HandleCompletionChannel(struct InstantReplicator* replicator)
 {
+  int result;
+  void* context;
+  struct ibv_cq* queue;
+  struct ibv_wc* completion;
+  struct ibv_wc completions[32];
 
+  while (ibv_get_cq_event(replicator->channel2, &queue, &context) == 0)
+  {
+    ibv_ack_cq_events(queue, 1);
+    ibv_req_notify_cq(queue, 0);
+
+    while ((result = ibv_poll_cq(queue, COUNT(completions), completions)) > 0)
+    {
+      for (completion = completions; completion < (completions + result); ++ completion)
+      {
+        // if (completion->status != IBV_WC_SUCCESS)
+        switch (completion->opcode)
+        {
+          case IBV_WC_RECV:        break;
+          case IBV_WC_SEND:        break;
+          case IBV_WC_RDMA_READ:   break;
+          case IBV_WC_RDMA_WRITE:  break;
+        }
+      }
+    }
+  }
 }
 
 // Connection tracking
@@ -220,6 +250,8 @@ static int MakeConnectionAttempt(struct InstantReplicator* replicator, struct In
     // At least one address should be registered
     return -ENOENT;
   }
+
+  descriptor = NULL;
 
   if ((rdma_create_id(replicator->channel1, &descriptor, peer, RDMA_PS_TCP)                 != 0) ||
       (rdma_resolve_addr(descriptor, NULL, (struct sockaddr*)&point->address, POLL_TIMEOUT) != 0))
@@ -454,13 +486,7 @@ int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t
 
   pthread_mutex_lock(&replicator->lock);
 
-  peer = replicator->peers;
-
-  while ((peer != NULL) && (uuid_compare(peer->identifier, identifier) != 0))
-  {
-    //
-    peer = peer->next;
-  }
+  for (peer = replicator->peers; (peer != NULL) && (uuid_compare(peer->identifier, identifier) != 0); peer = peer->next);
 
   if (peer == NULL)
   {
