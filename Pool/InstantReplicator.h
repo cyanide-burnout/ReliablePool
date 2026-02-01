@@ -21,15 +21,15 @@ extern "C"
 // Protocol
 
 #define INSTANT_MAGIC                0xe29a4b2d
-#define INSTANT_SERVICE_NAME_LENGTH  16
+#define INSTANT_SERVICE_NAME_LENGTH  12
 
 struct InstantHandshakeData
 {
-  uint32_t magic;
-  uint64_t nonce;
-  uuid_t identifier;
-  char name[INSTANT_SERVICE_NAME_LENGTH];
-  uint8_t digest[SHA256_DIGEST_LENGTH];
+  uint32_t magic;                          // 4
+  uint32_t nonce;                          // 8
+  uuid_t identifier;                       // 24
+  char name[INSTANT_SERVICE_NAME_LENGTH];  // 36
+  uint8_t digest[SHA_DIGEST_LENGTH];       // 56
 } __attribute__((packed));
 
 // Replicator
@@ -43,6 +43,19 @@ struct InstantHandshakeData
 
 #define INSTANT_POINT_COUNT  8
 
+struct InstantCard
+{
+  struct InstantCard* previous;
+  struct InstantCard* next;
+
+  struct ibv_comp_channel* channel;
+  struct ibv_context* context;
+  struct ibv_pd* domain;
+  struct ibv_cq* queue;
+
+  struct ibv_qp_init_attr attribute;
+};
+
 struct InstantPoint
 {
   struct sockaddr_storage address;
@@ -55,6 +68,7 @@ struct InstantPeer
   struct InstantPeer* next;
 
   struct rdma_cm_id* descriptor;
+  struct InstantCard* card;
 
   uint32_t state;  // INSTANT_PEER_STATE_*
   uint32_t round;  // Round-robin index of points
@@ -69,16 +83,13 @@ struct InstantReplicator
   struct ReliableMonitor super;
 
   struct rdma_cm_id* descriptor;
-  struct rdma_event_channel* channel1;
-  struct ibv_comp_channel* channel2;
-  struct ibv_context* context;
-  struct ibv_pd* domain;
-  struct ibv_cq* queue;
+  struct rdma_event_channel* channel;
 
   int handle;
   pthread_t thread;
   pthread_mutex_t lock;
   ATOMIC(uint32_t) state;
+  struct InstantCard* cards;
   struct InstantPeer* peers;
 
   char* name;
@@ -86,7 +97,6 @@ struct InstantReplicator
   uuid_t identifier;
 
   struct rdma_conn_param parameter;
-  struct ibv_qp_init_attr attribute;
   struct InstantHandshakeData handshake;
 };
 

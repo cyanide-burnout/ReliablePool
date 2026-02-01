@@ -21,6 +21,8 @@
 
 #define COUNT(array)  (sizeof(array) / sizeof(array[0]))
 
+_Static_assert(sizeof(struct InstantHandshakeData) <= 56, "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
+
 /*
 static void AddMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
 {
@@ -28,7 +30,7 @@ static void AddMemoryRegion(struct InstantReplicator* replicator, struct Reliabl
 
   share->closures[1] = ibv_reg_mr(replicator->domain, share->memory, share->size,
     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
- 
+
   pthread_mutex_unlock(&replicator->lock);
 }
 
@@ -62,6 +64,7 @@ static void HandleApplicationEvent(struct InstantReplicator* replicator)
 
 static void HandleCompletionChannel(struct InstantReplicator* replicator)
 {
+  /*
   int result;
   void* context;
   struct ibv_cq* queue;
@@ -88,9 +91,63 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator)
       }
     }
   }
+  */
 }
 
 // Connection tracking
+
+static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator, struct ibv_context* context)
+{
+  struct InstantCard* card;
+
+  for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
+
+  if ((card == NULL) &&
+      (card  = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
+  {
+    if ((card->channel = ibv_create_comp_channel(context))  &&
+        (card->domain  = ibv_alloc_pd(context))             &&
+        (card->queue   = ibv_create_cq(context, QUEUE_LENGTH, NULL, card->channel, 0)))
+    {
+      card->attribute.cap.max_send_wr     = QUEUE_LENGTH;
+      card->attribute.cap.max_recv_wr     = QUEUE_LENGTH;
+      card->attribute.cap.max_send_sge    = 1;
+      card->attribute.cap.max_recv_sge    = 1;
+      card->attribute.cap.max_inline_data = 256;
+      card->attribute.sq_sig_all          = 1;
+      card->attribute.send_cq             = card->queue;
+      card->attribute.recv_cq             = card->queue;
+      card->attribute.qp_type             = IBV_QPT_RC;
+      card->context                       = context;
+      card->next                          = replicator->cards;
+      replicator->cards                   = card;
+    }
+    else
+    {
+      if (card->queue    != NULL)  ibv_destroy_cq(card->queue);
+      if (card->domain   != NULL)  ibv_dealloc_pd(card->domain);
+      if (card->channel  != NULL)  ibv_destroy_comp_channel(card->channel);
+      free(card);
+      card = NULL;
+    }
+  }
+
+  return card;
+}
+
+static void RemoveCard(struct InstantReplicator* replicator, struct InstantCard* card)
+{
+  struct InstantCard* other;
+
+	if (other = card->next)      other->previous   = card->previous;
+  if (other = card->previous)  other->next       = card->next;
+  else                         replicator->cards = card->next;
+
+  ibv_destroy_cq(card->queue);
+  ibv_dealloc_pd(card->domain);
+  ibv_destroy_comp_channel(card->channel);
+  free(card);
+}
 
 static void DestroyDescriptor(struct rdma_cm_id* descriptor, int condition)
 {
@@ -109,22 +166,23 @@ static void DestroyDescriptor(struct rdma_cm_id* descriptor, int condition)
 
 static int HandleConnectRequest(struct InstantReplicator* replicator, struct rdma_cm_id* descriptor, struct rdma_conn_param* parameter)
 {
+  struct InstantCard* card;
   struct InstantPeer* peer;
   struct InstantHandshakeData* handshake;
-  uint8_t digest[SHA256_DIGEST_LENGTH];
+  uint8_t digest[SHA_DIGEST_LENGTH];
 
+  card      = FindOrCreateCard(replicator, descriptor->verbs);
   peer      = NULL;
   handshake = NULL;
 
-  printf("HandleConnectRequest verbs=%p\n", descriptor->verbs);
-
-  if ((parameter != NULL) &&
+  if ((card      != NULL) &&
+      (parameter != NULL) &&
       (parameter->private_data_len == sizeof(struct InstantHandshakeData)) &&
       (handshake = (struct InstantHandshakeData*)parameter->private_data)  &&
       (handshake->magic == INSTANT_MAGIC) &&
       (memcmp(handshake->name, replicator->handshake.name, INSTANT_SERVICE_NAME_LENGTH) == 0) &&
-      (HMAC(EVP_sha256(), replicator->secret, strlen(replicator->secret), (uint8_t*)handshake, offsetof(struct InstantHandshakeData, digest), digest, NULL) != NULL) &&
-      (memcmp(handshake->digest, digest, SHA256_DIGEST_LENGTH) == 0))
+      (HMAC(EVP_sha1(), replicator->secret, strlen(replicator->secret), (uint8_t*)handshake, offsetof(struct InstantHandshakeData, digest), digest, NULL) != NULL) &&
+      (memcmp(handshake->digest, digest, SHA_DIGEST_LENGTH) == 0))
   {
     pthread_mutex_lock(&replicator->lock);
     for (peer = replicator->peers; (peer != NULL) && (uuid_compare(handshake->identifier, peer->identifier) != 0); peer = peer->next);
@@ -133,7 +191,7 @@ static int HandleConnectRequest(struct InstantReplicator* replicator, struct rdm
 
   if ((peer == NULL) ||
       (peer->state != INSTANT_PEER_STATE_DISCONNECTED) ||
-      (rdma_create_qp(descriptor, replicator->domain, &replicator->attribute) != 0) ||
+      (rdma_create_qp(descriptor, card->domain, &card->attribute) != 0) ||
       (rdma_accept(descriptor, &replicator->parameter) != 0))
   {
     rdma_reject(descriptor, NULL, 0);
@@ -142,6 +200,7 @@ static int HandleConnectRequest(struct InstantReplicator* replicator, struct rdm
 
   peer->state         = INSTANT_PEER_STATE_CONNECTING;
   peer->descriptor    = descriptor;
+  peer->card          = card;
   descriptor->context = peer;
   return 0;
 }
@@ -150,10 +209,11 @@ static int HandleEstablished(struct InstantReplicator* replicator, struct rdma_c
 {
   struct InstantPeer* peer;
 
+  printf("HandleEstablished id=%p\n", descriptor);
+
   peer = (struct InstantPeer*)descriptor->context;
 
   peer->state      = INSTANT_PEER_STATE_CONNECTED;
-  peer->descriptor = descriptor;
   peer->fails      = 0;
   peer->points[peer->round].rank = 0;
 
@@ -164,11 +224,14 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
 {
   struct InstantPeer* peer;
 
+  printf("HandleDisconnected id=%p\n", descriptor);
+
   if ((peer = (struct InstantPeer*)descriptor->context) &&
       (peer->descriptor == descriptor))
   {
     peer->state      = INSTANT_PEER_STATE_DISCONNECTED;
     peer->descriptor = NULL;
+    peer->card       = NULL;
 
     peer->points[peer->round].rank ++;
     peer->fails ++;
@@ -192,13 +255,19 @@ static int HandleAddressResolved(struct InstantReplicator* replicator, struct rd
 
 static int HandleRouteResolved(struct InstantReplicator* replicator, struct rdma_cm_id* descriptor)
 {
-  printf("HandleRouteResolved verbs=%p\n", descriptor->verbs);
+  struct InstantCard* card;
+  struct InstantPeer* peer;
 
-  if ((rdma_create_qp(descriptor, replicator->domain, &replicator->attribute) != 0) ||
-      (rdma_connect(descriptor, &replicator->parameter)                       != 0))
+  card       = FindOrCreateCard(replicator, descriptor->verbs);
+  peer       = (struct InstantPeer*)descriptor->context;
+  peer->card = card;
+
+  if ((card == NULL) ||
+      (rdma_create_qp(descriptor, card->domain, &card->attribute) != 0) ||
+      (rdma_connect(descriptor, &replicator->parameter)           != 0))
   {
     // Cleanup connection state
-    return HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_CONNECT_ERROR);    
+    return HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_CONNECT_ERROR);
   }
 
   return 0;
@@ -210,7 +279,7 @@ static void HandleEventChannel(struct InstantReplicator* replicator)
   struct rdma_cm_event* event;
   int result;
 
-  while (rdma_get_cm_event(replicator->channel1, &event) == 0)
+  if (rdma_get_cm_event(replicator->channel, &event) == 0)
   {
     result     = 0;
     descriptor = event->id;
@@ -227,6 +296,7 @@ static void HandleEventChannel(struct InstantReplicator* replicator)
       case RDMA_CM_EVENT_UNREACHABLE:
       case RDMA_CM_EVENT_REJECTED:
       case RDMA_CM_EVENT_DISCONNECTED:     result = HandleDisconnected(replicator, descriptor, event->event);          break;
+      // case RDMA_CM_EVENT_DEVICE_REMOVAL:
     }
 
     rdma_ack_cm_event(event);
@@ -234,7 +304,7 @@ static void HandleEventChannel(struct InstantReplicator* replicator)
   }
 }
 
-static int MakeConnectionAttempt(struct InstantReplicator* replicator, struct InstantPeer* peer)
+static int TryConnect(struct InstantReplicator* replicator, struct InstantPeer* peer)
 {
   uint32_t number;
   struct InstantPoint* point;
@@ -255,7 +325,7 @@ static int MakeConnectionAttempt(struct InstantReplicator* replicator, struct In
 
   descriptor = NULL;
 
-  if ((rdma_create_id(replicator->channel1, &descriptor, peer, RDMA_PS_TCP)                 != 0) ||
+  if ((rdma_create_id(replicator->channel, &descriptor, peer, RDMA_PS_TCP)                  != 0) ||
       (rdma_resolve_addr(descriptor, NULL, (struct sockaddr*)&point->address, POLL_TIMEOUT) != 0))
   {
     DestroyDescriptor(descriptor, 1);
@@ -294,7 +364,7 @@ static void TrackPeerList(struct InstantReplicator* replicator)
         continue;
       }
 
-      MakeConnectionAttempt(replicator, peer);
+      TryConnect(replicator, peer);
     }
 
     previous = peer;
@@ -318,7 +388,7 @@ static void* DoWork(void* closure)
 
   events[0].fd      = handle;
   events[1].fd      = replicator->handle;
-  events[2].fd      = replicator->channel1->fd;
+  events[2].fd      = replicator->channel->fd;
   // events[3].fd      = replicator->channel2->fd;
   events[0].events  = POLLIN;
   events[1].events  = POLLIN;
@@ -395,10 +465,10 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
 
     replicator->handshake.magic = INSTANT_MAGIC;
 
-    getrandom((uint8_t*)&replicator->handshake.nonce, sizeof(uint64_t), 0);
+    getrandom((uint8_t*)&replicator->handshake.nonce, sizeof(uint32_t), 0);
     strncpy(replicator->handshake.name, name, INSTANT_SERVICE_NAME_LENGTH);
     uuid_copy(replicator->handshake.identifier, replicator->identifier);
-    HMAC(EVP_sha256(), secret, strlen(secret), (uint8_t*)&replicator->handshake, offsetof(struct InstantHandshakeData, digest), replicator->handshake.digest, NULL);
+    HMAC(EVP_sha1(), secret, strlen(secret), (uint8_t*)&replicator->handshake, offsetof(struct InstantHandshakeData, digest), replicator->handshake.digest, NULL);
 
     pthread_mutex_init(&replicator->lock, NULL);
 
@@ -410,15 +480,11 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     hint.ai_qp_type    = IBV_QPT_RC;
     information        = NULL;
 
-    if ((replicator->channel1 = rdma_create_event_channel())                    &&
+    if ((replicator->channel = rdma_create_event_channel())                     &&
         (rdma_getaddrinfo(NULL, service, &hint, &information)             == 0) &&
         (rdma_create_ep(&replicator->descriptor, information, NULL, NULL) == 0) &&
         (rdma_listen(replicator->descriptor, 16)                          == 0) &&
-        (rdma_migrate_id(replicator->descriptor, replicator->channel1)    == 0) /* &&
-        (replicator->context  = replicator->descriptor->verbs)                  &&
-        (replicator->channel2 = ibv_create_comp_channel(replicator->context))   &&
-        (replicator->domain   = ibv_alloc_pd(replicator->context))              &&
-        (replicator->queue    = ibv_create_cq(replicator->context, QUEUE_LENGTH, NULL, replicator->channel2, 0)) */)
+        (rdma_migrate_id(replicator->descriptor, replicator->channel)     == 0))
     {
       replicator->parameter.responder_resources = 2;
       replicator->parameter.initiator_depth     = 2;
@@ -426,16 +492,6 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
       replicator->parameter.rnr_retry_count     = 5;
       replicator->parameter.private_data        = &replicator->handshake;
       replicator->parameter.private_data_len    = sizeof(struct InstantHandshakeData);
-
-      replicator->attribute.cap.max_send_wr     = QUEUE_LENGTH;
-      replicator->attribute.cap.max_recv_wr     = QUEUE_LENGTH;
-      replicator->attribute.cap.max_send_sge    = 1;
-      replicator->attribute.cap.max_recv_sge    = 1;
-      replicator->attribute.cap.max_inline_data = 256;
-      replicator->attribute.sq_sig_all          = 1;
-      replicator->attribute.send_cq             = replicator->queue;
-      replicator->attribute.recv_cq             = replicator->queue;
-      replicator->attribute.qp_type             = IBV_QPT_RC;
 
       atomic_store_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_ACTIVE, memory_order_relaxed);
 
@@ -455,6 +511,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
 void ReleaseInstantReplicator(struct InstantReplicator* replicator)
 {
   struct InstantPeer* peer;
+  struct InstantCard* card;
 
   if (replicator != NULL)
   {
@@ -471,11 +528,14 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
       free(peer);
     }
 
-    if (replicator->queue      != NULL)  ibv_destroy_cq(replicator->queue);
-    if (replicator->domain     != NULL)  ibv_dealloc_pd(replicator->domain);
-    if (replicator->channel2   != NULL)  ibv_destroy_comp_channel(replicator->channel2);
+    while (card = replicator->cards)
+    {
+      //
+      RemoveCard(replicator, card);
+    }
+
     if (replicator->descriptor != NULL)  rdma_destroy_ep(replicator->descriptor);
-    if (replicator->channel1   != NULL)  rdma_destroy_event_channel(replicator->channel1);
+    if (replicator->channel    != NULL)  rdma_destroy_event_channel(replicator->channel);
 
     pthread_mutex_destroy(&replicator->lock);
     close(replicator->handle);
