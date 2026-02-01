@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <malloc.h>
 #include <string.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/random.h>
 #include <sys/eventfd.h>
@@ -16,7 +17,6 @@
 #include "ReliableIndexer.h"
 
 #define POLL_TIMEOUT   200   // Milliseconds
-#define QUEUE_LENGTH   4096  //
 #define ATTEMPT_COUNT  128   //
 
 #define COUNT(array)  (sizeof(array) / sizeof(array[0]))
@@ -57,21 +57,122 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
 static void HandleApplicationEvent(struct InstantReplicator* replicator)
 {
 
-
 }
 
-//
+// Transport abstractions
 
-static void HandleCompletionChannel(struct InstantReplicator* replicator)
+static int SubmitReceivingBuffer(struct InstantCard* card, uint64_t number)
 {
-  /*
-  int result;
+  struct ibv_mr* region;
+  struct ibv_sge element;
+  struct ibv_recv_wr work;
+  struct ibv_recv_wr* bad;
+
+  region         = card->region1;
+  element.addr   = (uintptr_t)card->buffers[number];
+  element.length = INSTANT_BUFFER_LENGTH;
+  element.lkey   = region->lkey;
+  work.wr_id     = number;
+  work.next      = NULL;
+  work.sg_list   = &element;
+  work.num_sge   = 1;
+
+  return ibv_post_srq_recv(card->queue1, &work, &bad);
+}
+
+static int SubmitInitialReceivingBufferList(struct InstantCard* card)
+{
+  uint64_t number;
+
+  for (number = 0; (number < INSTANT_QUEUE_LENGTH * 2) && (SubmitReceivingBuffer(card, number) == 0); number += 2);
+
+  return -(number != INSTANT_QUEUE_LENGTH * 2);  
+}
+
+static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator, struct ibv_context* context)
+{
+  struct InstantCard* card;
+  struct InstantCard* other;
+  struct ibv_srq_init_attr attribute;
+
+  for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
+
+  if ((card == NULL) &&
+      (card  = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
+  {
+    memset(&attribute, 0, sizeof(struct ibv_srq_init_attr));
+
+    attribute.attr.max_wr  = INSTANT_QUEUE_LENGTH;
+    attribute.attr.max_sge = 1;
+
+    if (!((card->channel = ibv_create_comp_channel(context))         &&
+          (card->domain  = ibv_alloc_pd(context))                    &&
+          (card->queue1  = ibv_create_srq(card->domain, &attribute)) &&
+          (card->queue2  = ibv_create_cq(context, INSTANT_QUEUE_LENGTH * 2, NULL, card->channel, 0)) &&
+          (card->region1 = ibv_reg_mr(card->domain, card->buffers, sizeof(card->buffers), IBV_ACCESS_LOCAL_WRITE)) &&
+          (SubmitInitialReceivingBufferList(card) == 0)))
+    {
+      if (card->queue1   != NULL)  ibv_destroy_srq(card->queue1);
+      if (card->queue2   != NULL)  ibv_destroy_cq(card->queue2);
+      if (card->region1  != NULL)  ibv_dereg_mr(card->region1);
+      if (card->domain   != NULL)  ibv_dealloc_pd(card->domain);
+      if (card->channel  != NULL)  ibv_destroy_comp_channel(card->channel);
+
+      free(card);
+      return NULL;
+    }
+
+    card->attribute.cap.max_send_wr     = INSTANT_QUEUE_LENGTH;
+    card->attribute.cap.max_recv_wr     = INSTANT_QUEUE_LENGTH;
+    card->attribute.cap.max_send_sge    = 1;
+    card->attribute.cap.max_recv_sge    = attribute.attr.max_sge;
+    card->attribute.cap.max_inline_data = 256;
+    card->attribute.sq_sig_all          = 1;
+    card->attribute.srq                 = card->queue1;
+    card->attribute.send_cq             = card->queue2;
+    card->attribute.recv_cq             = card->queue2;
+    card->attribute.qp_type             = IBV_QPT_RC;
+    card->context                       = context;
+
+    ibv_req_notify_cq(card->queue2, 0);
+
+    if (other = replicator->cards)
+    {
+      card->next      = other;
+      other->previous = card;
+    }
+
+    replicator->cards = card;
+  }
+
+  return card;
+}
+
+static void RemoveCard(struct InstantReplicator* replicator, struct InstantCard* card)
+{
+  struct InstantCard* other;
+
+  if (other = card->next)      other->previous   = card->previous;
+  if (other = card->previous)  other->next       = card->next;
+  else                         replicator->cards = card->next;
+
+  ibv_destroy_srq(card->queue1);
+  ibv_destroy_cq(card->queue2);
+  ibv_dereg_mr(card->region1);
+  ibv_dealloc_pd(card->domain);
+  ibv_destroy_comp_channel(card->channel);
+  free(card);
+}
+
+static void HandleCompletionChannel(struct InstantReplicator* replicator, struct InstantCard* card, int result)
+{
   void* context;
   struct ibv_cq* queue;
   struct ibv_wc* completion;
   struct ibv_wc completions[32];
 
-  while (ibv_get_cq_event(replicator->channel2, &queue, &context) == 0)
+  if ((result & POLLIN) &&
+      (ibv_get_cq_event(card->channel, &queue, &context) == 0))
   {
     ibv_ack_cq_events(queue, 1);
     ibv_req_notify_cq(queue, 0);
@@ -83,7 +184,11 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator)
         // if (completion->status != IBV_WC_SUCCESS)
         switch (completion->opcode)
         {
-          case IBV_WC_RECV:        break;
+          case IBV_WC_RECV:
+            SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
+            // HandleReceivedMessage();
+            break;
+
           case IBV_WC_SEND:        break;
           case IBV_WC_RDMA_READ:   break;
           case IBV_WC_RDMA_WRITE:  break;
@@ -91,63 +196,9 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator)
       }
     }
   }
-  */
 }
 
 // Connection tracking
-
-static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator, struct ibv_context* context)
-{
-  struct InstantCard* card;
-
-  for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
-
-  if ((card == NULL) &&
-      (card  = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
-  {
-    if ((card->channel = ibv_create_comp_channel(context))  &&
-        (card->domain  = ibv_alloc_pd(context))             &&
-        (card->queue   = ibv_create_cq(context, QUEUE_LENGTH, NULL, card->channel, 0)))
-    {
-      card->attribute.cap.max_send_wr     = QUEUE_LENGTH;
-      card->attribute.cap.max_recv_wr     = QUEUE_LENGTH;
-      card->attribute.cap.max_send_sge    = 1;
-      card->attribute.cap.max_recv_sge    = 1;
-      card->attribute.cap.max_inline_data = 256;
-      card->attribute.sq_sig_all          = 1;
-      card->attribute.send_cq             = card->queue;
-      card->attribute.recv_cq             = card->queue;
-      card->attribute.qp_type             = IBV_QPT_RC;
-      card->context                       = context;
-      card->next                          = replicator->cards;
-      replicator->cards                   = card;
-    }
-    else
-    {
-      if (card->queue    != NULL)  ibv_destroy_cq(card->queue);
-      if (card->domain   != NULL)  ibv_dealloc_pd(card->domain);
-      if (card->channel  != NULL)  ibv_destroy_comp_channel(card->channel);
-      free(card);
-      card = NULL;
-    }
-  }
-
-  return card;
-}
-
-static void RemoveCard(struct InstantReplicator* replicator, struct InstantCard* card)
-{
-  struct InstantCard* other;
-
-	if (other = card->next)      other->previous   = card->previous;
-  if (other = card->previous)  other->next       = card->next;
-  else                         replicator->cards = card->next;
-
-  ibv_destroy_cq(card->queue);
-  ibv_dealloc_pd(card->domain);
-  ibv_destroy_comp_channel(card->channel);
-  free(card);
-}
 
 static void DestroyDescriptor(struct rdma_cm_id* descriptor, int condition)
 {
@@ -273,13 +324,13 @@ static int HandleRouteResolved(struct InstantReplicator* replicator, struct rdma
   return 0;
 }
 
-static void HandleEventChannel(struct InstantReplicator* replicator)
+static void HandleEventChannel(struct InstantReplicator* replicator, int result)
 {
   struct rdma_cm_id* descriptor;
   struct rdma_cm_event* event;
-  int result;
 
-  if (rdma_get_cm_event(replicator->channel, &event) == 0)
+  if ((result & POLLIN) &&
+      (rdma_get_cm_event(replicator->channel, &event) == 0))
   {
     result     = 0;
     descriptor = event->id;
@@ -296,7 +347,7 @@ static void HandleEventChannel(struct InstantReplicator* replicator)
       case RDMA_CM_EVENT_UNREACHABLE:
       case RDMA_CM_EVENT_REJECTED:
       case RDMA_CM_EVENT_DISCONNECTED:     result = HandleDisconnected(replicator, descriptor, event->event);          break;
-      // case RDMA_CM_EVENT_DEVICE_REMOVAL:
+      case RDMA_CM_EVENT_DEVICE_REMOVAL:   raise(SIGABRT);
     }
 
     rdma_ack_cm_event(event);
@@ -428,13 +479,13 @@ static void* DoWork(void* closure)
 
     if (events[2].revents & POLLIN)
     {
-      HandleEventChannel(replicator);
+      HandleEventChannel(replicator, events[2].revents);
       events[2].revents = 0;
     }
 
     if (events[3].revents & POLLIN)
     {
-      HandleCompletionChannel(replicator);
+      // HandleCompletionChannel(replicator);
       events[3].revents = 0;
     }
   }
@@ -444,7 +495,7 @@ static void* DoWork(void* closure)
   return NULL;
 }
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, struct ReliableMonitor* next)
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, struct ReliableMonitor* next)
 {
   struct InstantReplicator* replicator;
   struct rdma_addrinfo* information;
@@ -459,13 +510,14 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     replicator->handle         = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     replicator->secret         = strdup(secret);
     replicator->name           = strdup(name);
+    replicator->limit          = limit;
 
     if (identifier == NULL)  uuid_generate(replicator->identifier);
     else                     uuid_copy(replicator->identifier, identifier);
 
     replicator->handshake.magic = INSTANT_MAGIC;
 
-    getrandom((uint8_t*)&replicator->handshake.nonce, sizeof(uint32_t), 0);
+    getrandom((uint8_t*)&replicator->handshake.nonce, sizeof(uint16_t), 0);
     strncpy(replicator->handshake.name, name, INSTANT_SERVICE_NAME_LENGTH);
     uuid_copy(replicator->handshake.identifier, replicator->identifier);
     HMAC(EVP_sha1(), secret, strlen(secret), (uint8_t*)&replicator->handshake, offsetof(struct InstantHandshakeData, digest), replicator->handshake.digest, NULL);
@@ -530,7 +582,7 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
 
     while (card = replicator->cards)
     {
-      //
+      // Remove all resources associated with HCA
       RemoveCard(replicator, card);
     }
 
@@ -548,16 +600,30 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length)
 {
   int index;
+  uint32_t count;
   struct InstantPeer* peer;
   struct InstantPeer* other;
   struct InstantPoint* point;
 
   pthread_mutex_lock(&replicator->lock);
 
-  for (peer = replicator->peers; (peer != NULL) && (uuid_compare(peer->identifier, identifier) != 0); peer = peer->next);
+  peer  = replicator->peers;
+  count = 0;
+
+  while ((peer != NULL) && (uuid_compare(peer->identifier, identifier) != 0))
+  {
+    ++ count;
+    peer = peer->next;
+  }
 
   if (peer == NULL)
   {
+    if (count >= replicator->limit)
+    {
+      pthread_mutex_unlock(&replicator->lock);
+      return -ENOSPC;
+    }
+
     peer = (struct InstantPeer*)calloc(1, sizeof(struct InstantPeer));
 
     if (peer == NULL)

@@ -20,14 +20,14 @@ extern "C"
 
 // Protocol
 
-#define INSTANT_MAGIC                0xe29a4b2d
-#define INSTANT_SERVICE_NAME_LENGTH  12
+#define INSTANT_MAGIC                0xe29a
+#define INSTANT_SERVICE_NAME_LENGTH  16
 
 struct InstantHandshakeData
 {
-  uint32_t magic;                          // 4
-  uint32_t nonce;                          // 8
-  uuid_t identifier;                       // 24
+  uint16_t magic;                          // 2
+  uint16_t nonce;                          // 4
+  uuid_t identifier;                       // 20
   char name[INSTANT_SERVICE_NAME_LENGTH];  // 36
   uint8_t digest[SHA_DIGEST_LENGTH];       // 56
 } __attribute__((packed));
@@ -43,6 +43,9 @@ struct InstantHandshakeData
 
 #define INSTANT_POINT_COUNT  8
 
+#define INSTANT_QUEUE_LENGTH   4096
+#define INSTANT_BUFFER_LENGTH  4096
+
 struct InstantCard
 {
   struct InstantCard* previous;
@@ -50,10 +53,14 @@ struct InstantCard
 
   struct ibv_comp_channel* channel;
   struct ibv_context* context;
+  struct ibv_srq* queue1;
+  struct ibv_cq* queue2;
   struct ibv_pd* domain;
-  struct ibv_cq* queue;
+  struct ibv_mr* region1;
 
   struct ibv_qp_init_attr attribute;
+
+  uint8_t buffers[INSTANT_QUEUE_LENGTH * 2][INSTANT_BUFFER_LENGTH];
 };
 
 struct InstantPoint
@@ -94,13 +101,14 @@ struct InstantReplicator
 
   char* name;
   char* secret;
+  uint32_t limit;
   uuid_t identifier;
 
   struct rdma_conn_param parameter;
   struct InstantHandshakeData handshake;
 };
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, struct ReliableMonitor* next);
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, struct ReliableMonitor* next);
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);
 
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length);
