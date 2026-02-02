@@ -26,7 +26,8 @@
 #define io_uring_set_iowait(ring, value)
 #endif
 
-_Static_assert(sizeof(struct InstantHandshakeData) <= 56, "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
+_Static_assert(sizeof(struct InstantHandshakeData) <= 56,                                                 "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
+_Static_assert((INSTANT_QUEUE_LENGTH != 0) && ((INSTANT_QUEUE_LENGTH & (INSTANT_QUEUE_LENGTH - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
 
 /*
 static void AddMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
@@ -91,7 +92,7 @@ static int SubmitInitialReceivingBufferList(struct InstantCard* card)
 
   for (number = 0; (number < INSTANT_QUEUE_LENGTH * 2) && (SubmitReceivingBuffer(card, number) == 0); number += 2);
 
-  return -(number != INSTANT_QUEUE_LENGTH * 2);  
+  return -(number != INSTANT_QUEUE_LENGTH * 2);
 }
 
 static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator, struct ibv_context* context)
@@ -481,9 +482,9 @@ static void* DoWork(void* closure)
     io_uring_sqe_set_data64(submission, RING_CAUSE_EVENT_CHANNEL);
   }
 
-  while (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE)
+  while ((atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE) &&
+         (io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL) >= 0))
   {
-    io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL);
     io_uring_for_each_cqe(&replicator->ring, head, completion)
     {
       switch (completion->user_data)
@@ -524,7 +525,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
   char service[16];
 
   if ((replicator = (struct InstantReplicator*)calloc(1, sizeof(struct InstantReplicator))) &&
-      (io_uring_queue_init(INSTANT_QUEUE_LENGTH, &replicator->ring, IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER) == 0))
+      (io_uring_queue_init(INSTANT_QUEUE_LENGTH, &replicator->ring, IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN) == 0))
   {
     io_uring_ring_dontfork(&replicator->ring);
     io_uring_set_iowait(&replicator->ring, 0);
