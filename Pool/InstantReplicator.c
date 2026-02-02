@@ -6,20 +6,25 @@
 #include <malloc.h>
 #include <string.h>
 #include <signal.h>
-#include <unistd.h>
 #include <sys/random.h>
-#include <sys/eventfd.h>
-#include <sys/timerfd.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
 #include "ReliableTracker.h"
 #include "ReliableIndexer.h"
 
-#define POLL_TIMEOUT   200   // Milliseconds
-#define ATTEMPT_COUNT  128   //
+#define RING_CAUSE_TIMEOUT            (LIBURING_UDATA_TIMEOUT - 1ULL)
+#define RING_CAUSE_EVENT_CHANNEL      (LIBURING_UDATA_TIMEOUT - 2ULL)
+#define RING_CAUSE_APPLICATION_EVENT  (LIBURING_UDATA_TIMEOUT - 3ULL)
+
+#define GENERIC_POLL_TIMEOUT      200   // Milliseconds
+#define CONNECTION_ATTEMPT_COUNT  128   //
 
 #define COUNT(array)  (sizeof(array) / sizeof(array[0]))
+
+#ifndef IORING_ENTER_NO_IOWAIT
+#define io_uring_set_iowait(ring, value)
+#endif
 
 _Static_assert(sizeof(struct InstantHandshakeData) <= 56, "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
 
@@ -93,6 +98,7 @@ static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator
 {
   struct InstantCard* card;
   struct InstantCard* other;
+  struct io_uring_sqe* submission;
   struct ibv_srq_init_attr attribute;
 
   for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
@@ -136,6 +142,12 @@ static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator
 
     ibv_req_notify_cq(card->queue2, 0);
 
+    if (submission = io_uring_get_sqe(&replicator->ring))
+    {
+      io_uring_prep_poll_add(submission, card->channel->fd, POLLIN);
+      io_uring_sqe_set_data(submission, card);
+    }
+
     if (other = replicator->cards)
     {
       card->next      = other;
@@ -170,8 +182,10 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
   struct ibv_cq* queue;
   struct ibv_wc* completion;
   struct ibv_wc completions[32];
+  struct io_uring_sqe* submission;
 
-  if ((result & POLLIN) &&
+  if ((result > 0)      &&
+      (result & POLLIN) &&
       (ibv_get_cq_event(card->channel, &queue, &context) == 0))
   {
     ibv_ack_cq_events(queue, 1);
@@ -185,8 +199,9 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
         switch (completion->opcode)
         {
           case IBV_WC_RECV:
+          case IBV_WC_RECV_RDMA_WITH_IMM:
             SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
-            // HandleReceivedMessage();
+            // HandleReceivedMessage(replicator, card->buffers[completion->wr_id], completion->byte_len);
             break;
 
           case IBV_WC_SEND:        break;
@@ -195,6 +210,12 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
         }
       }
     }
+  }
+
+  if (submission = io_uring_get_sqe(&replicator->ring))
+  {
+    io_uring_prep_poll_add(submission, card->channel->fd, POLLIN);
+    io_uring_sqe_set_data(submission, card);
   }
 }
 
@@ -295,7 +316,7 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
 
 static int HandleAddressResolved(struct InstantReplicator* replicator, struct rdma_cm_id* descriptor)
 {
-  if (rdma_resolve_route(descriptor, POLL_TIMEOUT) != 0)
+  if (rdma_resolve_route(descriptor, GENERIC_POLL_TIMEOUT) != 0)
   {
     // Cleanup connection state
     return HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_ROUTE_ERROR);
@@ -326,10 +347,12 @@ static int HandleRouteResolved(struct InstantReplicator* replicator, struct rdma
 
 static void HandleEventChannel(struct InstantReplicator* replicator, int result)
 {
+  struct io_uring_sqe* submission;
   struct rdma_cm_id* descriptor;
   struct rdma_cm_event* event;
 
-  if ((result & POLLIN) &&
+  if ((result > 0)      &&
+      (result & POLLIN) &&
       (rdma_get_cm_event(replicator->channel, &event) == 0))
   {
     result     = 0;
@@ -352,6 +375,12 @@ static void HandleEventChannel(struct InstantReplicator* replicator, int result)
 
     rdma_ack_cm_event(event);
     DestroyDescriptor(descriptor, result);
+  }
+
+  if (submission = io_uring_get_sqe(&replicator->ring))
+  {
+    io_uring_prep_poll_add(submission, replicator->channel->fd, POLLIN);
+    io_uring_sqe_set_data64(submission, RING_CAUSE_EVENT_CHANNEL);
   }
 }
 
@@ -376,8 +405,8 @@ static int TryConnect(struct InstantReplicator* replicator, struct InstantPeer* 
 
   descriptor = NULL;
 
-  if ((rdma_create_id(replicator->channel, &descriptor, peer, RDMA_PS_TCP)                  != 0) ||
-      (rdma_resolve_addr(descriptor, NULL, (struct sockaddr*)&point->address, POLL_TIMEOUT) != 0))
+  if ((rdma_create_id(replicator->channel, &descriptor, peer, RDMA_PS_TCP)                          != 0) ||
+      (rdma_resolve_addr(descriptor, NULL, (struct sockaddr*)&point->address, GENERIC_POLL_TIMEOUT) != 0))
   {
     DestroyDescriptor(descriptor, 1);
     peer->fails ++;
@@ -406,7 +435,7 @@ static void TrackPeerList(struct InstantReplicator* replicator)
     if ((peer->descriptor == NULL) &&
         (peer->state      == INSTANT_PEER_STATE_DISCONNECTED))
     {
-      if (peer->fails >= ATTEMPT_COUNT)
+      if (peer->fails >= CONNECTION_ATTEMPT_COUNT)
       {
         if (previous != NULL) previous->next    = next;
         else                  replicator->peers = next;
@@ -429,68 +458,60 @@ static void TrackPeerList(struct InstantReplicator* replicator)
 static void* DoWork(void* closure)
 {
   struct InstantReplicator* replicator;
-  struct itimerspec interval;
-  struct pollfd events[4];
-  uint64_t value;
-  int handle;
+  struct __kernel_timespec interval;
+  struct io_uring_sqe* submission;
+  struct io_uring_cqe* completion;
+  unsigned head;
 
-  replicator = (struct InstantReplicator*)closure;
-  handle     = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-
-  events[0].fd      = handle;
-  events[1].fd      = replicator->handle;
-  events[2].fd      = replicator->channel->fd;
-  // events[3].fd      = replicator->channel2->fd;
-  events[0].events  = POLLIN;
-  events[1].events  = POLLIN;
-  events[2].events  = POLLIN;
-  events[3].events  = POLLIN;
-  events[0].revents = 0;
-  events[1].revents = 0;
-  events[2].revents = 0;
-  events[3].revents = 0;
-
-  interval.it_interval.tv_nsec = POLL_TIMEOUT * 1000000ULL;
-  interval.it_interval.tv_sec  = 0;
-  interval.it_value.tv_nsec    = interval.it_interval.tv_nsec;
-  interval.it_value.tv_sec     = interval.it_interval.tv_sec;
+  replicator       = (struct InstantReplicator*)closure;
+  interval.tv_nsec = GENERIC_POLL_TIMEOUT * 1000000ULL;
+  interval.tv_sec  = 0;
 
   pthread_setname_np(replicator->thread, "Replicator");
-  timerfd_settime(handle, 0, &interval, NULL);
-  // ibv_req_notify_cq(replicator->queue, 0);
+
+  if (submission = io_uring_get_sqe(&replicator->ring))
+  {
+    io_uring_prep_timeout(submission, &interval, 0, IORING_TIMEOUT_MULTISHOT);
+    io_uring_sqe_set_data64(submission, RING_CAUSE_TIMEOUT);
+  }
+
+  if (submission = io_uring_get_sqe(&replicator->ring))
+  {
+    io_uring_prep_poll_add(submission, replicator->channel->fd, POLLIN);
+    io_uring_sqe_set_data64(submission, RING_CAUSE_EVENT_CHANNEL);
+  }
 
   while (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE)
   {
-    poll(events, 3, POLL_TIMEOUT);
-
-    if (events[0].revents & POLLIN)
+    io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL);
+    io_uring_for_each_cqe(&replicator->ring, head, completion)
     {
-      read(handle, &value, sizeof(uint64_t));
-      TrackPeerList(replicator);
-      events[0].revents = 0;
-    }
+      switch (completion->user_data)
+      {
+        case 0ULL:
+        case LIBURING_UDATA_TIMEOUT:
+          break;
 
-    if (events[1].revents & POLLIN)
-    {
-      read(replicator->handle, &value, sizeof(uint64_t));
-      HandleApplicationEvent(replicator);
-      events[1].revents = 0;
-    }
+        case RING_CAUSE_TIMEOUT:
+          TrackPeerList(replicator);
+          break;
 
-    if (events[2].revents & POLLIN)
-    {
-      HandleEventChannel(replicator, events[2].revents);
-      events[2].revents = 0;
-    }
+        case RING_CAUSE_EVENT_CHANNEL:
+          HandleEventChannel(replicator, completion->res);
+          break;
 
-    if (events[3].revents & POLLIN)
-    {
-      // HandleCompletionChannel(replicator);
-      events[3].revents = 0;
+        case RING_CAUSE_APPLICATION_EVENT:
+          HandleApplicationEvent(replicator);
+          break;
+
+        default:
+          HandleCompletionChannel(replicator, (struct InstantCard*)completion->user_data, completion->res);
+          break;
+      }
+
+      io_uring_cq_advance(&replicator->ring, 1);
     }
   }
-
-  close(handle);
 
   return NULL;
 }
@@ -502,12 +523,16 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
   struct rdma_addrinfo hint;
   char service[16];
 
-  if (replicator = (struct InstantReplicator*)calloc(1, sizeof(struct InstantReplicator)))
+  if ((replicator = (struct InstantReplicator*)calloc(1, sizeof(struct InstantReplicator))) &&
+      (io_uring_queue_init(INSTANT_QUEUE_LENGTH, &replicator->ring, IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER) == 0))
   {
+    io_uring_ring_dontfork(&replicator->ring);
+    io_uring_set_iowait(&replicator->ring, 0);
+    pthread_mutex_init(&replicator->lock, NULL);
+
     replicator->super.next     = next;
     replicator->super.closure  = replicator;
     replicator->super.function = HandleMonitorEvent;
-    replicator->handle         = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     replicator->secret         = strdup(secret);
     replicator->name           = strdup(name);
     replicator->limit          = limit;
@@ -521,8 +546,6 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     strncpy(replicator->handshake.name, name, INSTANT_SERVICE_NAME_LENGTH);
     uuid_copy(replicator->handshake.identifier, replicator->identifier);
     HMAC(EVP_sha1(), secret, strlen(secret), (uint8_t*)&replicator->handshake, offsetof(struct InstantHandshakeData, digest), replicator->handshake.digest, NULL);
-
-    pthread_mutex_init(&replicator->lock, NULL);
 
     snprintf(service, sizeof(service), "%d", port);
     memset(&hint, 0, sizeof(struct rdma_addrinfo));
@@ -590,7 +613,7 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
     if (replicator->channel    != NULL)  rdma_destroy_event_channel(replicator->channel);
 
     pthread_mutex_destroy(&replicator->lock);
-    close(replicator->handle);
+    io_uring_queue_exit(&replicator->ring);
     free(replicator->secret);
     free(replicator->name);
     free(replicator);

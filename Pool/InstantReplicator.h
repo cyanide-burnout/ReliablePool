@@ -8,6 +8,7 @@
 #include "ReliablePool.h"
 
 #include <uuid.h>
+#include <liburing.h>
 #include <openssl/sha.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
@@ -89,10 +90,10 @@ struct InstantReplicator
 {
   struct ReliableMonitor super;
 
+  struct io_uring ring;
   struct rdma_cm_id* descriptor;
   struct rdma_event_channel* channel;
 
-  int handle;
   pthread_t thread;
   pthread_mutex_t lock;
   ATOMIC(uint32_t) state;
