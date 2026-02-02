@@ -7,18 +7,18 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/random.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
-#include "ReliableTracker.h"
-#include "ReliableIndexer.h"
+#define RING_TAG_TIMEOUT        (LIBURING_UDATA_TIMEOUT - 1ULL)
+#define RING_TAG_EVENT_CHANNEL  (LIBURING_UDATA_TIMEOUT - 2ULL)
+#define RING_TAG_SENDING_QUEUE  (LIBURING_UDATA_TIMEOUT - 3ULL)
 
-#define RING_CAUSE_TIMEOUT            (LIBURING_UDATA_TIMEOUT - 1ULL)
-#define RING_CAUSE_EVENT_CHANNEL      (LIBURING_UDATA_TIMEOUT - 2ULL)
-#define RING_CAUSE_APPLICATION_EVENT  (LIBURING_UDATA_TIMEOUT - 3ULL)
-
-#define GENERIC_POLL_TIMEOUT      200   // Milliseconds
-#define CONNECTION_ATTEMPT_COUNT  128   //
+#define GENERIC_POLL_TIMEOUT       200
+#define COOKIE_EXPIRATION_COUNT    (60000 / GENERIC_POLL_TIMEOUT)
+#define CONNECTION_ATTEMPT_COUNT   128
 
 #define COUNT(array)  (sizeof(array) / sizeof(array[0]))
 
@@ -26,31 +26,556 @@
 #define io_uring_set_iowait(ring, value)
 #endif
 
-_Static_assert(sizeof(struct InstantHandshakeData) <= 56,                                                 "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
-_Static_assert((INSTANT_QUEUE_LENGTH != 0) && ((INSTANT_QUEUE_LENGTH & (INSTANT_QUEUE_LENGTH - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+#define WATCH(address)  ((uint32_t*)(address))
+#else
+#define WATCH(address)  ((uint32_t*)(address) + 1)
+#endif
 
-/*
-static void AddMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
+_Static_assert(sizeof(struct InstantHandshakeData) <= 56,                                                          "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
+_Static_assert((INSTANT_QUEUE_LENGTH    != 0) && ((INSTANT_QUEUE_LENGTH    & (INSTANT_QUEUE_LENGTH    - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
+_Static_assert((INSTANT_BATCH_THRESHOLD != 0) && ((INSTANT_BATCH_THRESHOLD & (INSTANT_BATCH_THRESHOLD - 1)) == 0), "INSTANT_BATCH_THRESHOLD must be a power of two");
+
+// Buffers, queues
+
+static inline uint32_t PushSendingBuffer(struct InstantSendingBufferList* list, struct InstantSendingBuffer* buffer)
 {
+  uint64_t current;
+  uint64_t next;
+
+  next = ((uint64_t)atomic_fetch_add_explicit(&buffer->tag, 1, memory_order_relaxed) << 32) | buffer->number;
+
+  do
+  {
+    current = atomic_load_explicit(&list->stack, memory_order_relaxed);
+    atomic_store_explicit(&buffer->next, current, memory_order_relaxed);
+  }
+  while (!atomic_compare_exchange_weak_explicit(&list->stack, &current, next, memory_order_release, memory_order_relaxed));
+
+  return current;
+}
+
+static inline struct InstantSendingBuffer* PopSendingBuffer(struct InstantSendingBufferList* list)
+{
+  uint64_t current;
+  uint64_t next;
+  uint32_t number;
+  struct InstantSendingBuffer* buffer;
+
+  do
+  {
+    current = atomic_load_explicit(&list->stack, memory_order_acquire);
+    number  = (uint32_t)current;
+
+    if (number == UINT32_MAX)
+    {
+      buffer = NULL;
+      break;
+    }
+
+    buffer = list->data + number;
+    next   = atomic_load_explicit(&buffer->next, memory_order_relaxed);
+  }
+  while (!atomic_compare_exchange_weak_explicit(&list->stack, &current, next, memory_order_acq_rel, memory_order_relaxed));
+
+  return buffer;
+}
+
+static void InitializeSendingBufferList(struct InstantSendingBufferList* list)
+{
+  uint32_t number;
+  struct InstantSendingBuffer* buffer;
+
+  number = INSTANT_QUEUE_LENGTH;
+  atomic_store_explicit(&list->stack, (uint64_t)UINT32_MAX, memory_order_relaxed);
+
+  while ((number --) > 0)
+  {
+    buffer         = list->data + number;
+    buffer->number = number;
+    PushSendingBuffer(list, buffer);
+  }
+}
+
+static struct InstantSendingBuffer* AllocateSendingBuffer(struct InstantSendingBufferList* list, int wait)
+{
+  struct InstantSendingBuffer* buffer;
+
+  for ( ; ; )
+  {
+    if (buffer = PopSendingBuffer(list))
+    {
+      buffer->length = 0U;
+      atomic_store_explicit(&buffer->count, 1, memory_order_relaxed);
+      return buffer;
+    }
+
+    if ((wait == 0) ||
+        (syscall(SYS_futex, WATCH(&list->stack), FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, UINT32_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+        (errno != EINTR) &&
+        (errno != EAGAIN))
+
+    {
+      //
+      return NULL;
+    }
+  }
+}
+
+static void ReleaseSendingBuffer(struct InstantSendingBufferList* list, struct InstantSendingBuffer* buffer)
+{
+  if ((atomic_fetch_sub_explicit(&buffer->count, 1, memory_order_relaxed) == 1) &&
+      (PushSendingBuffer(list, buffer) == UINT32_MAX))
+  {
+    while ((syscall(SYS_futex, WATCH(&list->stack), FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+           (errno == EINTR));
+  }
+}
+
+static int SubmitSendingQueue(struct InstantSendingQueue* queue, struct InstantSendingBuffer* buffer)
+{
+  uint32_t head;
+  uint32_t tail;
+
+  if ((queue  == NULL) ||
+      (buffer == NULL))
+  {
+    //
+    return -EINVAL;
+  }
+
+  do
+  {
+    head = atomic_load_explicit(&queue->head, memory_order_relaxed);
+    tail = atomic_load_explicit(&queue->tail, memory_order_acquire);
+
+    if ((uint32_t)(head - tail) >= INSTANT_QUEUE_LENGTH)
+    {
+      //
+      return -EAGAIN;
+    }
+  }
+  while (!atomic_compare_exchange_weak_explicit(&queue->head, &head, head + 1, memory_order_acq_rel, memory_order_relaxed));
+
+  atomic_store_explicit(&queue->data[head & (INSTANT_QUEUE_LENGTH - 1)], buffer, memory_order_release);
+
+  if (atomic_fetch_add_explicit(&queue->count, 1, memory_order_release) == 0)
+  {
+    while ((syscall(SYS_futex, (uint32_t*)&queue->count, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+           (errno == EINTR));
+  }
+
+  return 0;
+}
+
+static struct InstantSendingBuffer* AdvanceSendingQueue(struct InstantSendingQueue* queue)
+{
+  uint32_t tail;
+  uint32_t slot;
+  struct InstantSendingBuffer* buffer;
+
+  buffer = NULL;
+
+  if (atomic_load_explicit(&queue->count, memory_order_acquire) != 0)
+  {
+    tail = atomic_load_explicit(&queue->tail, memory_order_relaxed);
+    slot = tail & (INSTANT_QUEUE_LENGTH - 1);
+
+    while ((buffer = atomic_load_explicit(&queue->data[slot], memory_order_acquire)) == NULL)
+    {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+      __asm__ __volatile__("yield");
+#else
+      __asm__ __volatile__("" ::: "memory");
+#endif
+    }
+
+    atomic_store_explicit(&queue->data[slot], NULL, memory_order_release);
+    atomic_store_explicit(&queue->tail, tail + 1, memory_order_release);
+    atomic_fetch_sub_explicit(&queue->count, 1, memory_order_release);
+  }
+
+  return buffer;
+}
+
+static void SubmitRequestQueue(struct InstantRequestQueue* queue, struct InstantRequestItem* item)
+{
+  struct InstantRequestItem* other;
+
+  if (other = queue->tail)
+  {
+    other->next         = item;
+    other->request.next = &item->request;
+  }
+  else
+  {
+    //
+    queue->head = item;
+  }
+
+  item->next         = NULL;
+  item->request.next = NULL;
+  queue->tail        = item;
+}
+
+static void AdvanceRequestQueue(struct InstantRequestQueue* queue)
+{
+  struct InstantRequestItem* item;
+
+  if (((item        = queue->head) != NULL) &&
+      ((queue->head = item->next)  == NULL))
+  {
+    // Reset tail when queue is empty
+    queue->tail = NULL;
+  }
+}
+
+static struct InstantRequestItem* AllocateRequestItem(struct InstantReplicator* replicator)
+{
+  struct InstantRequestItem* item;
+
+  if (item = replicator->items)
+  {
+    memset(&item->request, 0, sizeof(struct ibv_send_wr));
+    memset(&item->element, 0, sizeof(struct ibv_sge));
+    replicator->items = item->next;
+    return item;
+  }
+
+  return (struct InstantRequestItem*)calloc(1, sizeof(struct InstantRequestItem));
+}
+
+static void ReleaseRequestItem(struct InstantReplicator* replicator, struct InstantRequestItem* item)
+{
+  item->next        = replicator->items;
+  replicator->items = item;
+}
+
+// Cookies
+
+static struct InstantCookie* EnsureCookie(struct InstantReplicator* replicator, struct ReliablePool* pool)
+{
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct InstantCookie* other;
+  struct ReliableShare* share;
+  struct InstantCard* card;
+  struct ibv_mr* region;
+  uint32_t number;
+
+  pthread_mutex_lock(&replicator->lock);
+  pthread_rwlock_rdlock(&pool->lock);
+
+  cookie = (struct InstantCookie*)pool->closures[1];
+  share  = pool->share;
+  card   = replicator->cards;
+
+  if ((cookie != NULL) &&
+      (cookie->share != share))
+  {
+    if (other = replicator->cookies)
+    {
+      cookie->next    = other;
+      other->previous = cookie;
+    }
+
+    replicator->cookies = cookie;
+    cookie->expiration  = COOKIE_EXPIRATION_COUNT;
+    cookie              = NULL;
+    pool->closures[1]   = NULL;
+  }
+
+  if ((cookie == NULL) &&
+      (cookie  = (struct InstantCookie*)calloc(1, sizeof(struct InstantCookie))))
+  {
+    memory              = share->memory;
+    cookie->share       = share;
+    cookie->data.length = sizeof(struct InstantCookieData);
+    pool->closures[1]   = cookie;
+    memcpy(cookie->data.name, memory->name, RELIABLE_MEMORY_NAME_LENGTH);
+    atomic_fetch_add_explicit(&share->weight, RELIABLE_WEIGHT_WEAK, memory_order_relaxed);
+  }
+
+  pthread_rwlock_unlock(&pool->lock);
+
+  if ((cookie != NULL) &&
+      (card   != NULL) &&
+      (cookie->data.count <= card->number))
+  {
+    number              = cookie->data.count;
+    cookie->data.count  = card->number + 1;
+    cookie->data.length = sizeof(struct InstantCookieData) + cookie->data.count * sizeof(uint32_t);
+
+    do
+    {
+      if (region = ibv_reg_mr(card->domain, share->memory, share->size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ))
+      {
+        cookie->regions[card->number]   = region;
+        cookie->data.keys[card->number] = region->rkey;
+      }
+
+      card = card->next;
+    }
+    while ((card != NULL) &&
+           (card->number >= number));
+
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+
+  return cookie;
+}
+
+static void RetireCookie(struct InstantReplicator* replicator, struct ReliablePool* pool)
+{
+  struct InstantCookie* cookie;
+  struct InstantCookie* other;
+
+  pthread_mutex_lock(&replicator->lock);
+  pthread_rwlock_rdlock(&pool->lock);
+
+  if (cookie = (struct InstantCookie*)pool->closures[1])
+  {
+    if (other = replicator->cookies)
+    {
+      cookie->next    = other;
+      other->previous = cookie;
+    }
+
+    replicator->cookies = cookie;
+    cookie->expiration  = COOKIE_EXPIRATION_COUNT;
+    pool->closures[1]   = NULL;
+  }
+
+  pthread_rwlock_unlock(&pool->lock);
+  pthread_mutex_unlock(&replicator->lock);
+}
+
+static void DestroyCookie(struct InstantCookie* cookie)
+{
+  uint32_t number;
+  struct ibv_mr* region;
+
+  for (number = 0; number < cookie->data.count; ++ number)
+  {
+    if (region = cookie->regions[number])
+    {
+      // ibv_dereg_mr() is not NULL-tolerant
+      ibv_dereg_mr(region);
+    }
+  }
+
+  ReleaseReliableShare(cookie->share);
+  free(cookie);
+}
+
+static int HandleCookieIterator(void* key, size_t size, void* data, void* argument1, void* argument2)
+{
+  EnsureCookie((struct InstantReplicator*)argument1, (struct ReliablePool*)data);
+  return 0;
+}
+
+static void UpdateCookieList(struct InstantReplicator* replicator)
+{
+  struct ReliableIndexer* indexer;
+
+  if (indexer = replicator->indexer)
+  {
+    pthread_rwlock_rdlock(&indexer->lock);
+    IterateThroughHashMap(indexer->map, HandleCookieIterator, replicator, NULL);
+    pthread_rwlock_unlock(&indexer->lock);
+  }
+}
+
+static void TrackCookieList(struct InstantReplicator* replicator)
+{
+  struct InstantCookie* cookie;
+  struct InstantCookie* next;
+  struct InstantCookie* previous;
+
   pthread_mutex_lock(&replicator->lock);
 
-  share->closures[1] = ibv_reg_mr(replicator->domain, share->memory, share->size,
-    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+  for (previous = NULL, cookie = replicator->cookies; cookie != NULL; cookie = next)
+  {
+    next = cookie->next;
+
+    if ((-- cookie->expiration) == 0)
+    {
+      if (next     != NULL)  next->previous      = previous;
+      if (previous != NULL)  previous->next      = next;
+      else                   replicator->cookies = next;
+
+      DestroyCookie(cookie);
+      continue;
+    }
+
+    previous = cookie;
+  }
 
   pthread_mutex_unlock(&replicator->lock);
 }
 
-static void RemoveMemoryRegion(struct InstantReplicator* replicator, struct ReliableShare* share)
+// Submissions
+
+static int SubmitSendingBuffer(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantSendingBuffer* buffer)
 {
+  struct InstantRequestItem* item;
+  struct InstantCard* card;
   struct ibv_mr* region;
 
-  if (region = (struct ibv_mr*)share->closures[1])
+  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+      (card = peer->card)                           &&
+      (item = AllocateRequestItem(replicator)))
   {
-    // ibv_dereg_mr() has no NULL-tolerance
-    ibv_dereg_mr(region);
+    region                   = card->region2;
+    item->element.addr       = (uintptr_t)buffer->data;
+    item->element.length     = buffer->length;
+    item->element.lkey       = region->lkey;
+    item->request.wr_id      = (uintptr_t)buffer;
+    item->request.sg_list    = &item->element;
+    item->request.num_sge    = 1;
+    item->request.opcode     = IBV_WR_SEND_WITH_IMM;
+    item->request.send_flags = IBV_SEND_SIGNALED;
+    item->request.imm_data   = card->number;
+
+    atomic_fetch_add_explicit(&buffer->count, 1, memory_order_relaxed);
+    SubmitRequestQueue(&peer->queue, item);
+    return 0;
+  }
+
+  return -1;
+}
+
+static int SubmitReadingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block)
+{
+  struct InstantRequestItem* item;
+  struct InstantCard* card;
+
+  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+      (card = peer->card)                           &&
+      (item = AllocateRequestItem(replicator)))
+  {
+    item->element.addr                = (uintptr_t)&block->mark;
+    item->element.length              = entry->length;
+    item->element.lkey                = region->lkey;
+    item->request.sg_list             = &item->element;
+    item->request.num_sge             = 1;
+    item->request.opcode              = IBV_WR_RDMA_READ;
+    item->request.wr.rdma.remote_addr = entry->address;
+    item->request.wr.rdma.rkey        = key;
+
+    if (task != NULL)
+    {
+      item->request.wr_id      = (uintptr_t)task;
+      item->request.send_flags = IBV_SEND_SIGNALED;
+    }
+
+    SubmitRequestQueue(&peer->queue, item);
+    return 0;
+  }
+
+  return -1;
+}
+
+static int SubmitWritingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t number, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block)
+{
+  struct InstantRequestItem* item;
+  struct InstantCard* card;
+
+  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+      (card = peer->card)                           &&
+      (item = AllocateRequestItem(replicator)))
+  {
+    item->element.addr                = (uintptr_t)&block->mark;
+    item->element.length              = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
+    item->element.lkey                = region->lkey;
+    item->request.wr_id               = number;
+    item->request.sg_list             = &item->element;
+    item->request.num_sge             = 1;
+    item->request.opcode              = IBV_WR_RDMA_WRITE;
+    item->request.send_flags          = IBV_SEND_SIGNALED;
+    item->request.wr.rdma.remote_addr = entry->address;
+    item->request.wr.rdma.rkey        = key;
+
+    if (task != NULL)
+    {
+      item->request.wr_id      = (uintptr_t)task;
+      item->request.opcode     = IBV_WR_RDMA_WRITE_WITH_IMM;
+      item->request.send_flags = IBV_SEND_SIGNALED;
+      item->request.imm_data   = number;
+    }
+
+    SubmitRequestQueue(&peer->queue, item);
+    return 0;
+  }
+
+  return -1;
+}
+
+// Monitor
+
+static void HandleBlockChange(struct InstantReplicator* replicator, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block)
+{
+  static __thread struct InstantSendingBuffer* buffer = NULL;
+  static __thread struct InstantCookie* cookie = NULL;
+  static __thread struct ReliablePool* last = NULL;
+
+  struct InstantHeaderData* header;
+  struct InstantBlockData* entry;
+  uintptr_t address;
+
+  if (block != NULL)
+  {
+    if (last != pool)
+    {
+      SubmitSendingQueue(&replicator->queue, buffer);
+      buffer = NULL;
+      cookie = NULL;
+      last   = pool;
+    }
+
+    if ((buffer == NULL) &&
+        (cookie  = EnsureCookie(replicator, pool)) &&
+        (buffer  = AllocateSendingBuffer(&replicator->buffers, 1)))
+    {
+      pthread_mutex_lock(&replicator->lock);
+      header         = (struct InstantHeaderData*)buffer->data;
+      header->type   = INSTANT_TYPE_NOTIFY;
+      header->task   = UINT32_MAX;
+      buffer->length = sizeof(struct InstantHeaderData) + cookie->data.length;
+      memcpy(buffer->data + sizeof(struct InstantHeaderData), &cookie->data, cookie->data.length);
+      uuid_copy(header->identifier, replicator->identifier);
+      pthread_mutex_unlock(&replicator->lock);
+    }
+
+    if (buffer != NULL)
+    {
+      // Most likely, passed block belongs to shadow share, that requires to remap its virtual address to actual cooked share
+      address  = (uintptr_t)&block->mark - (uintptr_t)share->memory;
+      share    = cookie->share;
+      address += (uintptr_t)share->memory;
+
+      entry           = (struct InstantBlockData*)(buffer->data + buffer->length);
+      entry->mark     = atomic_load_explicit(&block->mark, memory_order_acquire);
+      entry->length   = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
+      entry->address  = address;
+      buffer->length += sizeof(struct InstantBlockData);
+      uuid_copy(entry->identifier, block->identifier);
+    }
+  }
+
+  if ((buffer != NULL) &&
+      ((block == NULL) ||
+       (buffer->length >= INSTANT_MESSAGE_THRESHOLD)))
+  {
+    SubmitSendingQueue(&replicator->queue, buffer);
+    buffer = NULL;
+    cookie = NULL;
+    last   = NULL;
   }
 }
-*/
 
 static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
 {
@@ -58,11 +583,74 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
 
   replicator = (struct InstantReplicator*)closure;
 
+  switch (event)
+  {
+    case RELIABLE_MONITOR_POOL_CREATE:
+      replicator->indexer = GetReliableIndexer(pool);
+
+    case RELIABLE_MONITOR_SHARE_CREATE:
+      EnsureCookie(replicator, pool);
+      break;
+
+    case RELIABLE_MONITOR_POOL_RELEASE:
+      RetireCookie(replicator, pool);
+      break;
+
+    case RELIABLE_MONITOR_BLOCK_CHANGE:
+    case RELIABLE_MONITOR_FLUSH_COMMIT:
+      HandleBlockChange(replicator, pool, share, block);
+      break;
+  }
 }
 
-static void HandleApplicationEvent(struct InstantReplicator* replicator)
+static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
+{
+  struct InstantSendingBuffer* buffer;
+  struct io_uring_sqe* submission;
+  struct InstantPeer* peer;
+
+  while (buffer = AdvanceSendingQueue(&replicator->queue))
+  {
+    pthread_mutex_lock(&replicator->lock);
+
+    for (peer = replicator->peers; peer != NULL; peer = peer->next)
+    {
+      // SubmitSendingBuffer() increments buffer->count
+      SubmitSendingBuffer(replicator, peer, buffer);
+    }
+
+    pthread_mutex_unlock(&replicator->lock);
+    ReleaseSendingBuffer(&replicator->buffers, buffer);
+  }
+
+  if (submission = io_uring_get_sqe(&replicator->ring))
+  {
+    io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->queue.count, 0, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
+    io_uring_sqe_set_data64(submission, RING_TAG_SENDING_QUEUE);
+  }
+}
+
+// Message and work handling
+
+static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t* data, uint32_t length, uint32_t number, int status, int flags)
 {
 
+}
+
+static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t number, int status)
+{
+
+}
+
+
+static void HandleCompletedRead(struct InstantReplicator* replicator, struct InstantTask* task, int opcode, int status)
+{
+  // if (status != IBV_WC_SUCCESS)
+}
+
+static void HandleCompletedWrite(struct InstantReplicator* replicator, struct InstantTask* task, int opcode, int status)
+{
+  // if (status != IBV_WC_SUCCESS)
 }
 
 // Transport abstractions
@@ -71,19 +659,19 @@ static int SubmitReceivingBuffer(struct InstantCard* card, uint64_t number)
 {
   struct ibv_mr* region;
   struct ibv_sge element;
-  struct ibv_recv_wr work;
-  struct ibv_recv_wr* bad;
+  struct ibv_recv_wr request;
+  struct ibv_recv_wr* temporary;
 
-  region         = card->region1;
-  element.addr   = (uintptr_t)card->buffers[number];
-  element.length = INSTANT_BUFFER_LENGTH;
-  element.lkey   = region->lkey;
-  work.wr_id     = number;
-  work.next      = NULL;
-  work.sg_list   = &element;
-  work.num_sge   = 1;
+  region          = card->region1;
+  element.addr    = (uintptr_t)card->buffers[number];
+  element.length  = INSTANT_BUFFER_LENGTH;
+  element.lkey    = region->lkey;
+  request.wr_id   = number;
+  request.next    = NULL;
+  request.sg_list = &element;
+  request.num_sge = 1;
 
-  return ibv_post_srq_recv(card->queue1, &work, &bad);
+  return ibv_post_srq_recv(card->queue1, &request, &temporary);
 }
 
 static int SubmitInitialReceivingBufferList(struct InstantCard* card)
@@ -95,7 +683,7 @@ static int SubmitInitialReceivingBufferList(struct InstantCard* card)
   return -(number != INSTANT_QUEUE_LENGTH * 2);
 }
 
-static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator, struct ibv_context* context)
+static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, struct ibv_context* context)
 {
   struct InstantCard* card;
   struct InstantCard* other;
@@ -116,12 +704,14 @@ static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator
           (card->domain  = ibv_alloc_pd(context))                    &&
           (card->queue1  = ibv_create_srq(card->domain, &attribute)) &&
           (card->queue2  = ibv_create_cq(context, INSTANT_QUEUE_LENGTH * 2, NULL, card->channel, 0)) &&
-          (card->region1 = ibv_reg_mr(card->domain, card->buffers, sizeof(card->buffers), IBV_ACCESS_LOCAL_WRITE)) &&
+          (card->region1 = ibv_reg_mr(card->domain, card->buffers,        sizeof(card->buffers),       IBV_ACCESS_LOCAL_WRITE)) &&
+          (card->region2 = ibv_reg_mr(card->domain, &replicator->buffers, sizeof(replicator->buffers), IBV_ACCESS_LOCAL_WRITE)) &&
           (SubmitInitialReceivingBufferList(card) == 0)))
     {
       if (card->queue1   != NULL)  ibv_destroy_srq(card->queue1);
       if (card->queue2   != NULL)  ibv_destroy_cq(card->queue2);
       if (card->region1  != NULL)  ibv_dereg_mr(card->region1);
+      if (card->region2  != NULL)  ibv_dereg_mr(card->region2);
       if (card->domain   != NULL)  ibv_dealloc_pd(card->domain);
       if (card->channel  != NULL)  ibv_destroy_comp_channel(card->channel);
 
@@ -134,7 +724,7 @@ static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator
     card->attribute.cap.max_send_sge    = 1;
     card->attribute.cap.max_recv_sge    = attribute.attr.max_sge;
     card->attribute.cap.max_inline_data = 256;
-    card->attribute.sq_sig_all          = 1;
+    card->attribute.sq_sig_all          = 0;
     card->attribute.srq                 = card->queue1;
     card->attribute.send_cq             = card->queue2;
     card->attribute.recv_cq             = card->queue2;
@@ -149,29 +739,31 @@ static struct InstantCard* FindOrCreateCard(struct InstantReplicator* replicator
       io_uring_sqe_set_data(submission, card);
     }
 
+    pthread_mutex_lock(&replicator->lock);
+
     if (other = replicator->cards)
     {
       card->next      = other;
+      card->number    = other->number + 1;
       other->previous = card;
     }
 
     replicator->cards = card;
+
+    pthread_mutex_unlock(&replicator->lock);
+
+    UpdateCookieList(replicator);
   }
 
   return card;
 }
 
-static void RemoveCard(struct InstantReplicator* replicator, struct InstantCard* card)
+static void DestroyCard(struct InstantCard* card)
 {
-  struct InstantCard* other;
-
-  if (other = card->next)      other->previous   = card->previous;
-  if (other = card->previous)  other->next       = card->next;
-  else                         replicator->cards = card->next;
-
   ibv_destroy_srq(card->queue1);
   ibv_destroy_cq(card->queue2);
   ibv_dereg_mr(card->region1);
+  ibv_dereg_mr(card->region2);
   ibv_dealloc_pd(card->domain);
   ibv_destroy_comp_channel(card->channel);
   free(card);
@@ -196,18 +788,29 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
     {
       for (completion = completions; completion < (completions + result); ++ completion)
       {
-        // if (completion->status != IBV_WC_SUCCESS)
         switch (completion->opcode)
         {
-          case IBV_WC_RECV:
-          case IBV_WC_RECV_RDMA_WITH_IMM:
-            SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
-            // HandleReceivedMessage(replicator, card->buffers[completion->wr_id], completion->byte_len);
+          case IBV_WC_SEND:
+            ReleaseSendingBuffer(&replicator->buffers, (struct InstantSendingBuffer*)completion->wr_id);
             break;
 
-          case IBV_WC_SEND:        break;
-          case IBV_WC_RDMA_READ:   break;
-          case IBV_WC_RDMA_WRITE:  break;
+          case IBV_WC_RECV:
+            SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
+            HandleReceivedMessage(replicator, card->buffers[completion->wr_id], completion->byte_len, completion->imm_data, completion->status, completion->wc_flags & IBV_WC_WITH_IMM);
+            break;
+
+          case IBV_WC_RECV_RDMA_WITH_IMM:
+            SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
+            HandleTranferredData(replicator, completion->imm_data, completion->status);
+            break;
+
+          case IBV_WC_RDMA_READ:
+            HandleCompletedRead(replicator, (struct InstantTask*)completion->wr_id, completion->opcode, completion->status);
+            break;
+
+          case IBV_WC_RDMA_WRITE:
+            HandleCompletedWrite(replicator, (struct InstantTask*)completion->wr_id, completion->opcode, completion->status);
+            break;
         }
       }
     }
@@ -218,6 +821,71 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
     io_uring_prep_poll_add(submission, card->channel->fd, POLLIN);
     io_uring_sqe_set_data(submission, card);
   }
+}
+
+static void ClearRequestQueue(struct InstantReplicator* replicator, struct InstantRequestQueue* queue)
+{
+  struct InstantRequestItem* item;
+
+  while (item = queue->head)
+  {
+    if (item->request.send_flags & IBV_SEND_SIGNALED)
+    {
+      switch (item->request.opcode)
+      {
+        case IBV_WR_SEND:
+        case IBV_WR_SEND_WITH_IMM:
+          ReleaseSendingBuffer(&replicator->buffers, (struct InstantSendingBuffer*)item->request.wr_id);
+          break;
+
+        case IBV_WR_RDMA_READ:
+          HandleCompletedRead(replicator, (struct InstantTask*)item->request.wr_id, item->request.opcode, IBV_WC_WR_FLUSH_ERR);
+          break;
+
+        case IBV_WR_RDMA_WRITE:
+        case IBV_WR_RDMA_WRITE_WITH_IMM:
+          HandleCompletedWrite(replicator, (struct InstantTask*)item->request.wr_id, item->request.opcode, IBV_WC_WR_FLUSH_ERR);
+          break;
+      }
+    }
+
+    AdvanceRequestQueue(queue);
+    ReleaseRequestItem(replicator, item);
+  }
+}
+
+static void TrackRequestQueueList(struct InstantReplicator* replicator)
+{
+  int result;
+  struct InstantPeer* peer;
+  struct ibv_send_wr* request;
+  struct rdma_cm_id* descriptor;
+  struct InstantRequestItem* item;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+        (descriptor   = peer->descriptor))
+    {
+      if (item = peer->queue.head)
+      {
+        request = NULL;
+        result  = ibv_post_send(descriptor->qp, &item->request, &request);
+
+        while ((item = peer->queue.head) &&
+               ((result  == 0) ||
+                (request != &item->request)))
+        {
+          AdvanceRequestQueue(&peer->queue);
+          ReleaseRequestItem(replicator, item);
+        }
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
 }
 
 // Connection tracking
@@ -244,7 +912,7 @@ static int HandleConnectRequest(struct InstantReplicator* replicator, struct rdm
   struct InstantHandshakeData* handshake;
   uint8_t digest[SHA_DIGEST_LENGTH];
 
-  card      = FindOrCreateCard(replicator, descriptor->verbs);
+  card      = EnsureCard(replicator, descriptor->verbs);
   peer      = NULL;
   handshake = NULL;
 
@@ -310,6 +978,8 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
     peer->fails ++;
     peer->round ++;
     peer->round %= INSTANT_POINT_COUNT;
+
+    ClearRequestQueue(replicator, &peer->queue);
   }
 
   return -1;
@@ -331,7 +1001,7 @@ static int HandleRouteResolved(struct InstantReplicator* replicator, struct rdma
   struct InstantCard* card;
   struct InstantPeer* peer;
 
-  card       = FindOrCreateCard(replicator, descriptor->verbs);
+  card       = EnsureCard(replicator, descriptor->verbs);
   peer       = (struct InstantPeer*)descriptor->context;
   peer->card = card;
 
@@ -361,17 +1031,33 @@ static void HandleEventChannel(struct InstantReplicator* replicator, int result)
 
     switch (event->event)
     {
-      case RDMA_CM_EVENT_CONNECT_REQUEST:  result = HandleConnectRequest(replicator, descriptor, &event->param.conn);  break;
-      case RDMA_CM_EVENT_ADDR_RESOLVED:    result = HandleAddressResolved(replicator, descriptor);                     break;
-      case RDMA_CM_EVENT_ROUTE_RESOLVED:   result = HandleRouteResolved(replicator, descriptor);                       break;
-      case RDMA_CM_EVENT_ESTABLISHED:      result = HandleEstablished(replicator, descriptor);                         break;
+      case RDMA_CM_EVENT_CONNECT_REQUEST:
+        result = HandleConnectRequest(replicator, descriptor, &event->param.conn);
+        break;
+
+      case RDMA_CM_EVENT_ADDR_RESOLVED:
+        result = HandleAddressResolved(replicator, descriptor);
+        break;
+
+      case RDMA_CM_EVENT_ROUTE_RESOLVED:
+        result = HandleRouteResolved(replicator, descriptor);
+        break;
+
+      case RDMA_CM_EVENT_ESTABLISHED:
+        result = HandleEstablished(replicator, descriptor);
+        break;
+
       case RDMA_CM_EVENT_ADDR_ERROR:
       case RDMA_CM_EVENT_ROUTE_ERROR:
       case RDMA_CM_EVENT_CONNECT_ERROR:
       case RDMA_CM_EVENT_UNREACHABLE:
       case RDMA_CM_EVENT_REJECTED:
-      case RDMA_CM_EVENT_DISCONNECTED:     result = HandleDisconnected(replicator, descriptor, event->event);          break;
-      case RDMA_CM_EVENT_DEVICE_REMOVAL:   raise(SIGABRT);
+      case RDMA_CM_EVENT_DISCONNECTED:
+        result = HandleDisconnected(replicator, descriptor, event->event);
+        break;
+
+      case RDMA_CM_EVENT_DEVICE_REMOVAL:
+        raise(SIGABRT);
     }
 
     rdma_ack_cm_event(event);
@@ -381,7 +1067,7 @@ static void HandleEventChannel(struct InstantReplicator* replicator, int result)
   if (submission = io_uring_get_sqe(&replicator->ring))
   {
     io_uring_prep_poll_add(submission, replicator->channel->fd, POLLIN);
-    io_uring_sqe_set_data64(submission, RING_CAUSE_EVENT_CHANNEL);
+    io_uring_sqe_set_data64(submission, RING_TAG_EVENT_CHANNEL);
   }
 }
 
@@ -438,8 +1124,9 @@ static void TrackPeerList(struct InstantReplicator* replicator)
     {
       if (peer->fails >= CONNECTION_ATTEMPT_COUNT)
       {
-        if (previous != NULL) previous->next    = next;
-        else                  replicator->peers = next;
+        if (next     != NULL)  next->previous    = previous;
+        if (previous != NULL)  previous->next    = next;
+        else                   replicator->peers = next;
 
         free(peer);
         continue;
@@ -473,14 +1160,11 @@ static void* DoWork(void* closure)
   if (submission = io_uring_get_sqe(&replicator->ring))
   {
     io_uring_prep_timeout(submission, &interval, 0, IORING_TIMEOUT_MULTISHOT);
-    io_uring_sqe_set_data64(submission, RING_CAUSE_TIMEOUT);
+    io_uring_sqe_set_data64(submission, RING_TAG_TIMEOUT);
   }
 
-  if (submission = io_uring_get_sqe(&replicator->ring))
-  {
-    io_uring_prep_poll_add(submission, replicator->channel->fd, POLLIN);
-    io_uring_sqe_set_data64(submission, RING_CAUSE_EVENT_CHANNEL);
-  }
+  HandleSendingQueue(replicator, 0);
+  HandleEventChannel(replicator, 0);
 
   while ((atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE) &&
          (io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL) >= 0))
@@ -493,16 +1177,17 @@ static void* DoWork(void* closure)
         case LIBURING_UDATA_TIMEOUT:
           break;
 
-        case RING_CAUSE_TIMEOUT:
+        case RING_TAG_TIMEOUT:
           TrackPeerList(replicator);
+          TrackCookieList(replicator);
           break;
 
-        case RING_CAUSE_EVENT_CHANNEL:
+        case RING_TAG_SENDING_QUEUE:
+          HandleSendingQueue(replicator, completion->res);
+          break;
+
+        case RING_TAG_EVENT_CHANNEL:
           HandleEventChannel(replicator, completion->res);
-          break;
-
-        case RING_CAUSE_APPLICATION_EVENT:
-          HandleApplicationEvent(replicator);
           break;
 
         default:
@@ -511,9 +1196,11 @@ static void* DoWork(void* closure)
       }
 
       io_uring_cq_advance(&replicator->ring, 1);
+      TrackRequestQueueList(replicator);
     }
   }
 
+  atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_FAILURE, memory_order_relaxed);
   return NULL;
 }
 
@@ -521,6 +1208,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
 {
   struct InstantReplicator* replicator;
   struct rdma_addrinfo* information;
+  pthread_mutexattr_t attribute;
   struct rdma_addrinfo hint;
   char service[16];
 
@@ -529,7 +1217,11 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
   {
     io_uring_ring_dontfork(&replicator->ring);
     io_uring_set_iowait(&replicator->ring, 0);
-    pthread_mutex_init(&replicator->lock, NULL);
+
+    pthread_mutexattr_init(&attribute);
+    pthread_mutexattr_settype(&attribute, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&replicator->lock, &attribute);
+    pthread_mutexattr_destroy(&attribute);
 
     replicator->super.next     = next;
     replicator->super.closure  = replicator;
@@ -547,6 +1239,8 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     strncpy(replicator->handshake.name, name, INSTANT_SERVICE_NAME_LENGTH);
     uuid_copy(replicator->handshake.identifier, replicator->identifier);
     HMAC(EVP_sha1(), secret, strlen(secret), (uint8_t*)&replicator->handshake, offsetof(struct InstantHandshakeData, digest), replicator->handshake.digest, NULL);
+
+    InitializeSendingBufferList(&replicator->buffers);
 
     snprintf(service, sizeof(service), "%d", port);
     memset(&hint, 0, sizeof(struct rdma_addrinfo));
@@ -588,6 +1282,8 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
 {
   struct InstantPeer* peer;
   struct InstantCard* card;
+  struct InstantCookie* cookie;
+  struct InstantRequestItem* item;
 
   if (replicator != NULL)
   {
@@ -600,14 +1296,27 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
     while (peer = replicator->peers)
     {
       replicator->peers = peer->next;
+      ClearRequestQueue(replicator, &peer->queue);
       DestroyDescriptor(peer->descriptor, 1);
       free(peer);
     }
 
+    while (cookie = replicator->cookies)
+    {
+      replicator->cookies = cookie->next;
+      DestroyCookie(cookie);
+    }
+
     while (card = replicator->cards)
     {
-      // Remove all resources associated with HCA
-      RemoveCard(replicator, card);
+      replicator->cards = card->next;
+      DestroyCard(card);
+    }
+
+    while (item = replicator->items)
+    {
+      replicator->items = item->next;
+      free(item);
     }
 
     if (replicator->descriptor != NULL)  rdma_destroy_ep(replicator->descriptor);

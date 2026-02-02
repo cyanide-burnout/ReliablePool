@@ -18,6 +18,7 @@
 
 #include "InstantReplicator.h"
 #include "InstantDiscovery.h"
+#include "InstantWaiter.h"
 
 #define STATE_RUNNING  -1
 
@@ -102,7 +103,8 @@ int main(int count, char** arguments)
   struct InstantReplicator* replicator;
 
   struct FastRing* ring;
-  struct FastRingDescriptor* waiter;
+  struct FastRingDescriptor* waiter1;
+  struct FastRingDescriptor* waiter2;
   struct FastRingDescriptor* timeout;
   struct InstantDiscovery* discovery;
 
@@ -129,7 +131,8 @@ int main(int count, char** arguments)
 
   ring      = CreateFastRing(0);
   poll      = CreateFastAvahiPoll(ring);
-  waiter    = SubmitReliableWaiter(ring, tracker);
+  waiter1   = SubmitReliableWaiter(ring, tracker);
+  waiter2   = SubmitInstantWaiter(ring, replicator);
   discovery = CreateInstantDiscovery(poll, replicator);
   timeout   = SetFastRingTimeout(ring, NULL, 100, TIMEOUT_FLAG_REPEAT, HandleTimeoutCompletion, pool);
 
@@ -165,7 +168,8 @@ int main(int count, char** arguments)
 
   SetFastRingTimeout(ring, timeout, -1, 0, NULL, NULL);
   ReleaseInstantDiscovery(discovery);
-  CancelReliableWaiter(waiter);
+  CancelInstantWaiter(waiter2);
+  CancelReliableWaiter(waiter1);
   ReleaseFastAvahiPoll(poll);
   ReleaseFastRing(ring);
 

@@ -6,6 +6,8 @@
 #endif
 
 #include "ReliablePool.h"
+#include "ReliableTracker.h"
+#include "ReliableIndexer.h"
 
 #include <uuid.h>
 #include <liburing.h>
@@ -24,6 +26,9 @@ extern "C"
 #define INSTANT_MAGIC                0xe29a
 #define INSTANT_SERVICE_NAME_LENGTH  16
 
+#define INSTANT_TYPE_NOTIFY     1
+#define INSTANT_TYPE_RETREIVE   2
+
 struct InstantHandshakeData
 {
   uint16_t magic;                          // 2
@@ -33,33 +38,114 @@ struct InstantHandshakeData
   uint8_t digest[SHA_DIGEST_LENGTH];       // 56
 } __attribute__((packed));
 
+struct InstantCookieData
+{
+  uint32_t length;                         // Length of whole chunk
+  uint32_t count;                          // Count of registered regions
+  char name[RELIABLE_MEMORY_NAME_LENGTH];  // Name of pool
+  uint32_t keys[0];                        // List of remote keys
+} __attribute__((packed));
+
+struct InstantBlockData
+{
+  uuid_t identifier;  // Block UUID
+  uint64_t address;   // ReliableBlock::mark
+  uint32_t length;    // sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length
+  uint64_t mark;      //
+} __attribute__((packed));
+
+struct InstantHeaderData
+{
+  uuid_t identifier;  // Local instance UUID
+  uint16_t type;      // INSTANT_TYPE_*
+  uint32_t task;      // Task ID (for IBV_WC_RECV_RDMA_WITH_IMM) or UINT32_MAX
+} __attribute__((packed));
+
 // Replicator
 
 #define INSTANT_REPLICATOR_STATE_ACTIVE   (1 << 0)
 #define INSTANT_REPLICATOR_STATE_FAILURE  (1 << 1)
+#define INSTANT_REPLICATOR_STATE_HOLD     (1 << 2)
+#define INSTANT_REPLICATOR_STATE_READY    (1 << 3)
 
-#define INSTANT_PEER_STATE_DISCONNECTED 0
-#define INSTANT_PEER_STATE_CONNECTING   1
-#define INSTANT_PEER_STATE_CONNECTED    2
+#define INSTANT_PEER_STATE_DISCONNECTED  0
+#define INSTANT_PEER_STATE_CONNECTING    1
+#define INSTANT_PEER_STATE_CONNECTED     2
 
-#define INSTANT_POINT_COUNT  8
+#define INSTANT_POINT_COUNT  8    // Very optimistic (usually reserve 2-4 legs)
+#define INSTANT_CARD_COUNT   128  // More HCAs are unexpected (who uses more than two?)
 
-#define INSTANT_QUEUE_LENGTH   4096
-#define INSTANT_BUFFER_LENGTH  4096
+#define INSTANT_QUEUE_LENGTH   2048  // Must be a power of two
+#define INSTANT_BUFFER_LENGTH  4096  // Dangerous! Do not touch!
+
+#define INSTANT_BATCH_THRESHOLD    128  // Upper bound, where 4K message fits 111 blocks
+#define INSTANT_MESSAGE_THRESHOLD  (INSTANT_BUFFER_LENGTH - 2 * sizeof(struct InstantBlockData))
+
+struct InstantSendingBuffer
+{
+  uint32_t number;         // Buffer number
+  uint32_t length;         // Length of data
+  ATOMIC(uint32_t) tag;    // Generation tag
+  ATOMIC(uint64_t) next;   // Next buffer on stack
+  ATOMIC(uint32_t) count;  // Reference count
+  uint8_t data[INSTANT_BUFFER_LENGTH];
+};
+
+struct InstantSendingBufferList
+{
+  ATOMIC(uint64_t) stack;
+  struct InstantSendingBuffer data[INSTANT_QUEUE_LENGTH];
+};
+
+struct InstantSendingQueue
+{
+  ATOMIC(uint32_t) head;
+  ATOMIC(uint32_t) tail;
+  ATOMIC(uint32_t) count;
+  ATOMIC(struct InstantSendingBuffer*) data[INSTANT_QUEUE_LENGTH];
+};
+
+struct InstantRequestItem
+{
+  struct InstantRequestItem* next;
+  struct ibv_send_wr request;
+  struct ibv_sge element;
+};
+
+struct InstantRequestQueue
+{
+  struct InstantRequestItem* head;
+  struct InstantRequestItem* tail;
+};
+
+struct InstantCookie
+{
+  struct InstantCookie* previous;
+  struct InstantCookie* next;
+
+  uint32_t expiration;                         // Expication time in ticks (cleanup collection)
+  struct ReliableShare* share;                 // Associated share
+  struct ibv_mr* regions[INSTANT_CARD_COUNT];  // List of regions (in order of InstantCard::number)
+
+  struct InstantCookieData data;               // Cached InstantCookieData
+  uint32_t reserved[INSTANT_CARD_COUNT];       //
+};
 
 struct InstantCard
 {
   struct InstantCard* previous;
   struct InstantCard* next;
 
-  struct ibv_comp_channel* channel;
-  struct ibv_context* context;
-  struct ibv_srq* queue1;
-  struct ibv_cq* queue2;
-  struct ibv_pd* domain;
-  struct ibv_mr* region1;
+  struct ibv_comp_channel* channel;   // Completion channel
+  struct ibv_context* context;        // Verbs context of device
+  struct ibv_srq* queue1;             // Shared receive queue
+  struct ibv_cq* queue2;              // Completion queue for both send() and recv()
+  struct ibv_pd* domain;              // Protection domaini
+  struct ibv_mr* region1;             // Receiving buffers
+  struct ibv_mr* region2;             // Sending buffers
 
-  struct ibv_qp_init_attr attribute;
+  uint32_t number;                    // Number of InstantCard, used as an index in cookie, also sent as IMM
+  struct ibv_qp_init_attr attribute;  // Attributes for rdma_create_qp()
 
   uint8_t buffers[INSTANT_QUEUE_LENGTH * 2][INSTANT_BUFFER_LENGTH];
 };
@@ -76,7 +162,9 @@ struct InstantPeer
   struct InstantPeer* next;
 
   struct rdma_cm_id* descriptor;
+
   struct InstantCard* card;
+  struct InstantRequestQueue queue;
 
   uint32_t state;  // INSTANT_PEER_STATE_*
   uint32_t round;  // Round-robin index of points
@@ -86,9 +174,22 @@ struct InstantPeer
   struct InstantPoint points[INSTANT_POINT_COUNT];
 };
 
+struct InstantTask
+{
+  struct InstantTask* previous;
+  struct InstantTask* next;
+
+  int type;
+  uint32_t state;
+  uint32_t number;
+  struct InstantPeer* peer;
+
+};
+
 struct InstantReplicator
 {
   struct ReliableMonitor super;
+  struct ReliableIndexer* indexer;
 
   struct io_uring ring;
   struct rdma_cm_id* descriptor;
@@ -97,8 +198,10 @@ struct InstantReplicator
   pthread_t thread;
   pthread_mutex_t lock;
   ATOMIC(uint32_t) state;
-  struct InstantCard* cards;
   struct InstantPeer* peers;
+  struct InstantCard* cards;
+  struct InstantCookie* cookies;
+  struct InstantRequestItem* items;
 
   char* name;
   char* secret;
@@ -107,6 +210,9 @@ struct InstantReplicator
 
   struct rdma_conn_param parameter;
   struct InstantHandshakeData handshake;
+
+  struct InstantSendingQueue queue;
+  struct InstantSendingBufferList buffers;
 };
 
 struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, struct ReliableMonitor* next);

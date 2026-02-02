@@ -30,6 +30,7 @@ OBJECTS := \
 	../../Pool/ReliableWaiter.o \
 	../../Pool/InstantDiscovery.o \
 	../../Pool/InstantReplicator.o \
+	../../Pool/InstantWaiter.o \
 	Test.o
 
 FLAGS += \
