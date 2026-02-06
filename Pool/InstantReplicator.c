@@ -13,8 +13,9 @@
 #include <openssl/hmac.h>
 
 #define RING_TAG_TIMEOUT        (LIBURING_UDATA_TIMEOUT - 1ULL)
-#define RING_TAG_EVENT_CHANNEL  (LIBURING_UDATA_TIMEOUT - 2ULL)
-#define RING_TAG_SENDING_QUEUE  (LIBURING_UDATA_TIMEOUT - 3ULL)
+#define RING_TAG_READY_STATE    (LIBURING_UDATA_TIMEOUT - 2ULL)
+#define RING_TAG_EVENT_CHANNEL  (LIBURING_UDATA_TIMEOUT - 3ULL)
+#define RING_TAG_SENDING_QUEUE  (LIBURING_UDATA_TIMEOUT - 4ULL)
 
 #define GENERIC_POLL_TIMEOUT       200
 #define COOKIE_EXPIRATION_COUNT    (60000 / GENERIC_POLL_TIMEOUT)
@@ -32,13 +33,18 @@
 #define WATCH(address)  ((uint32_t*)(address) + 1)
 #endif
 
-_Static_assert(sizeof(struct InstantHandshakeData) <= 56,                                                          "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
-_Static_assert((INSTANT_QUEUE_LENGTH    != 0) && ((INSTANT_QUEUE_LENGTH    & (INSTANT_QUEUE_LENGTH    - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
-_Static_assert((INSTANT_BATCH_THRESHOLD != 0) && ((INSTANT_BATCH_THRESHOLD & (INSTANT_BATCH_THRESHOLD - 1)) == 0), "INSTANT_BATCH_THRESHOLD must be a power of two");
+_Static_assert(sizeof(struct InstantHandshakeData) <= 56,                                                       "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
+_Static_assert((sizeof(struct InstantSharedBuffer)             % sizeof(uint64_t)) == 0,                        "Size of InstantSharedBuffer must be 64-bit aligned");
+_Static_assert((offsetof(struct InstantSharedBuffer, values)   % sizeof(uint64_t)) == 0,                        "InstantSharedBuffer.values must be 64-bit aligned");
+_Static_assert((offsetof(struct InstantSharedBufferList, data) % sizeof(uint64_t)) == 0,                        "InstantSharedBufferList.data must be 64-bit aligned");
+_Static_assert((offsetof(struct InstantReplicator, buffers)    % sizeof(uint64_t)) == 0,                        "InstantReplicator.buffers must be 64-bit aligned");
+_Static_assert((INSTANT_QUEUE_LENGTH   != 0) && ((INSTANT_QUEUE_LENGTH   & (INSTANT_QUEUE_LENGTH   - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
+_Static_assert((INSTANT_TASK_ALIGNMENT != 0) && ((INSTANT_TASK_ALIGNMENT & (INSTANT_TASK_ALIGNMENT - 1)) == 0), "INSTANT_TASK_ALIGNMENT must be a power of two");
+_Static_assert(INSTANT_TASK_ALIGNMENT >= INSTANT_BATCH_LENGTH_LIMIT,                                            "INSTANT_TASK_ALIGNMENT must be equal or greater INSTANT_BATCH_LENGTH_LIMIT");
 
 // Buffers, queues
 
-static inline uint32_t PushSendingBuffer(struct InstantSendingBufferList* list, struct InstantSendingBuffer* buffer)
+static inline uint32_t PushSharedBuffer(struct InstantSharedBufferList* list, struct InstantSharedBuffer* buffer)
 {
   uint64_t current;
   uint64_t next;
@@ -55,12 +61,12 @@ static inline uint32_t PushSendingBuffer(struct InstantSendingBufferList* list, 
   return current;
 }
 
-static inline struct InstantSendingBuffer* PopSendingBuffer(struct InstantSendingBufferList* list)
+static inline struct InstantSharedBuffer* PopSharedBuffer(struct InstantSharedBufferList* list)
 {
   uint64_t current;
   uint64_t next;
   uint32_t number;
-  struct InstantSendingBuffer* buffer;
+  struct InstantSharedBuffer* buffer;
 
   do
   {
@@ -81,10 +87,10 @@ static inline struct InstantSendingBuffer* PopSendingBuffer(struct InstantSendin
   return buffer;
 }
 
-static void InitializeSendingBufferList(struct InstantSendingBufferList* list)
+static void InitializeSharedBufferList(struct InstantSharedBufferList* list)
 {
   uint32_t number;
-  struct InstantSendingBuffer* buffer;
+  struct InstantSharedBuffer* buffer;
 
   number = INSTANT_QUEUE_LENGTH;
   atomic_store_explicit(&list->stack, (uint64_t)UINT32_MAX, memory_order_relaxed);
@@ -93,17 +99,17 @@ static void InitializeSendingBufferList(struct InstantSendingBufferList* list)
   {
     buffer         = list->data + number;
     buffer->number = number;
-    PushSendingBuffer(list, buffer);
+    PushSharedBuffer(list, buffer);
   }
 }
 
-static struct InstantSendingBuffer* AllocateSendingBuffer(struct InstantSendingBufferList* list, int wait)
+static struct InstantSharedBuffer* AllocateSharedBuffer(struct InstantSharedBufferList* list, int wait)
 {
-  struct InstantSendingBuffer* buffer;
+  struct InstantSharedBuffer* buffer;
 
   for ( ; ; )
   {
-    if (buffer = PopSendingBuffer(list))
+    if (buffer = PopSharedBuffer(list))
     {
       buffer->length = 0U;
       atomic_store_explicit(&buffer->count, 1, memory_order_relaxed);
@@ -122,17 +128,18 @@ static struct InstantSendingBuffer* AllocateSendingBuffer(struct InstantSendingB
   }
 }
 
-static void ReleaseSendingBuffer(struct InstantSendingBufferList* list, struct InstantSendingBuffer* buffer)
+static void ReleaseSharedBuffer(struct InstantSharedBufferList* list, struct InstantSharedBuffer* buffer)
 {
-  if ((atomic_fetch_sub_explicit(&buffer->count, 1, memory_order_relaxed) == 1) &&
-      (PushSendingBuffer(list, buffer) == UINT32_MAX))
+  if ((buffer != NULL) &&
+      (atomic_fetch_sub_explicit(&buffer->count, 1, memory_order_relaxed) == 1) &&
+      (PushSharedBuffer(list, buffer) == UINT32_MAX))
   {
     while ((syscall(SYS_futex, WATCH(&list->stack), FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
   }
 }
 
-static int SubmitSendingQueue(struct InstantSendingQueue* queue, struct InstantSendingBuffer* buffer)
+static int AppendSendingQueue(struct InstantSendingQueue* queue, struct InstantSharedBuffer* buffer)
 {
   uint32_t head;
   uint32_t tail;
@@ -168,11 +175,11 @@ static int SubmitSendingQueue(struct InstantSendingQueue* queue, struct InstantS
   return 0;
 }
 
-static struct InstantSendingBuffer* AdvanceSendingQueue(struct InstantSendingQueue* queue)
+static struct InstantSharedBuffer* AdvanceSendingQueue(struct InstantSendingQueue* queue)
 {
   uint32_t tail;
   uint32_t slot;
-  struct InstantSendingBuffer* buffer;
+  struct InstantSharedBuffer* buffer;
 
   buffer = NULL;
 
@@ -200,7 +207,7 @@ static struct InstantSendingBuffer* AdvanceSendingQueue(struct InstantSendingQue
   return buffer;
 }
 
-static void SubmitRequestQueue(struct InstantRequestQueue* queue, struct InstantRequestItem* item)
+static void AppendRequestQueue(struct InstantRequestQueue* queue, struct InstantRequestItem* item)
 {
   struct InstantRequestItem* other;
 
@@ -238,9 +245,9 @@ static struct InstantRequestItem* AllocateRequestItem(struct InstantReplicator* 
 
   if (item = replicator->items)
   {
-    memset(&item->request, 0, sizeof(struct ibv_send_wr));
-    memset(&item->element, 0, sizeof(struct ibv_sge));
     replicator->items = item->next;
+    memset(&item->element, 0, sizeof(struct ibv_sge));
+    memset(&item->request, 0, sizeof(struct ibv_send_wr));
     return item;
   }
 
@@ -251,6 +258,68 @@ static void ReleaseRequestItem(struct InstantReplicator* replicator, struct Inst
 {
   item->next        = replicator->items;
   replicator->items = item;
+}
+
+static struct InstantTask* AllocateTask(struct InstantReplicator* replicator)
+{
+  struct InstantTask* task;
+
+  if (task = replicator->tasks)
+  {
+    replicator->tasks = task->next;
+    memset(task, 0, sizeof(struct InstantTask));
+    return task;
+  }
+
+  if (posix_memalign((void**)&task, INSTANT_TASK_ALIGNMENT, sizeof(struct InstantTask)) == 0)
+  {
+    memset(task, 0, sizeof(struct InstantTask));
+    return task;
+  }
+
+  return NULL;
+}
+
+static void SubmitTask(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantTask* other;
+
+  task->previous = replicator->schedule.tail;
+  task->number   = replicator->schedule.number ++;
+
+  if (other = task->previous)  other->next               = task;
+  else                         replicator->schedule.head = task; 
+
+  replicator->schedule.count += task->type > INSTANT_TASK_TYPE_SYNCING;
+  replicator->schedule.tail   = task;
+}
+
+static void RemoveTask(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantTask* other;
+
+  if (other = task->previous) other->next               = task->next;
+  else                        replicator->schedule.head = task->next;
+
+  if (other = task->next)     other->previous           = task->previous;
+  else                        replicator->schedule.tail = task->previous;
+
+  switch (task->type)
+  {
+    case INSTANT_TASK_TYPE_SYNCING:
+      free(task->syncing.list);
+      break;
+
+    case INSTANT_TASK_TYPE_READING:
+    case INSTANT_TASK_TYPE_WRITING:
+      ReleaseSharedBuffer(&replicator->buffers, task->transfer.buffer);
+      break;
+  }
+
+  task->previous              = NULL;
+  task->next                  = replicator->tasks;
+  replicator->tasks           = task;
+  replicator->schedule.count -= task->type > INSTANT_TASK_TYPE_SYNCING;
 }
 
 // Cookies
@@ -328,6 +397,24 @@ static struct InstantCookie* EnsureCookie(struct InstantReplicator* replicator, 
   return cookie;
 }
 
+static struct InstantCookie* FindCookie(struct InstantReplicator* replicator, const char* name)
+{
+  struct ReliablePool* pool;
+  struct InstantCookie* cookie;
+  struct ReliableIndexer* indexer;
+
+  cookie = NULL;
+
+  if ((indexer = replicator->indexer) &&
+      (pool    = FindReliablePool(indexer, name, 1)))
+  {
+    cookie = EnsureCookie(replicator, pool);
+    RetireReliablePool(pool);
+  }
+
+  return cookie;
+}
+
 static void RetireCookie(struct InstantReplicator* replicator, struct ReliablePool* pool)
 {
   struct InstantCookie* cookie;
@@ -367,7 +454,7 @@ static void DestroyCookie(struct InstantCookie* cookie)
     }
   }
 
-  ReleaseReliableShare(cookie->share);
+  RetireReliableShare(cookie->share);
   free(cookie);
 }
 
@@ -419,7 +506,7 @@ static void TrackCookieList(struct InstantReplicator* replicator)
 
 // Submissions
 
-static int SubmitSendingBuffer(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantSendingBuffer* buffer)
+static int SubmitSharedBuffer(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantSharedBuffer* buffer)
 {
   struct InstantRequestItem* item;
   struct InstantCard* card;
@@ -441,7 +528,7 @@ static int SubmitSendingBuffer(struct InstantReplicator* replicator, struct Inst
     item->request.imm_data   = card->number;
 
     atomic_fetch_add_explicit(&buffer->count, 1, memory_order_relaxed);
-    SubmitRequestQueue(&peer->queue, item);
+    AppendRequestQueue(&peer->queue, item);
     return 0;
   }
 
@@ -472,7 +559,7 @@ static int SubmitReadingWork(struct InstantReplicator* replicator, struct Instan
       item->request.send_flags = IBV_SEND_SIGNALED;
     }
 
-    SubmitRequestQueue(&peer->queue, item);
+    AppendRequestQueue(&peer->queue, item);
     return 0;
   }
 
@@ -491,11 +578,9 @@ static int SubmitWritingWork(struct InstantReplicator* replicator, struct Instan
     item->element.addr                = (uintptr_t)&block->mark;
     item->element.length              = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
     item->element.lkey                = region->lkey;
-    item->request.wr_id               = number;
     item->request.sg_list             = &item->element;
     item->request.num_sge             = 1;
     item->request.opcode              = IBV_WR_RDMA_WRITE;
-    item->request.send_flags          = IBV_SEND_SIGNALED;
     item->request.wr.rdma.remote_addr = entry->address;
     item->request.wr.rdma.rkey        = key;
 
@@ -507,7 +592,36 @@ static int SubmitWritingWork(struct InstantReplicator* replicator, struct Instan
       item->request.imm_data   = number;
     }
 
-    SubmitRequestQueue(&peer->queue, item);
+    AppendRequestQueue(&peer->queue, item);
+    return 0;
+  }
+
+  return -1;
+}
+
+static int SubmitSwappingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t number, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, uint64_t* result)
+{
+  struct InstantRequestItem* item;
+  struct InstantCard* card;
+
+  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+      (card = peer->card)                           &&
+      (item = AllocateRequestItem(replicator)))
+  {
+    item->element.addr                  = (uintptr_t)result;
+    item->element.length                = sizeof(uint64_t);
+    item->element.lkey                  = region->lkey;
+    item->request.wr_id                 = (uintptr_t)task | (uintptr_t)number;
+    item->request.sg_list               = &item->element;
+    item->request.num_sge               = 1;
+    item->request.opcode                = IBV_WR_ATOMIC_CMP_AND_SWP;
+    item->request.send_flags            = IBV_SEND_SIGNALED;
+    item->request.wr.atomic.remote_addr = entry->address;
+    item->request.wr.atomic.rkey        = key;
+    item->request.wr.atomic.compare_add = entry->mark;
+    item->request.wr.atomic.swap        = entry->mark | 1ULL;
+
+    AppendRequestQueue(&peer->queue, item);
     return 0;
   }
 
@@ -518,7 +632,7 @@ static int SubmitWritingWork(struct InstantReplicator* replicator, struct Instan
 
 static void HandleBlockChange(struct InstantReplicator* replicator, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block)
 {
-  static __thread struct InstantSendingBuffer* buffer = NULL;
+  static __thread struct InstantSharedBuffer* buffer = NULL;
   static __thread struct InstantCookie* cookie = NULL;
   static __thread struct ReliablePool* last = NULL;
 
@@ -530,7 +644,7 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
   {
     if (last != pool)
     {
-      SubmitSendingQueue(&replicator->queue, buffer);
+      AppendSendingQueue(&replicator->queue, buffer);
       buffer = NULL;
       cookie = NULL;
       last   = pool;
@@ -538,7 +652,7 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
 
     if ((buffer == NULL) &&
         (cookie  = EnsureCookie(replicator, pool)) &&
-        (buffer  = AllocateSendingBuffer(&replicator->buffers, 1)))
+        (buffer  = AllocateSharedBuffer(&replicator->buffers, 1)))
     {
       pthread_mutex_lock(&replicator->lock);
       header         = (struct InstantHeaderData*)buffer->data;
@@ -568,13 +682,18 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
 
   if ((buffer != NULL) &&
       ((block == NULL) ||
-       (buffer->length >= INSTANT_MESSAGE_THRESHOLD)))
+       (buffer->length >= INSTANT_MESSAGE_LENGTH_THRESHOLD)))
   {
-    SubmitSendingQueue(&replicator->queue, buffer);
+    AppendSendingQueue(&replicator->queue, buffer);
     buffer = NULL;
     cookie = NULL;
     last   = NULL;
   }
+}
+
+static void HandleBlockRelease(struct InstantReplicator* replicator, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block)
+{
+
 }
 
 static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
@@ -600,12 +719,16 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
     case RELIABLE_MONITOR_FLUSH_COMMIT:
       HandleBlockChange(replicator, pool, share, block);
       break;
+
+    case RELIABLE_MONITOR_BLOCK_RELEASE:
+      HandleBlockRelease(replicator, pool, share, block);
+      break;
   }
 }
 
 static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
 {
-  struct InstantSendingBuffer* buffer;
+  struct InstantSharedBuffer* buffer;
   struct io_uring_sqe* submission;
   struct InstantPeer* peer;
 
@@ -615,12 +738,12 @@ static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
 
     for (peer = replicator->peers; peer != NULL; peer = peer->next)
     {
-      // SubmitSendingBuffer() increments buffer->count
-      SubmitSendingBuffer(replicator, peer, buffer);
+      // SubmitSharedBuffer() increments buffer->count
+      SubmitSharedBuffer(replicator, peer, buffer);
     }
 
     pthread_mutex_unlock(&replicator->lock);
-    ReleaseSendingBuffer(&replicator->buffers, buffer);
+    ReleaseSharedBuffer(&replicator->buffers, buffer);
   }
 
   if (submission = io_uring_get_sqe(&replicator->ring))
@@ -632,25 +755,274 @@ static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
 
 // Message and work handling
 
+static int HandleSyncingIterator(void* key, size_t size, void* data, void* argument1, void* argument2)
+{
+  struct InstantReplicator* replicator;
+  struct InstantTask* task;
+
+  replicator = (struct InstantReplicator*)argument1;
+
+  if (task = AllocateTask(replicator))
+  {
+    memcpy(task->name, key, RELIABLE_MEMORY_NAME_LENGTH);
+
+    task->type         = INSTANT_TASK_TYPE_SYNCING;
+    task->peer         = (struct InstantPeer*)argument2;
+    task->syncing.list = CollectReliableBlockList(replicator->indexer, (struct ReliablePool*)data, NULL, RELIABLE_COLLECT_IN_USE);
+
+    SubmitTask(replicator, task);
+  }
+
+  return 0;
+}
+
+static void CreateSyncingTask(struct InstantReplicator* replicator, struct InstantPeer* peer)
+{
+  struct ReliableIndexer* indexer;
+
+  if (indexer = replicator->indexer)
+  {
+    pthread_rwlock_rdlock(&indexer->lock);
+    IterateThroughHashMap(indexer->map, HandleSyncingIterator, replicator, peer);
+    pthread_rwlock_unlock(&indexer->lock);
+  }
+}
+
+static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantHeaderData* header;
+  struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct ReliableShare* share;
+  uint32_t number;
+  uintptr_t limit;
+
+  if ((task->syncing.list == NULL)                             ||
+      (task->syncing.list[task->syncing.cursor] == UINT32_MAX) ||
+      !(cookie = FindCookie(replicator, task->name)))
+  {
+    // Emplty lost, removed pool or sending complete
+    return -1;
+  }
+
+  if (!(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+  {
+    task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
+    return 0;
+  }
+
+  share  = cookie->share;
+  memory = share->memory;
+  limit  = (uintptr_t)share->memory + share->size;
+
+  header         = (struct InstantHeaderData*)buffer->data;
+  header->type   = INSTANT_TYPE_NOTIFY;
+  header->task   = UINT32_MAX;
+  buffer->length = sizeof(struct InstantHeaderData) + cookie->data.length;
+
+  memcpy(buffer->data + sizeof(struct InstantHeaderData), &cookie->data, cookie->data.length);
+  uuid_copy(header->identifier, replicator->identifier);
+
+  while ((task->syncing.list[task->syncing.cursor] != UINT32_MAX) &&
+         (buffer->length < INSTANT_MESSAGE_LENGTH_THRESHOLD))
+  {
+    number = task->syncing.list[task->syncing.cursor ++];
+    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+
+    if ((limit > ((uintptr_t)block)) &&
+        (limit > ((uintptr_t)block + sizeof(struct ReliableBlock) + (uintptr_t)block->length)) &&
+        (atomic_load_explicit(&block->count, memory_order_acquire) > 0) &&
+        (~atomic_load_explicit(&block->mark, memory_order_relaxed) & 1ULL))
+    {
+      entry           = (struct InstantBlockData*)(buffer->data + buffer->length);
+      entry->mark     = atomic_load_explicit(&block->mark, memory_order_acquire);
+      entry->length   = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
+      entry->address  = (uintptr_t)&block->mark;
+      buffer->length += sizeof(struct InstantBlockData);
+      uuid_copy(entry->identifier, block->identifier);
+    }
+  }
+
+  if (buffer->length != (sizeof(struct InstantHeaderData) + cookie->data.length))
+  {
+    // Avoid sending empty messages
+    SubmitSharedBuffer(replicator, task->peer, buffer);
+  }
+
+  ReleaseSharedBuffer(&replicator->buffers, buffer);
+
+  task->state = INSTANT_TASK_STATE_PROGRESS;
+  return 0;
+}
+
+static int ExecuteReadingTask(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  return -1;
+}
+
+static int ExecuteWritingTask(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  return -1;
+}
+
 static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t* data, uint32_t length, uint32_t number, int status, int flags)
 {
+  struct InstantHeaderData* header;
+  struct InstantCookieData* cookie;
+  struct InstantBlockData* list;
+  struct InstantPeer* peer;
+  struct InstantTask* task;
+  intptr_t count;
 
+  if ((status == IBV_WC_SUCCESS) &&
+      (length >= sizeof(struct InstantHeaderData)))
+  {
+    header = (struct InstantHeaderData*)data;
+
+    pthread_mutex_lock(&replicator->lock);
+    for (peer = replicator->peers; (peer != NULL) && (uuid_compare(peer->identifier, header->identifier) != 0); peer = peer->next);
+    pthread_mutex_unlock(&replicator->lock);
+
+    if ((peer != NULL) &&
+        (peer->state == INSTANT_PEER_STATE_CONNECTING))
+    {
+      // The message can be received before or after CM events
+      peer->state = INSTANT_PEER_STATE_CONNECTED;
+    }
+
+    if ((peer != NULL) &&
+        (flags & IBV_WC_WITH_IMM) &&
+        (header->type >= INSTANT_TYPE_NOTIFY) &&
+        (header->type <= INSTANT_TYPE_RETREIVE) &&
+        (length >= (sizeof(struct InstantHeaderData) + sizeof(struct InstantCookieData))))
+    {
+      cookie = (struct InstantCookieData*)(data + sizeof(struct InstantHeaderData));
+      list   = (struct InstantBlockData*)(data + sizeof(struct InstantHeaderData) + cookie->length);
+      count  = (uintptr_t)data + length - (uintptr_t)list;
+
+      if ((count  > 0LL)           &&
+          (number < cookie->count) &&
+          (task = AllocateTask(replicator)))
+      {
+        task->peer           = peer;
+        task->type           = header->type;
+        task->transfer.task  = header->task;
+        task->transfer.key   = cookie->keys[number];
+        task->transfer.count = count / sizeof(struct InstantBlockData);
+
+        memcpy(task->name, cookie->name, RELIABLE_MEMORY_NAME_LENGTH);
+        memcpy(task->transfer.list, list, count);
+
+        SubmitTask(replicator, task);
+      }
+    }
+  }
 }
 
 static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t number, int status)
 {
+  struct InstantTask* task;
 
+  for (task = replicator->schedule.head; (task != NULL) && (task->number != number); task = task->next);
+
+  if (task != NULL)
+  {
+
+    RemoveTask(replicator, task);
+  }
 }
 
-
-static void HandleCompletedRead(struct InstantReplicator* replicator, struct InstantTask* task, int opcode, int status)
+static void HandleCompletedRead(struct InstantReplicator* replicator, struct InstantTask* task, int status)
 {
   // if (status != IBV_WC_SUCCESS)
+  RemoveTask(replicator, task);
 }
 
-static void HandleCompletedWrite(struct InstantReplicator* replicator, struct InstantTask* task, int opcode, int status)
+static void HandleCompletedSwap(struct InstantReplicator* replicator, struct InstantTask* task, uint16_t number, int status)
 {
   // if (status != IBV_WC_SUCCESS)
+  RemoveTask(replicator, task);
+}
+
+static void HandleCompletedWrite(struct InstantReplicator* replicator, struct InstantTask* task, int status)
+{
+  // if (status != IBV_WC_SUCCESS)
+  RemoveTask(replicator, task);
+}
+
+static void WaitForReadyState(struct InstantReplicator* replicator)
+{
+  struct io_uring_sqe* submission;
+
+  if ((~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY) &&
+      (submission = io_uring_get_sqe(&replicator->ring)))
+  {
+    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_HOLD, memory_order_relaxed);
+    io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->state, INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_HOLD, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
+    io_uring_sqe_set_data64(submission, RING_TAG_READY_STATE);
+  }
+}
+
+static void ExecuteTaskList(struct InstantReplicator* replicator)
+{
+  static ExecuteInstantTaskFunction functions[] =
+  {
+    ExecuteSyncingTask,
+    ExecuteReadingTask,
+    ExecuteWritingTask
+  };
+
+  struct InstantTask* task;
+  struct InstantTask* next;
+  ExecuteInstantTaskFunction function;
+
+  for (task = replicator->schedule.head; task != NULL; task = next)
+  {
+    next     = task->next;
+    function = functions[task->type];
+
+    if (function(replicator, task) < 0)
+    {
+      // Negative result means remove immediately
+      RemoveTask(replicator, task);
+    }
+  }
+
+  if ((replicator->schedule.count != 0) &&
+      (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_HOLD))
+  {
+    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_HOLD, memory_order_relaxed);
+    WaitForReadyState(replicator);
+  }
+
+  if ((replicator->schedule.count == 0) &&
+      (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_HOLD))
+  {
+    atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_HOLD | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
+    while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+           (errno == EINTR));
+  }
+}
+
+static void ClearTaskList(struct InstantReplicator* replicator, struct InstantPeer* peer)
+{
+  struct InstantTask* task;
+  struct InstantTask* next;
+
+  for (task = replicator->schedule.head; task != NULL; task = next)
+  {
+    next = task->next;
+
+    if ((task->peer == peer) &&
+        (task->state < INSTANT_TASK_STATE_WAIT_COMPLETION))
+    {
+      // Tasks in state INSTANT_TASK_STATE_WAIT_COMPLETION should be removed by HandleCompletedRead() / HandleCompletedWrite()
+      RemoveTask(replicator, task);
+    }
+  }
 }
 
 // Transport abstractions
@@ -791,7 +1163,7 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
         switch (completion->opcode)
         {
           case IBV_WC_SEND:
-            ReleaseSendingBuffer(&replicator->buffers, (struct InstantSendingBuffer*)completion->wr_id);
+            ReleaseSharedBuffer(&replicator->buffers, (struct InstantSharedBuffer*)completion->wr_id);
             break;
 
           case IBV_WC_RECV:
@@ -805,11 +1177,15 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
             break;
 
           case IBV_WC_RDMA_READ:
-            HandleCompletedRead(replicator, (struct InstantTask*)completion->wr_id, completion->opcode, completion->status);
+            HandleCompletedRead(replicator, (struct InstantTask*)completion->wr_id, completion->status);
             break;
 
           case IBV_WC_RDMA_WRITE:
-            HandleCompletedWrite(replicator, (struct InstantTask*)completion->wr_id, completion->opcode, completion->status);
+            HandleCompletedWrite(replicator, (struct InstantTask*)completion->wr_id, completion->status);
+            break;
+
+          case IBV_WC_COMP_SWAP:
+            HandleCompletedSwap(replicator, (struct InstantTask*)(completion->wr_id & INSTANT_TASK_ADDRESS_MASK), completion->wr_id & INSTANT_TASK_SLOT_MASK, completion->status);
             break;
         }
       }
@@ -835,16 +1211,20 @@ static void ClearRequestQueue(struct InstantReplicator* replicator, struct Insta
       {
         case IBV_WR_SEND:
         case IBV_WR_SEND_WITH_IMM:
-          ReleaseSendingBuffer(&replicator->buffers, (struct InstantSendingBuffer*)item->request.wr_id);
+          ReleaseSharedBuffer(&replicator->buffers, (struct InstantSharedBuffer*)item->request.wr_id);
           break;
 
         case IBV_WR_RDMA_READ:
-          HandleCompletedRead(replicator, (struct InstantTask*)item->request.wr_id, item->request.opcode, IBV_WC_WR_FLUSH_ERR);
+          HandleCompletedRead(replicator, (struct InstantTask*)item->request.wr_id, IBV_WC_WR_FLUSH_ERR);
           break;
 
         case IBV_WR_RDMA_WRITE:
         case IBV_WR_RDMA_WRITE_WITH_IMM:
-          HandleCompletedWrite(replicator, (struct InstantTask*)item->request.wr_id, item->request.opcode, IBV_WC_WR_FLUSH_ERR);
+          HandleCompletedWrite(replicator, (struct InstantTask*)item->request.wr_id, IBV_WC_WR_FLUSH_ERR);
+          break;
+
+        case IBV_WR_ATOMIC_CMP_AND_SWP:
+          HandleCompletedSwap(replicator, (struct InstantTask*)(item->request.wr_id & INSTANT_TASK_ADDRESS_MASK), item->request.wr_id & INSTANT_TASK_SLOT_MASK, IBV_WC_WR_FLUSH_ERR);
           break;
       }
     }
@@ -854,7 +1234,7 @@ static void ClearRequestQueue(struct InstantReplicator* replicator, struct Insta
   }
 }
 
-static void TrackRequestQueueList(struct InstantReplicator* replicator)
+static void DrainRequestQueueList(struct InstantReplicator* replicator)
 {
   int result;
   struct InstantPeer* peer;
@@ -958,6 +1338,8 @@ static int HandleEstablished(struct InstantReplicator* replicator, struct rdma_c
   peer->fails      = 0;
   peer->points[peer->round].rank = 0;
 
+  CreateSyncingTask(replicator, peer);
+
   return 0;
 }
 
@@ -979,6 +1361,7 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
     peer->round ++;
     peer->round %= INSTANT_POINT_COUNT;
 
+    ClearTaskList(replicator, peer);
     ClearRequestQueue(replicator, &peer->queue);
   }
 
@@ -1182,6 +1565,10 @@ static void* DoWork(void* closure)
           TrackCookieList(replicator);
           break;
 
+        case RING_TAG_READY_STATE:
+          WaitForReadyState(replicator);
+          break;
+
         case RING_TAG_SENDING_QUEUE:
           HandleSendingQueue(replicator, completion->res);
           break;
@@ -1196,11 +1583,18 @@ static void* DoWork(void* closure)
       }
 
       io_uring_cq_advance(&replicator->ring, 1);
-      TrackRequestQueueList(replicator);
     }
+
+    ExecuteTaskList(replicator);
+    DrainRequestQueueList(replicator);
   }
 
   atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_FAILURE, memory_order_relaxed);
+  atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_HOLD | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
+
+  while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+         (errno == EINTR));
+
   return NULL;
 }
 
@@ -1240,7 +1634,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     uuid_copy(replicator->handshake.identifier, replicator->identifier);
     HMAC(EVP_sha1(), secret, strlen(secret), (uint8_t*)&replicator->handshake, offsetof(struct InstantHandshakeData, digest), replicator->handshake.digest, NULL);
 
-    InitializeSendingBufferList(&replicator->buffers);
+    InitializeSharedBufferList(&replicator->buffers);
 
     snprintf(service, sizeof(service), "%d", port);
     memset(&hint, 0, sizeof(struct rdma_addrinfo));
@@ -1282,6 +1676,7 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
 {
   struct InstantPeer* peer;
   struct InstantCard* card;
+  struct InstantTask* task;
   struct InstantCookie* cookie;
   struct InstantRequestItem* item;
 
@@ -1299,6 +1694,18 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
       ClearRequestQueue(replicator, &peer->queue);
       DestroyDescriptor(peer->descriptor, 1);
       free(peer);
+    }
+
+    while (task = replicator->schedule.head)
+    {
+      // Remove all pending tasks that left
+      RemoveTask(replicator, task);
+    }
+
+    while (task = replicator->tasks)
+    {
+      replicator->tasks = task->next;
+      free(task);
     }
 
     while (cookie = replicator->cookies)

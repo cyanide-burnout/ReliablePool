@@ -37,7 +37,7 @@ struct ReliableIndexer* CreateReliableIndexer(struct ReliableMonitor* next);
 struct ReliableIndexer* GetReliableIndexer(struct ReliablePool* pool);
 void ReleaseReliableIndexer(struct ReliableIndexer* indexer);
 
-struct ReliablePool* FindReliablePool(struct ReliableIndexer* indexer, const char* name);
+struct ReliablePool* FindReliablePool(struct ReliableIndexer* indexer, const char* name, int acquire);
 
 uint32_t FindReliableBlockNumber(struct ReliableIndexer* indexer, const char* name, uuid_t identifier);
 uint32_t* CollectReliableBlockList(struct ReliableIndexer* indexer, struct ReliablePool* pool, struct timespec* time, uint32_t flags);

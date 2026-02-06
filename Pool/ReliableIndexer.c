@@ -211,7 +211,7 @@ void ReleaseReliableIndexer(struct ReliableIndexer* indexer)
   }
 }
 
-struct ReliablePool* FindReliablePool(struct ReliableIndexer* indexer, const char* name)
+struct ReliablePool* FindReliablePool(struct ReliableIndexer* indexer, const char* name, int acquire)
 {
   char key[RELIABLE_MEMORY_NAME_LENGTH];
   struct ReliablePool* pool;
@@ -222,7 +222,13 @@ struct ReliablePool* FindReliablePool(struct ReliableIndexer* indexer, const cha
   strncpy(key, name, RELIABLE_MEMORY_NAME_LENGTH);
 
   pthread_rwlock_rdlock(&indexer->lock);
-  GetFromHashMap(indexer->map, key, RELIABLE_MEMORY_NAME_LENGTH, (void**)&pool);
+
+  if (GetFromHashMap(indexer->map, key, RELIABLE_MEMORY_NAME_LENGTH, (void**)&pool) == HASHMAP_SUCCESS)
+  {
+    //
+    atomic_fetch_add_explicit(&pool->count, acquire, memory_order_relaxed);
+  }
+
   pthread_rwlock_unlock(&indexer->lock);
 
   return pool;
@@ -308,7 +314,7 @@ uint32_t* CollectReliableBlockList(struct ReliableIndexer* indexer, struct Relia
 
   pthread_rwlock_unlock(&indexer->lock);
 
-  ReleaseReliableShare(share);
+  RetireReliableShare(share);
 
   return list;
 }

@@ -416,8 +416,6 @@ struct ReliablePool* CreateReliablePool(int handle, const char* name, size_t len
 
 void ReleaseReliablePool(struct ReliablePool* pool)
 {
-  struct ReliableShare* share;
-
   if (pool != NULL)
   {
     CallReliableMonitor(RELIABLE_MONITOR_POOL_RELEASE, pool, pool->share, NULL);
@@ -799,12 +797,21 @@ struct ReliableShare* MakeReliableShareCopy(struct ReliablePool* pool, struct Re
   return result;
 }
 
-void ReleaseReliableShare(struct ReliableShare* share)
+void RetireReliableShare(struct ReliableShare* share)
 {
   if (share != NULL)
   {
     // Call private implementation
     ReleaseShare(NULL, share, RELIABLE_WEIGHT_WEAK);
+  }
+}
+
+void RetireReliablePool(struct ReliablePool* pool)
+{
+  if (pool != NULL)
+  {
+    // Call private implementation
+    ReleasePool(pool);
   }
 }
 

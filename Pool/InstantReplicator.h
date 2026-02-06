@@ -72,29 +72,49 @@ struct InstantHeaderData
 #define INSTANT_PEER_STATE_CONNECTING    1
 #define INSTANT_PEER_STATE_CONNECTED     2
 
+#define INSTANT_TASK_TYPE_SYNCING  0
+#define INSTANT_TASK_TYPE_READING  INSTANT_TYPE_NOTIFY
+#define INSTANT_TASK_TYPE_WRITING  INSTANT_TYPE_RETREIVE
+
+#define INSTANT_TASK_STATE_IDLE             0
+#define INSTANT_TASK_STATE_PROGRESS         1
+#define INSTANT_TASK_STATE_WAIT_DATA        2
+#define INSTANT_TASK_STATE_WAIT_HOLD        3
+#define INSTANT_TASK_STATE_WAIT_BUFFER      4
+#define INSTANT_TASK_STATE_WAIT_COMPLETION  5
+
 #define INSTANT_POINT_COUNT  8    // Very optimistic (usually reserve 2-4 legs)
 #define INSTANT_CARD_COUNT   128  // More HCAs are unexpected (who uses more than two?)
 
 #define INSTANT_QUEUE_LENGTH   2048  // Must be a power of two
-#define INSTANT_BUFFER_LENGTH  4096  // Dangerous! Do not touch!
+#define INSTANT_BUFFER_LENGTH  4096  // Corresponds to InfiniBand payload MTU (RoCE jumbo-frames have greater length)
 
-#define INSTANT_BATCH_THRESHOLD    128  // Upper bound, where 4K message fits 111 blocks
-#define INSTANT_MESSAGE_THRESHOLD  (INSTANT_BUFFER_LENGTH - 2 * sizeof(struct InstantBlockData))
+#define INSTANT_TASK_ALIGNMENT            128ULL
+#define INSTANT_BATCH_LENGTH_LIMIT        (INSTANT_BUFFER_LENGTH / sizeof(struct InstantBlockData) + 1)
+#define INSTANT_MESSAGE_LENGTH_THRESHOLD  (INSTANT_BUFFER_LENGTH - 2 * sizeof(struct InstantBlockData))
 
-struct InstantSendingBuffer
+#define INSTANT_TASK_SLOT_MASK     (INSTANT_TASK_ALIGNMENT - 1ULL)
+#define INSTANT_TASK_ADDRESS_MASK  (~INSTANT_TASK_SLOT_MASK)
+
+struct InstantSharedBuffer
 {
   uint32_t number;         // Buffer number
   uint32_t length;         // Length of data
   ATOMIC(uint32_t) tag;    // Generation tag
   ATOMIC(uint64_t) next;   // Next buffer on stack
   ATOMIC(uint32_t) count;  // Reference count
-  uint8_t data[INSTANT_BUFFER_LENGTH];
+
+  union
+  {
+    uint8_t data[INSTANT_BUFFER_LENGTH];
+    uint64_t values[INSTANT_BATCH_LENGTH_LIMIT];
+  };
 };
 
-struct InstantSendingBufferList
+struct InstantSharedBufferList
 {
   ATOMIC(uint64_t) stack;
-  struct InstantSendingBuffer data[INSTANT_QUEUE_LENGTH];
+  struct InstantSharedBuffer data[INSTANT_QUEUE_LENGTH];
 };
 
 struct InstantSendingQueue
@@ -102,7 +122,7 @@ struct InstantSendingQueue
   ATOMIC(uint32_t) head;
   ATOMIC(uint32_t) tail;
   ATOMIC(uint32_t) count;
-  ATOMIC(struct InstantSendingBuffer*) data[INSTANT_QUEUE_LENGTH];
+  ATOMIC(struct InstantSharedBuffer*) data[INSTANT_QUEUE_LENGTH];
 };
 
 struct InstantRequestItem
@@ -174,6 +194,21 @@ struct InstantPeer
   struct InstantPoint points[INSTANT_POINT_COUNT];
 };
 
+struct InstantSyncingTaskData  // INSTANT_TASK_TYPE_SYNCING
+{
+  uint32_t cursor;
+  uint32_t* list;
+};
+
+struct InstantTransferTaskData  // INSTANT_TASK_TYPE_READING, INSTANT_TASK_TYPE_WRITING
+{
+  uint32_t key;
+  uint32_t task;
+  uint32_t count;
+  struct InstantSharedBuffer* buffer;
+  struct InstantBlockData list[INSTANT_BATCH_LENGTH_LIMIT];
+};
+
 struct InstantTask
 {
   struct InstantTask* previous;
@@ -183,13 +218,32 @@ struct InstantTask
   uint32_t state;
   uint32_t number;
   struct InstantPeer* peer;
+  char name[RELIABLE_MEMORY_NAME_LENGTH];
 
+  union
+  {
+    struct InstantSyncingTaskData syncing;
+    struct InstantTransferTaskData transfer;
+  };
+};
+
+struct InstantTaskList
+{
+  uint32_t count;            // Count of tasks that require INSTANT_REPLICATOR_STATE_HOLD
+  uint32_t number;           // Task number counter
+  struct InstantTask* head;  //
+  struct InstantTask* tail;  //
 };
 
 struct InstantReplicator
 {
   struct ReliableMonitor super;
   struct ReliableIndexer* indexer;
+
+  char* name;
+  char* secret;
+  uint32_t limit;
+  uuid_t identifier;
 
   struct io_uring ring;
   struct rdma_cm_id* descriptor;
@@ -198,22 +252,21 @@ struct InstantReplicator
   pthread_t thread;
   pthread_mutex_t lock;
   ATOMIC(uint32_t) state;
-  struct InstantPeer* peers;
   struct InstantCard* cards;
+  struct InstantPeer* peers;
+  struct InstantTask* tasks;
   struct InstantCookie* cookies;
   struct InstantRequestItem* items;
-
-  char* name;
-  char* secret;
-  uint32_t limit;
-  uuid_t identifier;
 
   struct rdma_conn_param parameter;
   struct InstantHandshakeData handshake;
 
+  struct InstantTaskList schedule;
   struct InstantSendingQueue queue;
-  struct InstantSendingBufferList buffers;
+  struct InstantSharedBufferList buffers;
 };
+
+typedef int (*ExecuteInstantTaskFunction)(struct InstantReplicator* replicator, struct InstantTask* task);
 
 struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, struct ReliableMonitor* next);
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);

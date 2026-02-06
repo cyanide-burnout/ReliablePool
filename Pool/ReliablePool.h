@@ -138,7 +138,8 @@ uint32_t ReserveReliableBlock(struct ReliablePool* pool, uuid_t identifier, int 
 int FreeReliableBlock(struct ReliablePool* pool, uint32_t number, uuid_t identifier);
 
 struct ReliableShare* MakeReliableShareCopy(struct ReliablePool* pool, struct ReliableShare* share);
-void ReleaseReliableShare(struct ReliableShare* share);
+void RetireReliableShare(struct ReliableShare* share);
+void RetireReliablePool(struct ReliablePool* pool);
 
 // C++ helpers
 
