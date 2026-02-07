@@ -5,7 +5,7 @@
 #include <sys/syscall.h>
 #include <linux/futex.h>
 
-#define EXPECTED_STATE  (INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_HOLD | INSTANT_REPLICATOR_STATE_READY)
+#define EXPECTED_STATE  (INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY)
 
 static int HandleWaiterCompletion(struct FastRingDescriptor* descriptor, struct io_uring_cqe* completion, int reason)
 {
@@ -14,7 +14,7 @@ static int HandleWaiterCompletion(struct FastRingDescriptor* descriptor, struct 
   if ((completion != NULL) &&
       (replicator  = (struct InstantReplicator*)descriptor->closure))
   {
-    if (atomic_load_explicit(&replicator->state, memory_order_acquire) & INSTANT_REPLICATOR_STATE_HOLD)
+    if (atomic_load_explicit(&replicator->state, memory_order_acquire) & INSTANT_REPLICATOR_STATE_LOCK)
     {
       atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_READY, memory_order_release);
 

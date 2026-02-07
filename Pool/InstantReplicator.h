@@ -29,7 +29,8 @@ extern "C"
 #define INSTANT_TYPE_CLOCK      0
 #define INSTANT_TYPE_NOTIFY     1
 #define INSTANT_TYPE_RETREIVE   2
-#define INSTANT_TYPE_RELEASE    3
+#define INSTANT_TYPE_COMPLETE   3
+#define INSTANT_TYPE_RELEASE    4
 
 struct InstantHandshakeData
 {
@@ -65,9 +66,12 @@ struct InstantHeaderData
 
 // Replicator
 
+#define RELIABLE_MONITOR_BLOCK_DAMAGE   13
+#define RELIABLE_MONITOR_BLOCK_ARRIVAL  14
+
 #define INSTANT_REPLICATOR_STATE_ACTIVE   (1U << 0)
 #define INSTANT_REPLICATOR_STATE_FAILURE  (1U << 1)
-#define INSTANT_REPLICATOR_STATE_HOLD     (1U << 2)
+#define INSTANT_REPLICATOR_STATE_LOCK     (1U << 2)
 #define INSTANT_REPLICATOR_STATE_READY    (1U << 3)
 
 #define INSTANT_PEER_STATE_DISCONNECTED  0
@@ -81,7 +85,7 @@ struct InstantHeaderData
 #define INSTANT_TASK_STATE_IDLE             0
 #define INSTANT_TASK_STATE_PROGRESS         1
 #define INSTANT_TASK_STATE_WAIT_DATA        2
-#define INSTANT_TASK_STATE_WAIT_HOLD        3
+#define INSTANT_TASK_STATE_WAIT_LOCK        3
 #define INSTANT_TASK_STATE_WAIT_BUFFER      4
 #define INSTANT_TASK_STATE_WAIT_COMPLETION  5
 
@@ -233,7 +237,7 @@ struct InstantTask
 
 struct InstantTaskList
 {
-  uint32_t count;            // Count of tasks that require INSTANT_REPLICATOR_STATE_HOLD
+  uint32_t count;            // Count of tasks that require INSTANT_REPLICATOR_STATE_LOCK
   uint32_t number;           // Task number counter
   struct InstantTask* head;  //
   struct InstantTask* tail;  //

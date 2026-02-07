@@ -34,16 +34,17 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
 {
   char buffer[64];
 
-  /*
   switch (event)
   {
-     case RELIABLE_MONITOR_BLOCK_ALLOCATE:
+    /*
+
+    case RELIABLE_MONITOR_BLOCK_ALLOCATE:
       uuid_unparse_lower(block->identifier, buffer);
       printf("Block %u (%s) allocated\n", block->number, buffer);
       break;
 
-     case RELIABLE_MONITOR_BLOCK_RELEASE:
-     case RELIABLE_MONITOR_BLOCK_FREE:
+    case RELIABLE_MONITOR_BLOCK_RELEASE:
+    case RELIABLE_MONITOR_BLOCK_FREE:
       uuid_unparse_lower(block->identifier, buffer);
       printf("Block %u (%s) released\n", block->number, buffer);
       break;
@@ -52,8 +53,14 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
       uuid_unparse_lower(block->identifier, buffer);
       printf("Block %u (%s) changed: %s\n", block->number, buffer, block->data);
       break;
+
+    */
+
+    case RELIABLE_MONITOR_BLOCK_ARRIVAL:
+      uuid_unparse_lower(block->identifier, buffer);
+      printf("Block %u (%s) arrived: %s\n", block->number, buffer, block->data);
+      break;
   }
-  */
 }
 
 static void GeenetateActivity(struct ReliablePool* pool)

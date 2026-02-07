@@ -12,6 +12,8 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
+#include "CRC32C.h"
+
 #define RING_TAG_TIMEOUT        (LIBURING_UDATA_TIMEOUT - 1ULL)
 #define RING_TAG_READY_STATE    (LIBURING_UDATA_TIMEOUT - 2ULL)
 #define RING_TAG_EVENT_CHANNEL  (LIBURING_UDATA_TIMEOUT - 3ULL)
@@ -252,6 +254,30 @@ static struct InstantRequestItem* AllocateRequestItem(struct InstantReplicator* 
   }
 
   return (struct InstantRequestItem*)calloc(1, sizeof(struct InstantRequestItem));
+}
+
+static int ReserveRequestItemList(struct InstantReplicator* replicator, uint32_t count)
+{
+  struct InstantRequestItem* item;
+
+  item = replicator->items;
+
+  while ((count > 0) &&
+         (item != NULL))
+  {
+    item = item->next;
+    count --;
+  }
+
+  while ((count > 0) &&
+         (item = (struct InstantRequestItem*)calloc(1, sizeof(struct InstantRequestItem))))
+  {
+    item->next        = replicator->items;
+    replicator->items = item;
+    count --;
+  }
+
+  return -count;
 }
 
 static void ReleaseRequestItem(struct InstantReplicator* replicator, struct InstantRequestItem* item)
@@ -885,7 +911,7 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
 
   if (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY)
   {
-    task->state = INSTANT_TASK_STATE_WAIT_HOLD;
+    task->state = INSTANT_TASK_STATE_WAIT_LOCK;
     return 0;
   }
 
@@ -928,9 +954,11 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
 
   RetireReliablePool(pool);
 
-  if (count == 0)
+  if ((count == 0) ||
+      (ReserveRequestItemList(replicator, count) < 0))
   {
-    // No interest of any announced blocks
+    // No interest of any announced blocks or
+    // can not reserve required amount of request items
     return -1;
   }
 
@@ -963,17 +991,23 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
   return 0;
 }
 
+static int PrepareRetreiveRequest(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  return -1;
+}
+
 static int ExecuteReadingTask(struct InstantReplicator* replicator, struct InstantTask* task)
 {
   switch (task->state)
   {
     case INSTANT_TASK_STATE_IDLE:
-    case INSTANT_TASK_STATE_WAIT_HOLD:
+    case INSTANT_TASK_STATE_WAIT_LOCK:
       return PrepareReadingRequest(replicator, task);
 
     case INSTANT_TASK_STATE_WAIT_BUFFER:
-      return 0;
+      return PrepareRetreiveRequest(replicator, task);
 
+    case INSTANT_TASK_STATE_WAIT_DATA:
     case INSTANT_TASK_STATE_WAIT_COMPLETION:
       return 0;
   }
@@ -1055,15 +1089,23 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
 
 static void HandleCompletedRead(struct InstantReplicator* replicator, struct InstantTask* task, int status)
 {
+  struct InstantBlockData* entry;
   struct ReliableMemory* memory;
   struct InstantCookie* cookie;
   struct ReliableBlock* block;
   struct ReliableShare* share;
+  struct ReliablePool* pool;
+  uint32_t control;
   uint32_t number;
   uint32_t index;
+  uint32_t count;
 
-  if ((status == IBV_WC_SUCCESS) &&
-      (cookie  = FindCookie(replicator, task->name)))
+  pool   = NULL;
+  cookie = NULL;
+  count  = 0;
+
+  if ((pool    = FindReliablePool(replicator->indexer, task->name, 1)) &&
+      (cookie  = EnsureCookie(replicator, pool)))
   {
     share  = cookie->share;
     memory = share->memory;
@@ -1074,12 +1116,31 @@ static void HandleCompletedRead(struct InstantReplicator* replicator, struct Ins
 
       if (number != UINT32_MAX)
       {
-        block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+        block   = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+        control = GetCRC32C(block->data, block->length, 0);
 
-        printf("read block %u\n", number);
+        if ((status  == IBV_WC_SUCCESS) &&
+            (control == atomic_load_explicit(&block->control, memory_order_relaxed)))
+        {
+          task->transfer.numbers[index] = UINT32_MAX;
+          CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
+          continue;
+        }
+
+        entry          = task->transfer.entries + index;
+        entry->mark    = atomic_load_explicit(&block->mark, memory_order_relaxed);
+        entry->address = (uintptr_t)&block->mark;
+        count ++;
       }
     }
+  }
 
+  RetireReliablePool(pool);
+
+  if (count != 0)
+  {
+    task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
+    return;
   }
 
   RemoveTask(replicator, task);
@@ -1104,8 +1165,8 @@ static void WaitForReadyState(struct InstantReplicator* replicator)
   if ((~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY) &&
       (submission = io_uring_get_sqe(&replicator->ring)))
   {
-    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_HOLD, memory_order_relaxed);
-    io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->state, INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_HOLD, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
+    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
+    io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->state, INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
     io_uring_sqe_set_data64(submission, RING_TAG_READY_STATE);
   }
 }
@@ -1136,18 +1197,18 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
   }
 
   if ((replicator->schedule.count != 0) &&
-      (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_HOLD))
+      (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
   {
-    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_HOLD, memory_order_relaxed);
+    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
     WaitForReadyState(replicator);
   }
 
   if ((replicator->schedule.count == 0) &&
-      (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_HOLD))
+      (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
   {
-    atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_HOLD | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
+    atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
   }
@@ -1682,6 +1743,7 @@ static void* DoWork(void* closure)
   struct io_uring_sqe* submission;
   struct io_uring_cqe* completion;
   unsigned head;
+  int result;
 
   replicator       = (struct InstantReplicator*)closure;
   interval.tv_nsec = GENERIC_POLL_TIMEOUT * 1000000ULL;
@@ -1698,9 +1760,18 @@ static void* DoWork(void* closure)
   HandleSendingQueue(replicator, 0);
   HandleEventChannel(replicator, 0);
 
-  while ((atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE) &&
-         (io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL) >= 0))
+  while (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE)
   {
+    result = io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL);
+    
+    if ((result == -EINVAL) ||
+        (result == -ENOMEM) ||
+        (result == -EFAULT))
+    {
+      atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_FAILURE, memory_order_relaxed);
+      break;
+    }
+
     io_uring_for_each_cqe(&replicator->ring, head, completion)
     {
       switch (completion->user_data)
@@ -1738,8 +1809,7 @@ static void* DoWork(void* closure)
     DrainRequestQueueList(replicator);
   }
 
-  atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_FAILURE, memory_order_relaxed);
-  atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_HOLD | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
+  atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
 
   while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
          (errno == EINTR));
