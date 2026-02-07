@@ -1493,11 +1493,17 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
 {
   struct InstantPeer* peer;
 
-  printf("HandleDisconnected id=%p\n", descriptor);
-
   if ((peer = (struct InstantPeer*)descriptor->context) &&
       (peer->descriptor == descriptor))
   {
+    if (peer->state == INSTANT_PEER_STATE_CONNECTED)
+    {
+      printf("HandleDisconnected id=%p peer=%p reason=%d\n", descriptor, peer, reason);
+
+      ClearTaskList(replicator, peer);
+      ClearRequestQueue(replicator, &peer->queue);
+    }
+
     peer->state      = INSTANT_PEER_STATE_DISCONNECTED;
     peer->descriptor = NULL;
     peer->card       = NULL;
@@ -1506,9 +1512,6 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
     peer->fails ++;
     peer->round ++;
     peer->round %= INSTANT_POINT_COUNT;
-
-    ClearTaskList(replicator, peer);
-    ClearRequestQueue(replicator, &peer->queue);
   }
 
   return -1;
