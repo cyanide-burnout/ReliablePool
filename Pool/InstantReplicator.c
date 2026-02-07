@@ -288,7 +288,7 @@ static void SubmitTask(struct InstantReplicator* replicator, struct InstantTask*
   task->number   = replicator->schedule.number ++;
 
   if (other = task->previous)  other->next               = task;
-  else                         replicator->schedule.head = task; 
+  else                         replicator->schedule.head = task;
 
   replicator->schedule.count += task->type > INSTANT_TASK_TYPE_SYNCING;
   replicator->schedule.tail   = task;
@@ -948,8 +948,14 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
     {
       block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
 
-      if (-- count)  SubmitReadingWork(replicator, peer, NULL, task->transfer.key, entry, region, block);
-      else           SubmitReadingWork(replicator, peer, task, task->transfer.key, entry, region, block);
+      if (-- count)
+      {
+        SubmitReadingWork(replicator, peer, NULL, task->transfer.key, entry, region, block);
+        continue;
+      }
+
+      SubmitReadingWork(replicator, peer, task, task->transfer.key, entry, region, block);
+      break;
     }
   }
 
@@ -1133,6 +1139,8 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
       (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_HOLD))
   {
     atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_HOLD, memory_order_relaxed);
+    while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+           (errno == EINTR));
     WaitForReadyState(replicator);
   }
 
