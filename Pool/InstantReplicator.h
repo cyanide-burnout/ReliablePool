@@ -26,8 +26,10 @@ extern "C"
 #define INSTANT_MAGIC                0xe29a
 #define INSTANT_SERVICE_NAME_LENGTH  16
 
+#define INSTANT_TYPE_CLOCK      0
 #define INSTANT_TYPE_NOTIFY     1
 #define INSTANT_TYPE_RETREIVE   2
+#define INSTANT_TYPE_RELEASE    3
 
 struct InstantHandshakeData
 {
@@ -189,6 +191,7 @@ struct InstantPeer
   uint32_t state;  // INSTANT_PEER_STATE_*
   uint32_t round;  // Round-robin index of points
   uint32_t fails;  // Connection failures count
+  int64_t vector;  // Clock vector in units of mark epoch
 
   uuid_t identifier;
   struct InstantPoint points[INSTANT_POINT_COUNT];
@@ -206,7 +209,8 @@ struct InstantTransferTaskData  // INSTANT_TASK_TYPE_READING, INSTANT_TASK_TYPE_
   uint32_t task;
   uint32_t count;
   struct InstantSharedBuffer* buffer;
-  struct InstantBlockData list[INSTANT_BATCH_LENGTH_LIMIT];
+  uint32_t numbers[INSTANT_BATCH_LENGTH_LIMIT];
+  struct InstantBlockData entries[INSTANT_BATCH_LENGTH_LIMIT];
 };
 
 struct InstantTask

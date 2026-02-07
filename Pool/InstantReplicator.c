@@ -858,8 +858,120 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
   return 0;
 }
 
+static int PrepareReadingRequest(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct ReliableShare* share;
+  struct ReliablePool* pool;
+  struct InstantPeer* peer;
+  struct InstantCard* card;
+  struct ibv_mr* region;
+  uint32_t number;
+  uint32_t count;
+  uint32_t index;
+  uint64_t mark;
+
+  peer  = task->peer;
+  count = 0;
+
+  if (peer->state != INSTANT_PEER_STATE_CONNECTED)
+  {
+    // Connection lost
+    return -1;
+  }
+
+  if (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY)
+  {
+    task->state = INSTANT_TASK_STATE_WAIT_HOLD;
+    return 0;
+  }
+
+  if (!(pool   = FindReliablePool(replicator->indexer, task->name, 1)) ||
+      !(cookie = EnsureCookie(replicator, pool)))
+  {
+    RetireReliablePool(pool);
+    return -1;
+  }
+
+  // Phase 1: checking blocks for changes
+
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    entry = task->transfer.entries + index;
+
+    if (((number = FindReliableBlockNumber(replicator->indexer, task->name, entry->identifier))   == UINT32_MAX) &&
+        (((number = ReserveReliableBlock(pool, entry->identifier, RELIABLE_TYPE_NON_RECOVERABLE)) == UINT32_MAX) ||
+         ((cookie = EnsureCookie(replicator, pool))                                               == NULL)))
+    {
+      RetireReliablePool(pool);
+      return -1;
+    }
+
+    share  = cookie->share;
+    memory = share->memory;
+    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+    mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
+
+    if ((mark & 1ULL) ||
+        (mark >= (entry->mark + peer->vector)))
+    {
+      task->transfer.numbers[index] = UINT32_MAX;
+      continue;
+    }
+
+    task->transfer.numbers[index] = number;
+    count ++;
+  }
+
+  RetireReliablePool(pool);
+
+  if (count == 0)
+  {
+    // No interest of any announced blocks
+    return -1;
+  }
+
+  // Phase 2: requesting changed blocks with optimistic approach
+
+  card   = peer->card;
+  region = cookie->regions[card->number];
+
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    entry  = task->transfer.entries + index;
+    number = task->transfer.numbers[index];
+
+    if (number != UINT32_MAX)
+    {
+      block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+
+      if (-- count)  SubmitReadingWork(replicator, peer, NULL, task->transfer.key, entry, region, block);
+      else           SubmitReadingWork(replicator, peer, task, task->transfer.key, entry, region, block);
+    }
+  }
+
+  task->state = INSTANT_TASK_STATE_WAIT_COMPLETION;
+  return 0;
+}
+
 static int ExecuteReadingTask(struct InstantReplicator* replicator, struct InstantTask* task)
 {
+  switch (task->state)
+  {
+    case INSTANT_TASK_STATE_IDLE:
+    case INSTANT_TASK_STATE_WAIT_HOLD:
+      return PrepareReadingRequest(replicator, task);
+
+    case INSTANT_TASK_STATE_WAIT_BUFFER:
+      return 0;
+
+    case INSTANT_TASK_STATE_WAIT_COMPLETION:
+      return 0;
+  }
+
   return -1;
 }
 
@@ -872,7 +984,7 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
 {
   struct InstantHeaderData* header;
   struct InstantCookieData* cookie;
-  struct InstantBlockData* list;
+  struct InstantBlockData* entries;
   struct InstantPeer* peer;
   struct InstantTask* task;
   intptr_t count;
@@ -899,9 +1011,9 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
         (header->type <= INSTANT_TYPE_RETREIVE) &&
         (length >= (sizeof(struct InstantHeaderData) + sizeof(struct InstantCookieData))))
     {
-      cookie = (struct InstantCookieData*)(data + sizeof(struct InstantHeaderData));
-      list   = (struct InstantBlockData*)(data + sizeof(struct InstantHeaderData) + cookie->length);
-      count  = (uintptr_t)data + length - (uintptr_t)list;
+      cookie  = (struct InstantCookieData*)(data + sizeof(struct InstantHeaderData));
+      entries = (struct InstantBlockData*)(data + sizeof(struct InstantHeaderData) + cookie->length);
+      count   = (uintptr_t)data + length - (uintptr_t)entries;
 
       if ((count  > 0LL)           &&
           (number < cookie->count) &&
@@ -914,7 +1026,7 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
         task->transfer.count = count / sizeof(struct InstantBlockData);
 
         memcpy(task->name, cookie->name, RELIABLE_MEMORY_NAME_LENGTH);
-        memcpy(task->transfer.list, list, count);
+        memcpy(task->transfer.entries, entries, count);
 
         SubmitTask(replicator, task);
       }
@@ -937,7 +1049,33 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
 
 static void HandleCompletedRead(struct InstantReplicator* replicator, struct InstantTask* task, int status)
 {
-  // if (status != IBV_WC_SUCCESS)
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct ReliableShare* share;
+  uint32_t number;
+  uint32_t index;
+
+  if ((status == IBV_WC_SUCCESS) &&
+      (cookie  = FindCookie(replicator, task->name)))
+  {
+    share  = cookie->share;
+    memory = share->memory;
+
+    for (index = 0; index < task->transfer.count; ++ index)
+    {
+      number = task->transfer.numbers[index];
+
+      if (number != UINT32_MAX)
+      {
+        block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+
+        printf("read block %u\n", number);
+      }
+    }
+
+  }
+
   RemoveTask(replicator, task);
 }
 
