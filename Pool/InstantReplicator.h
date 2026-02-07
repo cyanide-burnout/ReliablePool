@@ -29,7 +29,8 @@ extern "C"
 #define INSTANT_TYPE_CLOCK      0
 #define INSTANT_TYPE_NOTIFY     1
 #define INSTANT_TYPE_RETREIVE   2
-#define INSTANT_TYPE_RELEASE    3
+#define INSTANT_TYPE_COMPLETE   3
+#define INSTANT_TYPE_DELETE     4
 
 struct InstantHandshakeData
 {
@@ -65,9 +66,15 @@ struct InstantHeaderData
 
 // Replicator
 
+#define RELIABLE_MONITOR_BLOCK_DAMAGE   13
+#define RELIABLE_MONITOR_BLOCK_DELETE   14
+#define RELIABLE_MONITOR_BLOCK_ARRIVAL  15
+
+#define INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE  (1U << 0)
+
 #define INSTANT_REPLICATOR_STATE_ACTIVE   (1U << 0)
 #define INSTANT_REPLICATOR_STATE_FAILURE  (1U << 1)
-#define INSTANT_REPLICATOR_STATE_HOLD     (1U << 2)
+#define INSTANT_REPLICATOR_STATE_LOCK     (1U << 2)
 #define INSTANT_REPLICATOR_STATE_READY    (1U << 3)
 
 #define INSTANT_PEER_STATE_DISCONNECTED  0
@@ -81,7 +88,7 @@ struct InstantHeaderData
 #define INSTANT_TASK_STATE_IDLE             0
 #define INSTANT_TASK_STATE_PROGRESS         1
 #define INSTANT_TASK_STATE_WAIT_DATA        2
-#define INSTANT_TASK_STATE_WAIT_HOLD        3
+#define INSTANT_TASK_STATE_WAIT_LOCK        3
 #define INSTANT_TASK_STATE_WAIT_BUFFER      4
 #define INSTANT_TASK_STATE_WAIT_COMPLETION  5
 
@@ -91,12 +98,8 @@ struct InstantHeaderData
 #define INSTANT_QUEUE_LENGTH   2048  // Must be a power of two
 #define INSTANT_BUFFER_LENGTH  4096  // Corresponds to InfiniBand payload MTU (RoCE jumbo-frames have greater length)
 
-#define INSTANT_TASK_ALIGNMENT            128ULL
 #define INSTANT_BATCH_LENGTH_LIMIT        (INSTANT_BUFFER_LENGTH / sizeof(struct InstantBlockData) + 1)
 #define INSTANT_MESSAGE_LENGTH_THRESHOLD  (INSTANT_BUFFER_LENGTH - 2 * sizeof(struct InstantBlockData))
-
-#define INSTANT_TASK_SLOT_MASK     (INSTANT_TASK_ALIGNMENT - 1ULL)
-#define INSTANT_TASK_ADDRESS_MASK  (~INSTANT_TASK_SLOT_MASK)
 
 struct InstantSharedBuffer
 {
@@ -233,7 +236,7 @@ struct InstantTask
 
 struct InstantTaskList
 {
-  uint32_t count;            // Count of tasks that require INSTANT_REPLICATOR_STATE_HOLD
+  uint32_t count;            // Count of tasks that require INSTANT_REPLICATOR_STATE_LOCK
   uint32_t number;           // Task number counter
   struct InstantTask* head;  //
   struct InstantTask* tail;  //
@@ -247,6 +250,7 @@ struct InstantReplicator
   char* name;
   char* secret;
   uint32_t limit;
+  uint32_t options;
   uuid_t identifier;
 
   struct io_uring ring;
@@ -272,7 +276,7 @@ struct InstantReplicator
 
 typedef int (*ExecuteInstantTaskFunction)(struct InstantReplicator* replicator, struct InstantTask* task);
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, struct ReliableMonitor* next);
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, uint32_t options, struct ReliableMonitor* next);
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);
 
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length);
