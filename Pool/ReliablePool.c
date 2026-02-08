@@ -633,6 +633,7 @@ void ReleaseReliableBlock(struct ReliableDescriptor* descriptor, int type)
       if (type == RELIABLE_TYPE_FREE)
       {
         uuid_clear(block->identifier);
+        atomic_store_explicit(&block->hint,    0, memory_order_relaxed);
         atomic_store_explicit(&block->mark,    0, memory_order_relaxed);
         atomic_store_explicit(&block->control, 0, memory_order_relaxed);
         PushFreeBlock(share->memory, block);
@@ -768,6 +769,7 @@ int FreeReliableBlock(struct ReliablePool* pool, uint32_t number, uuid_t identif
   CallReliableMonitor(RELIABLE_MONITOR_BLOCK_FREE, pool, share, block);
 
   uuid_clear(block->identifier);
+  atomic_store_explicit(&block->hint,    0, memory_order_relaxed);
   atomic_store_explicit(&block->mark,    0, memory_order_relaxed);
   atomic_store_explicit(&block->control, 0, memory_order_relaxed);
 
