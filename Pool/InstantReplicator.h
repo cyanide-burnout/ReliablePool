@@ -30,7 +30,7 @@ extern "C"
 #define INSTANT_TYPE_NOTIFY     1
 #define INSTANT_TYPE_RETREIVE   2
 #define INSTANT_TYPE_COMPLETE   3
-#define INSTANT_TYPE_DELETE     4
+#define INSTANT_TYPE_REMOVE     4
 
 struct InstantHandshakeData
 {
@@ -54,6 +54,7 @@ struct InstantBlockData
   uuid_t identifier;  // Block UUID
   uint64_t address;   // ReliableBlock::mark
   uint32_t length;    // sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length
+  uint64_t hint;      //
   uint64_t mark;      //
 } __attribute__((packed));
 
@@ -67,8 +68,8 @@ struct InstantHeaderData
 // Replicator
 
 #define RELIABLE_MONITOR_BLOCK_DAMAGE   13
-#define RELIABLE_MONITOR_BLOCK_DELETE   14
-#define RELIABLE_MONITOR_BLOCK_ARRIVAL  15
+#define RELIABLE_MONITOR_BLOCK_ARRIVAL  14
+#define RELIABLE_MONITOR_BLOCK_REMOVAL  15
 
 #define INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE  (1U << 0)
 
@@ -92,7 +93,7 @@ struct InstantHeaderData
 #define INSTANT_TASK_STATE_WAIT_BUFFER      4
 #define INSTANT_TASK_STATE_WAIT_COMPLETION  5
 
-#define INSTANT_POINT_COUNT  8   // Very optimistic (usually reserve 2-4 legs)
+#define INSTANT_POINT_COUNT  8   // Very optimistic (usually 2-4 legs reserved)
 #define INSTANT_CARD_COUNT   64  // More HCAs are unexpected (who uses more than 8?)
 
 #define INSTANT_QUEUE_LENGTH   2048  // Must be a power of two

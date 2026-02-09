@@ -684,6 +684,7 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
 
       entry           = (struct InstantBlockData*)(buffer->data + buffer->length);
       entry->mark     = atomic_load_explicit(&block->mark, memory_order_acquire);
+      entry->hint     = atomic_load_explicit(&block->hint, memory_order_relaxed);
       entry->length   = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
       entry->address  = address;
       buffer->length += sizeof(struct InstantBlockData);
@@ -850,6 +851,7 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
     {
       entry           = (struct InstantBlockData*)(buffer->data + buffer->length);
       entry->mark     = atomic_load_explicit(&block->mark, memory_order_acquire);
+      entry->hint     = atomic_load_explicit(&block->hint, memory_order_relaxed);
       entry->length   = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
       entry->address  = (uintptr_t)&block->mark;
       buffer->length += sizeof(struct InstantBlockData);
@@ -869,14 +871,11 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
   return 0;
 }
 
-static int PrepareRetreiveRequest(struct InstantReplicator* replicator, struct InstantTask* task)
+static int TransmitRetreiveRequest(struct InstantReplicator* replicator, struct InstantTask* task)
 {
   struct InstantSharedBuffer* buffer;
   struct InstantHeaderData* header;
-  struct InstantBlockData* entry;
   struct InstantCookie* cookie;
-  uint32_t number;
-  uint32_t index;
 
   if (!(cookie = FindCookie(replicator, task->name)))
   {
@@ -884,7 +883,8 @@ static int PrepareRetreiveRequest(struct InstantReplicator* replicator, struct I
     return -1;
   }
 
-  if (!(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+  if ( (ReserveRequestItemList(replicator, 1) < 0) ||
+      !(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
   {
     task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
     return 0;
@@ -895,29 +895,74 @@ static int PrepareRetreiveRequest(struct InstantReplicator* replicator, struct I
   header->task   = task->number;
   buffer->length = sizeof(struct InstantHeaderData) + cookie->data.length;
 
-  memcpy(buffer->data + sizeof(struct InstantHeaderData), &cookie->data, cookie->data.length);
   uuid_copy(header->identifier, replicator->identifier);
+  memcpy(buffer->data + sizeof(struct InstantHeaderData), &cookie->data, cookie->data.length);
+  memcpy(buffer->data + buffer->length, task->transfer.entries, task->transfer.count * sizeof(struct InstantBlockData));
 
-  for (index = 0; index < task->transfer.count; ++ index)
-  {
-    entry  = task->transfer.entries + index;
-    number = task->transfer.numbers[index];
+  buffer->length        += task->transfer.count * sizeof(struct InstantBlockData);
+  task->transfer.buffer  = buffer;
+  task->state            = INSTANT_TASK_STATE_WAIT_DATA;
 
-    if (number != UINT32_MAX)
-    {
-      memcpy(buffer->data + buffer->length, entry, sizeof(struct InstantBlockData));
-      buffer->length += sizeof(struct InstantBlockData);
-    }
-  }
-
-  SubmitSharedBuffer(replicator, task->peer, buffer);
-  ReleaseSharedBuffer(&replicator->buffers, buffer);
-
-  task->state = INSTANT_TASK_STATE_WAIT_DATA;
-  return 0;
+  return SubmitSharedBuffer(replicator, task->peer, buffer);
 }
 
-static int PrepareReadingRequest(struct InstantReplicator* replicator, struct InstantTask* task)
+static struct InstantBlockData* FindStaleInstantBlockData(uuid_t identifier, uint64_t hint, struct InstantBlockData* cursor, uint32_t count)
+{
+  while (count != 0)
+  {
+    if ((uuid_compare(cursor->identifier, identifier) == 0) &&
+        (cursor->hint >= hint))
+    {
+      // Suggest removing only an outdated entry
+      return cursor;
+    }
+
+    cursor ++;
+    count  --;
+  }
+
+  return NULL;
+}
+
+static void PruneStaleReadingTask(struct InstantReplicator* replicator, const char* name, struct InstantBlockData* entries, uint32_t count)
+{
+  struct InstantBlockData* entry;
+  struct InstantTask* task;
+  struct InstantTask* next;
+  uint32_t index;
+
+  for (task = replicator->schedule.head; task != NULL; task = next)
+  {
+    next = task->next;
+
+    if ((task->type  == INSTANT_TASK_TYPE_READING) &&
+        (task->state == INSTANT_TASK_STATE_IDLE)   &&
+        (memcmp(task->name, name, RELIABLE_MEMORY_NAME_LENGTH) == 0))
+    {
+      for (index = 0; index < task->transfer.count; )
+      {
+        entry = task->transfer.entries + index;
+
+        if (FindStaleInstantBlockData(entry->identifier, entry->hint, entries, count) != NULL)
+        {
+          task->transfer.count --;
+          memmove(entry, entry + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
+          continue;
+        }
+
+        index ++;
+      }
+
+      if (task->transfer.count == 0)
+      {
+        RemoveTask(replicator, task);
+        continue;
+      }
+    }
+  }
+}
+
+static int CollectReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
 {
   struct InstantBlockData* entry;
   struct ReliableMemory* memory;
@@ -926,15 +971,11 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
   struct ReliableShare* share;
   struct ReliablePool* pool;
   struct InstantPeer* peer;
-  struct InstantCard* card;
-  struct ibv_mr* region;
   uint32_t number;
-  uint32_t count;
   uint32_t index;
-  uint64_t mark;
+  uint64_t hint;
 
-  peer  = task->peer;
-  count = 0;
+  peer = task->peer;
 
   if (peer->state != INSTANT_PEER_STATE_CONNECTED)
   {
@@ -955,9 +996,7 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
     return -1;
   }
 
-  // Phase 1: checking blocks for changes
-
-  for (index = 0; index < task->transfer.count; ++ index)
+  for (index = 0; index < task->transfer.count; )
   {
     entry = task->transfer.entries + index;
 
@@ -972,45 +1011,80 @@ static int PrepareReadingRequest(struct InstantReplicator* replicator, struct In
     share  = cookie->share;
     memory = share->memory;
     block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
-    mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
+    hint   = atomic_load_explicit(&block->hint, memory_order_relaxed);
 
-    if ((mark & 1ULL) ||
-        (mark >= (entry->mark + peer->vector)))
+    if (hint >= entry->hint)
     {
-      task->transfer.numbers[index] = UINT32_MAX;
+      task->transfer.count --;
+      memmove(entry, entry + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
       continue;
     }
 
+    atomic_store_explicit(&block->hint, entry->hint, memory_order_relaxed);
     task->transfer.numbers[index] = number;
-    count ++;
+    index ++;
   }
 
   RetireReliablePool(pool);
 
-  if ((count == 0) ||
-      (ReserveRequestItemList(replicator, count) < 0))
+  if (task->transfer.count == 0)
   {
-    // No interest of any announced blocks or
-    // can not reserve required amount of request items
+    // List of entries is empty now, removing the task
     return -1;
   }
 
-  // Phase 2: prepare data for retreive request in pessimistic approach
+  task->state = INSTANT_TASK_STATE_PROGRESS;
+  return 1;
+}
 
-  for (index = 0; index < task->transfer.count; ++ index)
+static int PrepareReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct ReliableShare* share;
+  uint32_t* number;
+  uint32_t index;
+  uint64_t hint;
+
+  if (!(cookie = FindCookie(replicator, task->name)))
   {
-    entry  = task->transfer.entries + index;
-    number = task->transfer.numbers[index];
-
-    if (number != UINT32_MAX)
-    {
-      block          = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
-      entry->mark    = atomic_load_explicit(&block->mark, memory_order_relaxed);
-      entry->address = (uintptr_t)&block->mark;
-    }
+    // Cannot acquire cookie
+    return -1;
   }
 
-  return PrepareRetreiveRequest(replicator, task);
+  share  = cookie->share;
+  memory = share->memory;
+
+  for (index = 0; index < task->transfer.count; )
+  {
+    number = task->transfer.numbers + index;
+    entry  = task->transfer.entries + index;
+    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)*number);
+    hint   = atomic_load_explicit(&block->hint, memory_order_relaxed);
+
+    if (hint > entry->hint)
+    {
+      task->transfer.count --;
+      memmove(entry,  entry  + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
+      memmove(number, number + 1, (task->transfer.count - index) * sizeof(uint32_t));
+      continue;
+    }
+
+    entry->hint    = hint;
+    entry->mark    = atomic_load_explicit(&block->mark, memory_order_relaxed);
+    entry->address = (uintptr_t)&block->mark;
+    index ++;
+  }
+
+  if (task->transfer.count == 0)
+  {
+    // List of entries is empty now, removing the task
+    return -1;
+  }
+
+  return TransmitRetreiveRequest(replicator, task);
 }
 
 static int ExecuteReadingTask(struct InstantReplicator* replicator, struct InstantTask* task)
@@ -1019,10 +1093,13 @@ static int ExecuteReadingTask(struct InstantReplicator* replicator, struct Insta
   {
     case INSTANT_TASK_STATE_IDLE:
     case INSTANT_TASK_STATE_WAIT_LOCK:
-      return PrepareReadingRequest(replicator, task);
+      return CollectReadingBlockList(replicator, task);
+
+    case INSTANT_TASK_STATE_PROGRESS:
+      return PrepareReadingBlockList(replicator, task);
 
     case INSTANT_TASK_STATE_WAIT_BUFFER:
-      return PrepareRetreiveRequest(replicator, task);
+      return TransmitRetreiveRequest(replicator, task);
 
     case INSTANT_TASK_STATE_WAIT_DATA:
     case INSTANT_TASK_STATE_WAIT_COMPLETION:
@@ -1086,7 +1163,9 @@ static int PrepareExchangeRequest(struct InstantReplicator* replicator, struct I
     entry   = task->transfer.entries + index;
     number  = FindReliableBlockNumber(replicator->indexer, task->name, entry->identifier);
     count  += (number != UINT32_MAX);
+
     task->transfer.numbers[index] = number;
+    buffer->values[index]         = 0ULL;
   }
 
   if ((count == 0) ||
@@ -1137,14 +1216,52 @@ static int ExecuteWritingTask(struct InstantReplicator* replicator, struct Insta
   return -1;
 }
 
+static void CreateTransferTask(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantHeaderData* header, uint32_t length, uint32_t number)
+{
+  struct InstantCookieData* cookie;
+  struct InstantBlockData* entries;
+  struct InstantTask* task;
+  intptr_t count;
+  uint32_t index;
+
+  cookie  = (struct InstantCookieData*)((uint8_t*)header + sizeof(struct InstantHeaderData));
+  entries = (struct InstantBlockData*)((uint8_t*)header + sizeof(struct InstantHeaderData) + cookie->length);
+  count   = (uintptr_t)header + length - (uintptr_t)entries;
+
+  if ((count  > 0LL)           &&
+      (number < cookie->count) &&
+      (task = AllocateTask(replicator)))
+  {
+    task->peer           = peer;
+    task->type           = header->type;
+    task->transfer.task  = header->task;
+    task->transfer.key   = cookie->keys[number];
+    task->transfer.count = count / sizeof(struct InstantBlockData);
+
+    memcpy(task->name, cookie->name, RELIABLE_MEMORY_NAME_LENGTH);
+    memcpy(task->transfer.entries, entries, count);
+
+    for (index = 0; index < task->transfer.count; index ++)
+    {
+      // Adjust hint to local epoch
+      task->transfer.entries[index].hint += peer->vector;
+    }
+
+    if (task->type == INSTANT_TASK_TYPE_READING)
+    {
+      // Prune outdated entries and tasks
+      PruneStaleReadingTask(replicator, task->name, task->transfer.entries, task->transfer.count);
+    }
+
+    SubmitTask(replicator, task);
+  }
+}
+
 static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t* data, uint32_t length, uint32_t number, int status, int flags)
 {
   struct InstantHeaderData* header;
-  struct InstantCookieData* cookie;
-  struct InstantBlockData* entries;
   struct InstantPeer* peer;
   struct InstantTask* task;
-  intptr_t count;
 
   if ((status == IBV_WC_SUCCESS) &&
       (length >= sizeof(struct InstantHeaderData)))
@@ -1172,7 +1289,7 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
       case INSTANT_TYPE_CLOCK:
         break;
 
-      case INSTANT_TYPE_DELETE:
+      case INSTANT_TYPE_REMOVE:
         break;
 
       case INSTANT_TYPE_COMPLETE:
@@ -1185,25 +1302,8 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
         if ((flags & IBV_WC_WITH_IMM) &&
             (length >= (sizeof(struct InstantHeaderData) + sizeof(struct InstantCookieData))))
         {
-          cookie  = (struct InstantCookieData*)(data + sizeof(struct InstantHeaderData));
-          entries = (struct InstantBlockData*)(data + sizeof(struct InstantHeaderData) + cookie->length);
-          count   = (uintptr_t)data + length - (uintptr_t)entries;
-
-          if ((count  > 0LL)           &&
-              (number < cookie->count) &&
-              (task = AllocateTask(replicator)))
-          {
-            task->peer           = peer;
-            task->type           = header->type;
-            task->transfer.task  = header->task;
-            task->transfer.key   = cookie->keys[number];
-            task->transfer.count = count / sizeof(struct InstantBlockData);
-
-            memcpy(task->name, cookie->name, RELIABLE_MEMORY_NAME_LENGTH);
-            memcpy(task->transfer.entries, entries, count);
-
-            SubmitTask(replicator, task);
-          }
+          //
+          CreateTransferTask(replicator, peer, header, length, number);
         }
     }
   }
@@ -1344,21 +1444,31 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
     ExecuteWritingTask
   };
 
+  int result;
+  int condition;
   struct InstantTask* task;
   struct InstantTask* next;
   ExecuteInstantTaskFunction function;
 
-  for (task = replicator->schedule.head; task != NULL; task = next)
+  do
   {
-    next     = task->next;
-    function = functions[task->type];
+    condition = 0;
 
-    if (function(replicator, task) < 0)
+    for (task = replicator->schedule.head; task != NULL; task = next)
     {
-      // Negative result means remove immediately
-      RemoveTask(replicator, task);
+      next       = task->next;
+      function   = functions[task->type];
+      result     = function(replicator, task);
+      condition |= (result > 0);
+
+      if (result < 0)
+      {
+        // Negative result means remove immediately
+        RemoveTask(replicator, task);
+      }
     }
   }
+  while (condition != 0);
 
   if ((replicator->schedule.count != 0) &&
       (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
@@ -1437,7 +1547,7 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
 
   if ((card == NULL) &&
       (!(other = replicator->cards) ||
-        (other->number < (INSTANT_CARD_COUNT - 2))) &&
+        (other->number < (INSTANT_CARD_COUNT - 1))) &&
       (card = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
   {
     memset(&attribute, 0, sizeof(struct ibv_srq_init_attr));
