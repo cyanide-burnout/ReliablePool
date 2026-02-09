@@ -249,8 +249,6 @@ struct InstantReplicator
 
   char* name;
   char* secret;
-  uint32_t limit;
-  uint32_t options;
   uuid_t identifier;
 
   struct io_uring ring;
@@ -276,7 +274,7 @@ struct InstantReplicator
 
 typedef int (*ExecuteInstantTaskFunction)(struct InstantReplicator* replicator, struct InstantTask* task);
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t limit, uint32_t options, struct ReliableMonitor* next);
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, struct ReliableMonitor* next);
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);
 
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length);
