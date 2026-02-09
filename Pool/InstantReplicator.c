@@ -578,7 +578,6 @@ static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* re
   item->request.wr.rdma.rkey        = key;
 
   AppendRequestQueue(&peer->queue, item);
-
   item = AllocateRequestItem(replicator);
 
   item->element.addr                = (uintptr_t)&block->mark;
@@ -591,6 +590,7 @@ static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* re
   item->request.wr.rdma.rkey        = key;
 
   AppendRequestQueue(&peer->queue, item);
+  return item;
 }
 
 static int UpdateWritingWork(struct InstantRequestItem* item, struct InstantTask* task, uint32_t number)
