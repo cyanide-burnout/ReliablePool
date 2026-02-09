@@ -268,6 +268,7 @@ static void HandleDurtyBlock(struct ReliableTracker* tracker, struct ReliableTra
     {
       atomic_store_explicit(&block->control, control, memory_order_relaxed);
       atomic_store_explicit(&block->mark,    epoch,   memory_order_release);
+      atomic_store_explicit(&block->hint,    epoch,   memory_order_release);
 
       pool  = trackable->pool;
       share = (struct ReliableShare*)pool->closures[0];

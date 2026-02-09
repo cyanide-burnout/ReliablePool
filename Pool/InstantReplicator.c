@@ -1597,7 +1597,9 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
   for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
 
   if ((card == NULL) &&
-      (card  = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
+      (!(other = replicator->cards) ||
+        (other->number < (INSTANT_CARD_COUNT - 2))) &&
+      (card = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
   {
     memset(&attribute, 0, sizeof(struct ibv_srq_init_attr));
 

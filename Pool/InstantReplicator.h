@@ -92,8 +92,8 @@ struct InstantHeaderData
 #define INSTANT_TASK_STATE_WAIT_BUFFER      4
 #define INSTANT_TASK_STATE_WAIT_COMPLETION  5
 
-#define INSTANT_POINT_COUNT  8    // Very optimistic (usually reserve 2-4 legs)
-#define INSTANT_CARD_COUNT   128  // More HCAs are unexpected (who uses more than two?)
+#define INSTANT_POINT_COUNT  8   // Very optimistic (usually reserve 2-4 legs)
+#define INSTANT_CARD_COUNT   64  // More HCAs are unexpected (who uses more than 8?)
 
 #define INSTANT_QUEUE_LENGTH   2048  // Must be a power of two
 #define INSTANT_BUFFER_LENGTH  4096  // Corresponds to InfiniBand payload MTU (RoCE jumbo-frames have greater length)
