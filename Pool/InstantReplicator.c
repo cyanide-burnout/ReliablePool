@@ -246,6 +246,7 @@ static struct InstantRequestItem* AllocateRequestItem(struct InstantReplicator* 
   if (item = replicator->items)
   {
     replicator->items = item->next;
+    item->next        = NULL;
     memset(&item->element, 0, sizeof(struct ibv_sge));
     memset(&item->request, 0, sizeof(struct ibv_send_wr));
     return item;
@@ -400,7 +401,7 @@ static struct InstantCookie* EnsureCookie(struct InstantReplicator* replicator, 
 
     do
     {
-      if (region = ibv_reg_mr(card->domain, share->memory, share->size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ))
+      if (region = ibv_reg_mr(card->domain, share->memory, share->size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC))
       {
         cookie->regions[card->number]   = region;
         cookie->data.keys[card->number] = region->rkey;
@@ -587,17 +588,34 @@ static int SubmitReadingWork(struct InstantReplicator* replicator, struct Instan
   return -1;
 }
 
-static int SubmitWritingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t number, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block)
+static void SubmitWritingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t number, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block)
 {
   struct InstantRequestItem* item;
   struct InstantCard* card;
 
-  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
-      (card = peer->card)                           &&
-      (item = AllocateRequestItem(replicator)))
+  // Use ReserveRequestItemList() first to make guaranteed allocation
+  // Here is two-stage WRITE work to make grant CAS-based consistency of block on remote
+
+  card = peer->card;
+
+  if (item = AllocateRequestItem(replicator))
+  {
+    item->element.addr                = (uintptr_t)&block->mark + sizeof(uint64_t);
+    item->element.length              = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) - sizeof(uint64_t) + block->length;
+    item->element.lkey                = region->lkey;
+    item->request.sg_list             = &item->element;
+    item->request.num_sge             = 1;
+    item->request.opcode              = IBV_WR_RDMA_WRITE;
+    item->request.wr.rdma.remote_addr = entry->address + sizeof(uint64_t);
+    item->request.wr.rdma.rkey        = key;
+
+    AppendRequestQueue(&peer->queue, item);
+  }
+
+  if (item = AllocateRequestItem(replicator))
   {
     item->element.addr                = (uintptr_t)&block->mark;
-    item->element.length              = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
+    item->element.length              = sizeof(uint64_t);
     item->element.lkey                = region->lkey;
     item->request.sg_list             = &item->element;
     item->request.num_sge             = 1;
@@ -614,21 +632,20 @@ static int SubmitWritingWork(struct InstantReplicator* replicator, struct Instan
     }
 
     AppendRequestQueue(&peer->queue, item);
-    return 0;
   }
-
-  return -1;
 }
 
-static int SubmitExchangingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t key, struct InstantBlockData* entry, uint64_t* result)
+static void SubmitExchangingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantTask* task, uint32_t key, struct InstantBlockData* entry, uint64_t* result)
 {
   struct InstantRequestItem* item;
   struct InstantCard* card;
   struct ibv_mr* region;
 
-  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
-      (card = peer->card)                           &&
-      (item = AllocateRequestItem(replicator)))
+  // Use ReserveRequestItemList() first to make guaranteed allocation
+
+  card = peer->card;
+
+  if (item = AllocateRequestItem(replicator))
   {
     region                              = card->region2;
     item->element.addr                  = (uintptr_t)result;
@@ -649,10 +666,7 @@ static int SubmitExchangingWork(struct InstantReplicator* replicator, struct Ins
     }
 
     AppendRequestQueue(&peer->queue, item);
-    return 0;
   }
-
-  return -1;
 }
 
 // Monitor
@@ -1326,6 +1340,12 @@ static void HandleCompletedRead(struct InstantReplicator* replicator, struct Ins
   uint32_t index;
   uint32_t count;
 
+  if (task == NULL)
+  {
+    // Unlikely there is an unexpected error in QP
+    return;
+  }
+
   pool   = NULL;
   cookie = NULL;
   count  = 0;
@@ -1405,6 +1425,12 @@ static void HandleCompletedExchange(struct InstantReplicator* replicator, struct
   uint32_t index;
   uint32_t count;
 
+  if (task == NULL)
+  {
+    // Unlikely there is an unexpected error in QP
+    return;
+  }
+
   peer   = task->peer;
   pool   = NULL;
   cookie = NULL;
@@ -1433,8 +1459,6 @@ static void HandleCompletedExchange(struct InstantReplicator* replicator, struct
           continue;
         }
 
-        entry->mark    = atomic_load_explicit(&block->mark, memory_order_relaxed);
-        entry->address = (uintptr_t)&block->mark;
         count ++;
       }
     }
@@ -1443,7 +1467,7 @@ static void HandleCompletedExchange(struct InstantReplicator* replicator, struct
   RetireReliablePool(pool);
 
   if ((count == 0) ||
-      (ReserveRequestItemList(replicator, count) < 0))
+      (ReserveRequestItemList(replicator, count * 2) < 0))
   {
     // No match with any requested blocks or
     // can not reserve required amount of request items
@@ -1474,12 +1498,11 @@ static void HandleCompletedExchange(struct InstantReplicator* replicator, struct
       break;
     }
   }
-
-  task->state = INSTANT_TASK_STATE_WAIT_COMPLETION;
 }
 
 static void HandleCompletedWrite(struct InstantReplicator* replicator, struct InstantTask* task, int status)
 {
+  // Status makes no sense for writing task completion
   RemoveTask(replicator, task);
 }
 
@@ -2090,7 +2113,7 @@ static void* DoWork(void* closure)
   while (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_ACTIVE)
   {
     result = io_uring_submit_and_wait_timeout(&replicator->ring, &completion, 1, &interval, NULL);
-    
+
     if ((result == -EINVAL) ||
         (result == -ENOMEM) ||
         (result == -EFAULT))
