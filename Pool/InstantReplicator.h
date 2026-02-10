@@ -212,6 +212,7 @@ struct InstantTransferTaskData  // INSTANT_TASK_TYPE_READING, INSTANT_TASK_TYPE_
   uint32_t key;
   uint32_t task;
   uint32_t count;
+  uint32_t attempt;
   struct InstantSharedBuffer* buffer;
   uint32_t numbers[INSTANT_BATCH_LENGTH_LIMIT];
   struct InstantBlockData entries[INSTANT_BATCH_LENGTH_LIMIT];
