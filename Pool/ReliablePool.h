@@ -61,13 +61,13 @@ struct ReliableBlock
 {
   uint32_t type;              // ┌ RELIABLE_TYPE_*                        ┐
   uint32_t number;            // │ Block number                           │
-  ATOMIC(uint64_t) next;      // │ Next free block                        │
-  ATOMIC(uint32_t) tag;       // │ Local version tag                      ├─ [local only]
-  ATOMIC(uint32_t) count;     // └ Count of references                    │
-  ATOMIC(uint64_t) hint;      //   Replication hint                       ┘
+  ATOMIC(uint64_t) next;      // │ Next free block                        ├─ [local only]
+  ATOMIC(uint32_t) tag;       // │ Local version tag                      │
+  ATOMIC(uint32_t) count;     // └ Count of references                    ┘
   ATOMIC(uint64_t) mark;      // ┌ Remote replication mark/fence          ┐
-  uuid_t identifier;          // └ Global block identifier                │
-  ATOMIC(uint32_t) control;   //   CRC32C of data if block under tracking ├─ [replicable]
+  ATOMIC(uint64_t) hint;      //   Replication hint                       │
+  uuid_t identifier;          // └ Global block identifier                ├─ [replicable]
+  ATOMIC(uint32_t) control;   //   CRC32C of data if block under tracking │
   uint32_t length;            //   Data length, can be filled by user     │
   uint8_t data[0];            //                                          ┘
 };

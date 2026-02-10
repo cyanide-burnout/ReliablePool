@@ -361,7 +361,7 @@ static struct InstantCookie* EnsureCookie(struct InstantReplicator* replicator, 
   pthread_rwlock_rdlock(&pool->lock);
 
   cookie = (struct InstantCookie*)pool->closures[1];
-  share  = pool->share;
+  share  = (struct ReliableShare*)pool->closures[0];
   card   = replicator->cards;
 
   if ((cookie != NULL) &&
@@ -1381,8 +1381,9 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
         if ((block->length <= memory->size - offsetof(struct ReliableBlock, data)) &&
             (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)))
         {
-          // TODO Fix a logical error on syncing
-          atomic_store_explicit(&block->hint, mark + peer->vector, memory_order_relaxed);
+          // Assumption: valid CRC here means the block was updated by this RETREIVE flow.
+          // If another writer updates the same block concurrently, hint normalization can be wrong.
+          atomic_fetch_add_explicit(&block->hint, peer->vector, memory_order_relaxed);
           CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
           *number = UINT32_MAX;
           continue;
