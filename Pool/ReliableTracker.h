@@ -79,6 +79,8 @@ int FlushReliableTracker(struct ReliableTracker* tracker);
 int LockReliableShare(struct ReliableShare* share);
 int UnlockReliableShare(struct ReliableShare* share);
 
+int64_t GetReliableTrackerClockVector(struct timespec* remote);
+
 #ifdef __cplusplus
 }
 #endif

@@ -21,6 +21,7 @@
 
 #define GENERIC_POLL_TIMEOUT       200
 #define COOKIE_EXPIRATION_COUNT    (60000 / GENERIC_POLL_TIMEOUT)
+#define REMOVAL_EXPIRATION_COUNT   (10000 / GENERIC_POLL_TIMEOUT)
 #define CONNECTION_ATTEMPT_COUNT   128
 #define READING_ATTEMPT_COUNT      3
 
@@ -42,6 +43,17 @@ _Static_assert((offsetof(struct InstantSharedBuffer, values)   % sizeof(uint64_t
 _Static_assert((offsetof(struct InstantSharedBufferList, data) % sizeof(uint64_t)) == 0,                  "InstantSharedBufferList.data must be 64-bit aligned");
 _Static_assert((offsetof(struct InstantReplicator, buffers)    % sizeof(uint64_t)) == 0,                  "InstantReplicator.buffers must be 64-bit aligned");
 _Static_assert((INSTANT_QUEUE_LENGTH != 0) && ((INSTANT_QUEUE_LENGTH & (INSTANT_QUEUE_LENGTH - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
+
+// Helpers
+
+static void CallEventFunction(struct InstantReplicator* replicator, int event, struct InstantPeer* peer, const char* data, int parameter)
+{
+  if (replicator->function != NULL)
+  {
+    //
+    replicator->function(event, peer, data, parameter, replicator->closure);
+  }
+}
 
 // Buffers, queues
 
@@ -310,7 +322,7 @@ static void SubmitTask(struct InstantReplicator* replicator, struct InstantTask*
   if (other = task->previous)  other->next               = task;
   else                         replicator->schedule.head = task;
 
-  replicator->schedule.count += task->type > INSTANT_TASK_TYPE_SYNCING;
+  replicator->schedule.count += task->type >= INSTANT_TASK_TYPE_READING;
   replicator->schedule.tail   = task;
 }
 
@@ -341,7 +353,7 @@ static void RemoveTask(struct InstantReplicator* replicator, struct InstantTask*
     task->previous              = NULL;
     task->next                  = replicator->tasks;
     replicator->tasks           = task;
-    replicator->schedule.count -= task->type > INSTANT_TASK_TYPE_SYNCING;
+    replicator->schedule.count -= task->type >= INSTANT_TASK_TYPE_READING;
   }
 }
 
@@ -367,16 +379,13 @@ static struct InstantCookie* EnsureCookie(struct InstantReplicator* replicator, 
   if ((cookie != NULL) &&
       (cookie->share != share))
   {
-    if (other = replicator->cookies)
-    {
-      cookie->next    = other;
-      other->previous = cookie;
-    }
+    if (other = replicator->cookies.tail)  other->next              = cookie;
+    else                                   replicator->cookies.head = cookie;
 
-    replicator->cookies = cookie;
-    cookie->expiration  = COOKIE_EXPIRATION_COUNT;
-    cookie              = NULL;
-    pool->closures[1]   = NULL;
+    replicator->cookies.tail = cookie;
+    cookie->expiration       = replicator->tick + COOKIE_EXPIRATION_COUNT;
+    cookie                   = NULL;
+    pool->closures[1]        = NULL;
   }
 
   if ((cookie == NULL) &&
@@ -448,15 +457,12 @@ static void RetireCookie(struct InstantReplicator* replicator, struct ReliablePo
 
   if (cookie = (struct InstantCookie*)pool->closures[1])
   {
-    if (other = replicator->cookies)
-    {
-      cookie->next    = other;
-      other->previous = cookie;
-    }
+    if (other = replicator->cookies.tail)  other->next              = cookie;
+    else                                   replicator->cookies.head = cookie;
 
-    replicator->cookies = cookie;
-    cookie->expiration  = COOKIE_EXPIRATION_COUNT;
-    pool->closures[1]   = NULL;
+    replicator->cookies.tail = cookie;
+    cookie->expiration       = replicator->tick + COOKIE_EXPIRATION_COUNT;
+    pool->closures[1]        = NULL;
   }
 
   pthread_rwlock_unlock(&pool->lock);
@@ -502,26 +508,108 @@ static void UpdateCookieList(struct InstantReplicator* replicator)
 static void TrackCookieList(struct InstantReplicator* replicator)
 {
   struct InstantCookie* cookie;
-  struct InstantCookie* next;
-  struct InstantCookie* previous;
 
   pthread_mutex_lock(&replicator->lock);
 
-  for (previous = NULL, cookie = replicator->cookies; cookie != NULL; cookie = next)
+  while ((cookie = replicator->cookies.head) &&
+         (replicator->tick > cookie->expiration))
   {
-    next = cookie->next;
+    replicator->cookies.head = cookie->next;
+    DestroyCookie(cookie);
+  }
 
-    if ((-- cookie->expiration) == 0)
+  if (replicator->cookies.head == NULL)
+  {
+    // Queue is empty
+    replicator->cookies.tail = NULL;
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
+// Removals
+
+static void CreateRemoval(struct InstantReplicator* replicator, struct InstantRemovalData* data)
+{
+  struct InstantRemoval* removal;
+  struct InstantRemoval* other;
+
+  if (removal = replicator->removals.stack)
+  {
+    replicator->removals.stack = removal->next;
+    removal->next              = NULL;
+  }
+
+  if ((removal != NULL) ||
+      (removal  = (struct InstantRemoval*)calloc(1, sizeof(struct InstantRemoval))))
+  {
+    memcpy(&removal->data, data, sizeof(struct InstantRemovalData));
+
+    if (other = replicator->removals.tail)  other->next               = removal;
+    else                                    replicator->removals.head = removal;
+
+    removal->expiration       = replicator->tick + REMOVAL_EXPIRATION_COUNT;
+    replicator->removals.tail = removal;
+  }
+}
+
+static void ApplyRemoval(struct InstantReplicator* replicator, struct InstantRemoval* removal)
+{
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct ReliableShare* share;
+  struct ReliablePool* pool;
+  uint32_t number;
+
+  pool   = NULL;
+  cookie = NULL;
+  number = FindReliableBlockNumber(replicator->indexer, removal->data.name, removal->data.identifier);
+
+  if ((number != UINT32_MAX) &&
+      (pool    = FindReliablePool(replicator->indexer, removal->data.name, 1)) &&
+      (cookie  = EnsureCookie(replicator, pool)))
+  {
+    share  = cookie->share;
+    memory = share->memory;
+    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+
+    if (((uintptr_t)block < ((uintptr_t)share->memory + share->size)) &&
+        (atomic_load_explicit(&block->count, memory_order_acquire) > 0))
     {
-      if (next     != NULL)  next->previous      = previous;
-      if (previous != NULL)  previous->next      = next;
-      else                   replicator->cookies = next;
-
-      DestroyCookie(cookie);
-      continue;
+      // Block is busy, it is up to application what to do
+      CallReliableMonitor(RELIABLE_MONITOR_BLOCK_REMOVAL, pool, share, block);
     }
+    else
+    {
+      // Try to remove block silently
+      FreeReliableBlock(pool, number, removal->data.identifier);
+    }
+  }
 
-    previous = cookie;
+  RetireReliablePool(pool);
+}
+
+static void TrackRemovalList(struct InstantReplicator* replicator)
+{
+  struct InstantRemoval* removal;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  while ((removal = replicator->removals.head) &&
+         (replicator->tick > removal->expiration))
+  {
+    replicator->removals.head  = removal->next;
+    removal->next              = replicator->removals.stack;
+    replicator->removals.stack = removal;
+
+    ApplyRemoval(replicator, removal);
+  }
+
+  if (replicator->removals.head == NULL)
+  {
+    // Queue is empty
+    replicator->removals.tail = NULL;
   }
 
   pthread_mutex_unlock(&replicator->lock);
@@ -713,7 +801,26 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
 
 static void HandleBlockRelease(struct InstantReplicator* replicator, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block)
 {
+  struct InstantSharedBuffer* buffer;
+  struct InstantRemovalData* removal;
+  struct InstantHeaderData* header;
+  struct ReliableMemory* memory;
 
+  if (buffer = AllocateSharedBuffer(&replicator->buffers, 1))
+  {
+    memory         = share->memory;
+    header         = (struct InstantHeaderData*)buffer->data;
+    header->type   = INSTANT_TYPE_REMOVE;
+    header->task   = UINT32_MAX;
+    buffer->length = sizeof(struct InstantHeaderData) + sizeof(struct InstantRemovalData);
+    removal        = (struct InstantRemovalData*)(buffer->data + sizeof(struct InstantHeaderData));
+
+    uuid_copy(header->identifier,  replicator->identifier);
+    uuid_copy(removal->identifier, block->identifier);
+    memcpy(removal->name, memory->name, RELIABLE_MEMORY_NAME_LENGTH);
+
+    AppendSendingQueue(&replicator->queue, buffer);
+  }
 }
 
 static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
@@ -774,6 +881,71 @@ static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
 }
 
 // Message and work handling
+
+static void CreateClockingTask(struct InstantReplicator* replicator, struct InstantPeer* peer)
+{
+  struct InstantTask* task;
+
+  for (task = replicator->schedule.head; task != NULL; task = task->next)
+  {
+    if (task->type == INSTANT_TASK_TYPE_CLOCKING)
+    {
+      // Change the clocking scope to broadcast
+      task->peer = NULL;
+      return;
+    }
+  }
+
+  if (task = AllocateTask(replicator))
+  {
+    task->type = INSTANT_TASK_TYPE_CLOCKING;
+    task->peer = peer;
+
+    SubmitTask(replicator, task);
+  }
+}
+
+static int ExecuteClockingTask(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantHeaderData* header;
+  struct InstantPeer* peer;
+  struct timespec* time;
+
+  if (!(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+  {
+    task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
+    return 0;
+  }
+
+  header         = (struct InstantHeaderData*)buffer->data;
+  header->type   = INSTANT_TYPE_CLOCK;
+  header->task   = UINT32_MAX;
+  buffer->length = sizeof(struct InstantHeaderData) + sizeof(struct timespec);
+  time           = (struct timespec*)(buffer->data + sizeof(struct InstantHeaderData));
+
+  uuid_copy(header->identifier, replicator->identifier);
+  clock_gettime(CLOCK_REALTIME, time);
+
+  if (task->peer != NULL)
+  {
+    SubmitSharedBuffer(replicator, task->peer, buffer);
+    ReleaseSharedBuffer(&replicator->buffers, buffer);
+    return -1;
+  }
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    // SubmitSharedBuffer() increments buffer->count
+    SubmitSharedBuffer(replicator, peer, buffer);
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+  ReleaseSharedBuffer(&replicator->buffers, buffer);
+  return -1;
+}
 
 static int HandleSyncingIterator(void* key, size_t size, void* data, void* argument1, void* argument2)
 {
@@ -1287,6 +1459,11 @@ static void CreateTransferTask(struct InstantReplicator* replicator, struct Inst
   }
 }
 
+static void ApplyClock(struct InstantReplicator* replicator, struct InstantPeer* peer, struct timespec* time)
+{
+  peer->vector = GetReliableTrackerClockVector(time);
+}
+
 static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t* data, uint32_t length, uint32_t number, int status, int flags)
 {
   struct InstantHeaderData* header;
@@ -1316,14 +1493,22 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
 
     switch (header->type)
     {
+      case INSTANT_TYPE_USER:
+        CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_USER_MESSAGE, peer, data + sizeof(struct InstantHeaderData), length - sizeof(struct InstantHeaderData));
+        break;
+
       case INSTANT_TYPE_CLOCK:
+        if (length == (sizeof(struct InstantHeaderData) + sizeof(struct timespec)))
+          ApplyClock(replicator, peer, (struct timespec*)(data + sizeof(struct InstantHeaderData)));
         break;
 
       case INSTANT_TYPE_REMOVE:
+        if (length == (sizeof(struct InstantHeaderData) + sizeof(struct InstantRemovalData)))
+          CreateRemoval(replicator, (struct InstantRemovalData*)(data + sizeof(struct InstantHeaderData)));
         break;
 
       case INSTANT_TYPE_COMPLETE:
-        for (task = replicator->schedule.head; (task != NULL) && (task->number != number); task = task->next);
+        for (task = replicator->schedule.head; (task != NULL) && (task->number != header->task); task = task->next);
         RemoveTask(replicator, task);
         break;
 
@@ -1331,10 +1516,8 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
       case INSTANT_TYPE_RETREIVE:
         if ((flags & IBV_WC_WITH_IMM) &&
             (length >= (sizeof(struct InstantHeaderData) + sizeof(struct InstantCookieData))))
-        {
-          //
           CreateTransferTask(replicator, peer, header, length, number);
-        }
+        break;
     }
   }
 }
@@ -1514,6 +1697,7 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
   static ExecuteInstantTaskFunction functions[] =
   {
     ExecuteSyncingTask,
+    ExecuteClockingTask,
     ExecuteReadingTask,
     ExecuteWritingTask
   };
@@ -1887,15 +2071,16 @@ static int HandleEstablished(struct InstantReplicator* replicator, struct rdma_c
 {
   struct InstantPeer* peer;
 
-  printf("HandleEstablished id=%p\n", descriptor);
-
   peer = (struct InstantPeer*)descriptor->context;
 
   peer->state      = INSTANT_PEER_STATE_CONNECTED;
   peer->fails      = 0;
   peer->points[peer->round].rank = 0;
 
+  CreateClockingTask(replicator, peer);
   CreateSyncingTask(replicator, peer);
+
+  CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_CONNECTED, peer, NULL, 0);
 
   return 0;
 }
@@ -1909,7 +2094,7 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
   {
     if (peer->state == INSTANT_PEER_STATE_CONNECTED)
     {
-      printf("HandleDisconnected id=%p peer=%p reason=%d\n", descriptor, peer, reason);
+      CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_DISCONNECTED, peer, NULL, reason);
 
       ClearTaskList(replicator, peer);
       ClearRequestQueue(replicator, &peer->queue);
@@ -2131,8 +2316,11 @@ static void* DoWork(void* closure)
           break;
 
         case RING_TAG_TIMEOUT:
+          replicator->tick ++;
           TrackPeerList(replicator);
           TrackCookieList(replicator);
+          TrackRemovalList(replicator);
+          CreateClockingTask(replicator, NULL);
           break;
 
         case RING_TAG_READY_STATE:
@@ -2167,7 +2355,7 @@ static void* DoWork(void* closure)
   return NULL;
 }
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, struct ReliableMonitor* next)
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, HandleInstantEventFunction function, void* closure, struct ReliableMonitor* next)
 {
   struct InstantReplicator* replicator;
   struct rdma_addrinfo* information;
@@ -2189,6 +2377,8 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     replicator->super.next     = next;
     replicator->super.closure  = replicator;
     replicator->super.function = HandleMonitorEvent;
+    replicator->function       = function;
+    replicator->closure        = closure;
     replicator->secret         = strdup(secret);
     replicator->name           = strdup(name);
 
@@ -2246,6 +2436,7 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
   struct InstantCard* card;
   struct InstantTask* task;
   struct InstantCookie* cookie;
+  struct InstantRemoval* removal;
   struct InstantRequestItem* item;
 
   if (replicator != NULL)
@@ -2276,9 +2467,21 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
       free(task);
     }
 
-    while (cookie = replicator->cookies)
+    while (removal = replicator->removals.head)
     {
-      replicator->cookies = cookie->next;
+      replicator->removals.head = removal->next;
+      free(removal);
+    }
+
+    while (removal = replicator->removals.stack)
+    {
+      replicator->removals.stack = removal->next;
+      free(removal);
+    }
+
+    while (cookie = replicator->cookies.head)
+    {
+      replicator->cookies.head = cookie->next;
       DestroyCookie(cookie);
     }
 
@@ -2361,4 +2564,35 @@ int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t
 
   pthread_mutex_unlock(&replicator->lock);
   return 0;
+}
+
+int TransmitInstantReplicatorUesrMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantHeaderData* header;
+
+  if ((replicator == NULL) ||
+      (data       == NULL) &&
+      (length != 0)        ||
+      (length >= (INSTANT_BUFFER_LENGTH - sizeof(struct InstantHeaderData))))
+  {
+    //
+    return -EINVAL;
+  }
+
+  if (buffer = AllocateSharedBuffer(&replicator->buffers, wait))
+  {
+    header         = (struct InstantHeaderData*)buffer->data;
+    header->type   = INSTANT_TYPE_USER;
+    header->task   = UINT32_MAX;
+    buffer->length = sizeof(struct InstantHeaderData) + length;
+
+    uuid_copy(header->identifier,  replicator->identifier);
+    memcpy(buffer->data + sizeof(struct InstantHeaderData), data, length);
+
+    AppendSendingQueue(&replicator->queue, buffer);
+    return 0;
+  }
+
+  return -EBUSY;
 }

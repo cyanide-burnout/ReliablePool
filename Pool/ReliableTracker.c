@@ -664,3 +664,14 @@ int UnlockReliableShare(struct ReliableShare* share)
 
   return result;
 }
+
+int64_t GetReliableTrackerClockVector(struct timespec* remote)
+{
+  struct timespec time;
+
+  clock_gettime(CLOCK_REALTIME, &time);
+
+  return
+    (int64_t)(((uint64_t)remote->tv_sec * 1000000000ULL + (uint64_t)remote->tv_nsec) & ~0xffffffULL) -
+    (int64_t)(((uint64_t)time.tv_sec    * 1000000000ULL + (uint64_t)time.tv_nsec)    & ~0xffffffULL);
+}

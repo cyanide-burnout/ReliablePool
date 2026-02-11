@@ -60,7 +60,39 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
       uuid_unparse_lower(block->identifier, buffer);
       printf("Block %u (%s) arrived: %s\n", block->number, buffer, block->data);
       break;
+
+    case RELIABLE_MONITOR_BLOCK_REMOVAL:
+      uuid_unparse_lower(block->identifier, buffer);
+      printf("Block %u (%s) removed\n", block->number, buffer);
+      break;
+
+    case RELIABLE_MONITOR_BLOCK_DAMAGE:
+      uuid_unparse_lower(block->identifier, buffer);
+      printf("Block %u (%s) damaged\n", block->number, buffer);
+      break;
   }
+}
+
+static void HandleReplicatorEvent(int event, struct InstantPeer* peer, const char* data, int parameter, void* closure)
+{
+  char buffer[64];
+
+  switch (event)
+  {
+    case INSTANT_REPLICATOR_EVENT_CONNECTED:
+      uuid_unparse_lower(peer->identifier, buffer);
+      printf("Peer %s conected\n", buffer);
+      break;
+
+    case INSTANT_REPLICATOR_EVENT_DISCONNECTED:
+      uuid_unparse_lower(peer->identifier, buffer);
+      printf("Peer %s disconected\n", buffer);
+      break;
+
+    case INSTANT_REPLICATOR_EVENT_USER_MESSAGE:
+      break;
+  }
+
 }
 
 static void GeenetateActivity(struct ReliablePool* pool)
@@ -131,7 +163,7 @@ int main(int count, char** arguments)
   monitor.function = HandleMonitorEvent;
 
   handle     = memfd_create("Test", MFD_CLOEXEC);
-  replicator = CreateInstantReplicator(0, NULL, "Test", "Secret", &monitor);
+  replicator = CreateInstantReplicator(0, NULL, "Test", "Secret", HandleReplicatorEvent, NULL, &monitor);
   indexer    = CreateReliableIndexer(&replicator->super);
   tracker    = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
   pool       = CreateReliablePool(handle, "Test", 50, 0, &tracker->super, NULL, NULL);

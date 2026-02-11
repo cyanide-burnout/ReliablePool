@@ -26,11 +26,12 @@ extern "C"
 #define INSTANT_MAGIC                0xe29a
 #define INSTANT_SERVICE_NAME_LENGTH  16
 
-#define INSTANT_TYPE_CLOCK      0
-#define INSTANT_TYPE_NOTIFY     1
-#define INSTANT_TYPE_RETREIVE   2
-#define INSTANT_TYPE_COMPLETE   3
-#define INSTANT_TYPE_REMOVE     4
+#define INSTANT_TYPE_CLOCK      1
+#define INSTANT_TYPE_NOTIFY     2
+#define INSTANT_TYPE_RETREIVE   3
+#define INSTANT_TYPE_COMPLETE   4
+#define INSTANT_TYPE_REMOVE     5
+#define INSTANT_TYPE_USER       6
 
 struct InstantHandshakeData
 {
@@ -39,6 +40,12 @@ struct InstantHandshakeData
   uuid_t identifier;                       // 20
   char name[INSTANT_SERVICE_NAME_LENGTH];  // 36
   uint8_t digest[SHA_DIGEST_LENGTH];       // 56
+} __attribute__((packed));
+
+struct InstantRemovalData
+{
+  char name[RELIABLE_MEMORY_NAME_LENGTH];  // Name of pool
+  uuid_t identifier;                       // Block UUID
 } __attribute__((packed));
 
 struct InstantCookieData
@@ -71,6 +78,10 @@ struct InstantHeaderData
 #define RELIABLE_MONITOR_BLOCK_ARRIVAL  14
 #define RELIABLE_MONITOR_BLOCK_REMOVAL  15
 
+#define INSTANT_REPLICATOR_EVENT_CONNECTED     0
+#define INSTANT_REPLICATOR_EVENT_DISCONNECTED  1
+#define INSTANT_REPLICATOR_EVENT_USER_MESSAGE  2
+
 #define INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE  (1U << 0)
 
 #define INSTANT_REPLICATOR_STATE_ACTIVE   (1U << 0)
@@ -82,9 +93,10 @@ struct InstantHeaderData
 #define INSTANT_PEER_STATE_CONNECTING    1
 #define INSTANT_PEER_STATE_CONNECTED     2
 
-#define INSTANT_TASK_TYPE_SYNCING  0
-#define INSTANT_TASK_TYPE_READING  INSTANT_TYPE_NOTIFY
-#define INSTANT_TASK_TYPE_WRITING  INSTANT_TYPE_RETREIVE
+#define INSTANT_TASK_TYPE_SYNCING   0
+#define INSTANT_TASK_TYPE_CLOCKING  INSTANT_TYPE_CLOCK
+#define INSTANT_TASK_TYPE_READING   INSTANT_TYPE_NOTIFY
+#define INSTANT_TASK_TYPE_WRITING   INSTANT_TYPE_RETREIVE
 
 #define INSTANT_TASK_STATE_IDLE             0
 #define INSTANT_TASK_STATE_PROGRESS         1
@@ -146,15 +158,35 @@ struct InstantRequestQueue
 
 struct InstantCookie
 {
-  struct InstantCookie* previous;
   struct InstantCookie* next;
-
   uint32_t expiration;                         // Expication time in ticks (cleanup collection)
+
   struct ReliableShare* share;                 // Associated share
   struct ibv_mr* regions[INSTANT_CARD_COUNT];  // List of regions (in order of InstantCard::number)
 
   struct InstantCookieData data;               // Cached InstantCookieData
   uint32_t reserved[INSTANT_CARD_COUNT];       //
+};
+
+struct InstantRemoval
+{
+  struct InstantRemoval* next;
+  uint32_t expiration;
+
+  struct InstantRemovalData data;
+};
+
+struct InstantRemovalQueue
+{
+  struct InstantRemoval* stack;
+  struct InstantRemoval* head;
+  struct InstantRemoval* tail;
+};
+
+struct InstantCookieQueue
+{
+  struct InstantCookie* head;
+  struct InstantCookie* tail;
 };
 
 struct InstantCard
@@ -244,26 +276,30 @@ struct InstantTaskList
   struct InstantTask* tail;  //
 };
 
+typedef void (*HandleInstantEventFunction)(int event, struct InstantPeer* peer, const char* data, int parameter, void* closure);
+
 struct InstantReplicator
 {
   struct ReliableMonitor super;
   struct ReliableIndexer* indexer;
+  HandleInstantEventFunction function;
 
   char* name;
   char* secret;
+  void* closure;
   uuid_t identifier;
 
   struct io_uring ring;
   struct rdma_cm_id* descriptor;
   struct rdma_event_channel* channel;
 
+  uint32_t tick;
   pthread_t thread;
   pthread_mutex_t lock;
   ATOMIC(uint32_t) state;
   struct InstantCard* cards;
   struct InstantPeer* peers;
   struct InstantTask* tasks;
-  struct InstantCookie* cookies;
   struct InstantRequestItem* items;
 
   struct rdma_conn_param parameter;
@@ -271,15 +307,18 @@ struct InstantReplicator
 
   struct InstantTaskList schedule;
   struct InstantSendingQueue queue;
+  struct InstantCookieQueue cookies;
+  struct InstantRemovalQueue removals;
   struct InstantSharedBufferList buffers;
 };
 
 typedef int (*ExecuteInstantTaskFunction)(struct InstantReplicator* replicator, struct InstantTask* task);
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, struct ReliableMonitor* next);
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, HandleInstantEventFunction function, void* closure, struct ReliableMonitor* next);
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);
 
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length);
+int TransmitInstantReplicatorUesrMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait);
 
 #ifdef __cplusplus
 }
