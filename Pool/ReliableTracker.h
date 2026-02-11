@@ -15,7 +15,7 @@ extern "C"
 #endif
 
 #define RELIABLE_MONITOR_SHARE_CHANGE  10  // share - actual share waving modified page, called in monitoring thread
-#define RELIABLE_MONITOR_BLOCK_CHANGE  11  // share - unprotecred shadow copy of operational share, called by FlushReliableTracker()
+#define RELIABLE_MONITOR_BLOCK_CHANGE  11  // share - unprotected shadow copy of operational share, called by FlushReliableTracker()
 #define RELIABLE_MONITOR_FLUSH_COMMIT  12
 
 #define RELIABLE_TRACKER_STATE_ACTIVE   (1 << 0)
@@ -23,9 +23,9 @@ extern "C"
 #define RELIABLE_TRACKER_STATE_KICK     (1 << 2)
 
 #define RELIABLE_TRACKER_FLAG_ID_HOST     (1 << 0)   // ┌
-#define RELIABLE_TRACKER_FLAG_ID_PROCESS  (1 << 1)   // │ Host ID generation principals
+#define RELIABLE_TRACKER_FLAG_ID_PROCESS  (1 << 1)   // │ Host ID generation principles
 #define RELIABLE_TRACKER_FLAG_ID_UNIQUE   (1 << 2)   // └
-#define RELIABLE_TRACKER_FLAG_FORCE_MARK  (1 << 16)  // Mark blocks on every flash to reduce CRC checks, иге makes negative influence on remote replication
+#define RELIABLE_TRACKER_FLAG_FORCE_MARK  (1 << 16)  // Mark blocks on every flush to reduce CRC checks, it makes negative influence on remote replication
 
 #define RELIABLE_TRACKABLE_STATE_DURTY  (1 << 0)
 #define RELIABLE_TRACKABLE_STATE_LOCK   (1 << 1)

@@ -28,7 +28,7 @@ extern "C"
 
 #define INSTANT_TYPE_CLOCK      1
 #define INSTANT_TYPE_NOTIFY     2
-#define INSTANT_TYPE_RETREIVE   3
+#define INSTANT_TYPE_RETRIEVE   3
 #define INSTANT_TYPE_COMPLETE   4
 #define INSTANT_TYPE_REMOVE     5
 #define INSTANT_TYPE_USER       6
@@ -96,7 +96,7 @@ struct InstantHeaderData
 #define INSTANT_TASK_TYPE_SYNCING   0
 #define INSTANT_TASK_TYPE_CLOCKING  INSTANT_TYPE_CLOCK
 #define INSTANT_TASK_TYPE_READING   INSTANT_TYPE_NOTIFY
-#define INSTANT_TASK_TYPE_WRITING   INSTANT_TYPE_RETREIVE
+#define INSTANT_TASK_TYPE_WRITING   INSTANT_TYPE_RETRIEVE
 
 #define INSTANT_TASK_STATE_IDLE             0
 #define INSTANT_TASK_STATE_PROGRESS         1
@@ -159,7 +159,7 @@ struct InstantRequestQueue
 struct InstantCookie
 {
   struct InstantCookie* next;
-  uint32_t expiration;                         // Expication time in ticks (cleanup collection)
+  uint32_t expiration;                         // Expiration time in ticks (cleanup collection)
 
   struct ReliableShare* share;                 // Associated share
   struct ibv_mr* regions[INSTANT_CARD_COUNT];  // List of regions (in order of InstantCard::number)
@@ -198,7 +198,7 @@ struct InstantCard
   struct ibv_context* context;        // Verbs context of device
   struct ibv_srq* queue1;             // Shared receive queue
   struct ibv_cq* queue2;              // Completion queue for both send() and recv()
-  struct ibv_pd* domain;              // Protection domaini
+  struct ibv_pd* domain;              // Protection domain
   struct ibv_mr* region1;             // Receiving buffers
   struct ibv_mr* region2;             // Sending buffers
 

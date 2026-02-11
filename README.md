@@ -8,22 +8,158 @@ ReliablePool started as an internal building block to support high-reliability, 
 
 ## What it is
 
-ReliablePool is a memory/pool subsystem designed around long-lived, stable memory mappings (“shares”) and predictable ownership semantics. It is intended for systems that need:
+ReliablePool is a memory/pool subsystem designed around long-lived, stable memory mappings ("shares") and predictable ownership semantics. It is intended for systems that need:
 
 - stable addresses over time (even as the pool grows),
 - explicit lifetime management and controlled ownership,
 - integration points for replication/monitoring and idempotent processing,
-- capability to recover data on restart (through using `memfd` or an opened file as backends and systemd’s **FDSTORE** feature),
+- capability to recover data on restart (through using `memfd` or an opened file as backends and systemd's **FDSTORE** feature),
 - capability for inter-process sharing.
 
-## Related components
+## Related Components
 
 ReliablePool is commonly used together with:
 
-- **ReliableMonitor** — a pluggable monitor/replication chain (supports multiple providers):
-  - **ReliableIndexer** — indexes blocks and pools for cross-host replication providers.
-  - **ReliableTracker** — tracks modified pages via `userfaultfd` write-protection (WP) and maintains a dirty bitmap; flushes in an idempotent state; can notify monitors about changes:
-    - **ReliableWaiter** — an external adapter for the **FastRing** event loop, kept outside the tracker to avoid coupling ReliableTracker to a specific runtime.
+- **Reliable components**: `ReliableMonitor`, `ReliableIndexer`, `ReliableTracker`, `ReliableWaiter`
+- **Instant components**: `InstantReplicator`, `InstantWaiter`, `InstantDiscovery`
 
+## Reliable Components
 
----
+### ReliableMonitor
+
+Role:
+
+- Linked monitor chain (`next`) attached to `ReliablePool`.
+- Entry point for lifecycle and block events.
+
+Callback:
+
+- `ReliableMonitorFunction(event, pool, share, block, closure)`
+
+Core events:
+
+- `RELIABLE_MONITOR_POOL_CREATE` / `RELIABLE_MONITOR_POOL_RELEASE`
+- `RELIABLE_MONITOR_SHARE_CREATE` / `RELIABLE_MONITOR_SHARE_DESTROY`
+- `RELIABLE_MONITOR_BLOCK_ALLOCATE` / `RELIABLE_MONITOR_BLOCK_ATTACH`
+- `RELIABLE_MONITOR_BLOCK_RELEASE` / `RELIABLE_MONITOR_BLOCK_FREE`
+- `RELIABLE_MONITOR_BLOCK_RESERVE` / `RELIABLE_MONITOR_BLOCK_RECOVER`
+
+`RELIABLE_MONITOR_POOL_RELEASE` is delivered as the last event for a pool monitor chain.
+
+### ReliableIndexer
+
+Role:
+
+- Monitor implementation that maintains a pool index: `name -> ReliablePool*`.
+- Monitor implementation that maintains a block index: `(name, block_uuid) -> block_number`.
+
+Main API:
+
+- `CreateReliableIndexer(next)` / `ReleaseReliableIndexer(indexer)`
+- `GetReliableIndexer(pool)`
+- `FindReliablePool(indexer, name, acquire)`
+- `FindReliableBlockNumber(indexer, name, identifier)`
+- `CollectReliableBlockList(indexer, pool, time, flags)`
+- `RemoveUnusedReliableBlockList(indexer, pool, time)`
+
+Used by replication logic to resolve remote identifiers into local block numbers and to collect candidate block sets.
+
+### ReliableTracker
+
+Role:
+
+- Monitor + background worker based on `userfaultfd` write-protection.
+- Tracks dirty pages, calculates block CRC32C, updates replication marks/hints.
+- Emits replication-oriented monitor events.
+
+Main API:
+
+- `CreateReliableTracker(flags, next)` / `ReleaseReliableTracker(tracker)`
+- `FlushReliableTracker(tracker)` (must be called in idempotent/safe state)
+- `LockReliableShare(share)` / `UnlockReliableShare(share)`
+- `GetReliableTrackerClockVector(remote_timespec)`
+
+Tracker-specific events:
+
+- `RELIABLE_MONITOR_SHARE_CHANGE` (page-level dirty signal from tracking thread)
+- `RELIABLE_MONITOR_BLOCK_CHANGE` (block changed after flush analysis)
+- `RELIABLE_MONITOR_FLUSH_COMMIT` (flush commit barrier for downstream monitors)
+
+### ReliableWaiter
+
+Role:
+
+- `FastRing` adapter for `ReliableTracker`.
+- Waits on tracker state via io_uring futex and calls `FlushReliableTracker(...)` on wake.
+
+Main API:
+
+- `SubmitReliableWaiter(ring, tracker)`
+- `CancelReliableWaiter(descriptor)`
+
+## Instant Components
+
+### InstantReplicator
+
+Role:
+
+- RDMA replication monitor in the `ReliableMonitor` chain.
+- Synchronizes pool changes between peers.
+
+Main API:
+
+- `CreateInstantReplicator(port, identifier, name, secret, function, closure, next)`
+- `ReleaseInstantReplicator(replicator)`
+- `RegisterRemoteInstantReplicator(replicator, identifier, address, length)`
+- `TransmitInstantReplicatorUserMessage(replicator, data, length, wait)`
+
+Protocol format:
+
+- Header: `InstantHeaderData`
+- Payload (type-specific):
+  - `INSTANT_TYPE_CLOCK`: `struct timespec`
+  - `INSTANT_TYPE_NOTIFY` / `INSTANT_TYPE_RETRIEVE`: transfer metadata and registered keys
+  - `INSTANT_TYPE_COMPLETE`: task completion marker
+  - `INSTANT_TYPE_REMOVE`: `InstantRemovalData`
+  - `INSTANT_TYPE_USER`: arbitrary user payload
+
+`INSTANT_TYPE_REMOVE` message format:
+
+- `InstantHeaderData + InstantRemovalData`
+
+Callback events (`HandleInstantEventFunction`):
+
+- `INSTANT_REPLICATOR_EVENT_CONNECTED`
+- `INSTANT_REPLICATOR_EVENT_DISCONNECTED`
+- `INSTANT_REPLICATOR_EVENT_USER_MESSAGE`
+
+### InstantWaiter
+
+Role:
+
+- `FastRing` adapter for waiting on `InstantReplicator` state transitions through io_uring futex operations.
+
+Main API:
+
+- `SubmitInstantWaiter(ring, replicator)` - creates and submits a waiter descriptor.
+- `CancelInstantWaiter(descriptor)` - cancels the waiter and releases callback linkage.
+
+Use when the application already runs a `FastRing` loop and needs non-blocking integration with replicator wakeups.
+
+### InstantDiscovery
+
+Role:
+
+- Avahi/mDNS helper for automatic peer discovery and local service publication for `InstantReplicator`.
+
+Main API:
+
+- `CreateInstantDiscovery(poll, replicator)`
+- `ReleaseInstantDiscovery(discovery)`
+
+Behavior:
+
+- Publishes local service as `_replicator._tcp` with TXT key `instance=<uuid>`.
+- Browses matching services and resolves endpoints.
+- Calls `RegisterRemoteInstantReplicator(...)` for discovered remote instances.
+- Restarts Avahi client on transient daemon/DBus failures using delayed retry.

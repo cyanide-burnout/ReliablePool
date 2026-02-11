@@ -53,7 +53,7 @@ static inline uint64_t MakeEpoch(struct ReliableTracker* tracker)
   return result;
 }
 
-static inline void WakeListner(struct ReliableTracker* tracker)
+static inline void WakeListener(struct ReliableTracker* tracker)
 {
   if (~atomic_fetch_or_explicit(&tracker->state, RELIABLE_TRACKER_STATE_KICK, memory_order_release) & RELIABLE_TRACKER_STATE_KICK)
   {
@@ -241,7 +241,7 @@ static int HandleFaultyPage(struct ReliableTracker* tracker, uintptr_t address)
       atomic_fetch_or_explicit(trackable->map + (page >> 6), 1ULL << (page & 63), memory_order_relaxed);
       atomic_fetch_or_explicit(&trackable->state, RELIABLE_TRACKABLE_STATE_DURTY, memory_order_relaxed);
 
-      WakeListner(tracker);
+      WakeListener(tracker);
       CallReliableMonitor(RELIABLE_MONITOR_SHARE_CHANGE, trackable->pool, trackable->share, NULL);
       result = ~atomic_load_explicit(&trackable->state, memory_order_relaxed) & RELIABLE_TRACKABLE_STATE_LOCK;
       break;
@@ -253,7 +253,7 @@ static int HandleFaultyPage(struct ReliableTracker* tracker, uintptr_t address)
   return result;
 }
 
-static void HandleDurtyBlock(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, struct ReliableBlock* block, uint64_t epoch)
+static void HandleDirtyBlock(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, struct ReliableBlock* block, uint64_t epoch)
 {
   struct ReliableShare* share;
   struct ReliablePool* pool;
@@ -285,7 +285,7 @@ static void HandleDurtyBlock(struct ReliableTracker* tracker, struct ReliableTra
   }
 }
 
-static void HandleDurtyPage(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, uintptr_t page, uint64_t epoch)
+static void HandleDirtyPage(struct ReliableTracker* tracker, struct ReliableTrackable* trackable, uintptr_t page, uint64_t epoch)
 {
   struct ReliableMemory* memory;
   struct ReliableBlock* block;
@@ -315,7 +315,7 @@ static void HandleDurtyPage(struct ReliableTracker* tracker, struct ReliableTrac
            (number <  limit))
     {
       block = (struct ReliableBlock*)(memory->data + memory->size * (size_t)(number ++));
-      HandleDurtyBlock(tracker, trackable, block, epoch);
+      HandleDirtyBlock(tracker, trackable, block, epoch);
     }
   }
 }
@@ -520,7 +520,7 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
               mask &= mask - 1;
               page += index << 6;
 
-              HandleDurtyPage(tracker, trackable, page, epoch);
+              HandleDirtyPage(tracker, trackable, page, epoch);
             }
           }
         }
@@ -536,7 +536,7 @@ int FlushReliableTracker(struct ReliableTracker* tracker)
 
     if (pool != NULL)
     {
-      // Two shots in one: [1] at least one trackable has been changed, [2] the pool is being reused reused to make CallReliableMonitor()
+      // Two shots in one: [1] at least one trackable has been changed, [2] the pool is being reused to make CallReliableMonitor()
       CallReliableMonitor(RELIABLE_MONITOR_FLUSH_COMMIT, pool, NULL, NULL);
     }
 

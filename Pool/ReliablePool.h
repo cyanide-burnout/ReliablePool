@@ -72,7 +72,7 @@ struct ReliableBlock
   uint8_t data[0];            //                                          ┘
 };
 
-struct ReliableMemory  // Sturcture behind the mmap
+struct ReliableMemory  // Structure behind the mmap
 {
   uint32_t magic;                          // RELIABLE_MEMORY_MAGIC
   uint32_t size;                           // Block size including sizeof(struct ReliableBlock)

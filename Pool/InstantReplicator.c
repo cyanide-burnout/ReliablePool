@@ -1051,7 +1051,7 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
   return 0;
 }
 
-static int TransmitRetreiveRequest(struct InstantReplicator* replicator, struct InstantTask* task)
+static int TransmitRetrieveRequest(struct InstantReplicator* replicator, struct InstantTask* task)
 {
   struct InstantSharedBuffer* buffer;
   struct InstantHeaderData* header;
@@ -1071,7 +1071,7 @@ static int TransmitRetreiveRequest(struct InstantReplicator* replicator, struct 
   }
 
   header         = (struct InstantHeaderData*)buffer->data;
-  header->type   = INSTANT_TYPE_RETREIVE;
+  header->type   = INSTANT_TYPE_RETRIEVE;
   header->task   = task->number;
   buffer->length = sizeof(struct InstantHeaderData) + cookie->data.length;
 
@@ -1270,7 +1270,7 @@ static int PrepareReadingBlockList(struct InstantReplicator* replicator, struct 
     return -1;
   }
 
-  return TransmitRetreiveRequest(replicator, task);
+  return TransmitRetrieveRequest(replicator, task);
 }
 
 static int ExecuteReadingTask(struct InstantReplicator* replicator, struct InstantTask* task)
@@ -1285,7 +1285,7 @@ static int ExecuteReadingTask(struct InstantReplicator* replicator, struct Insta
       return PrepareReadingBlockList(replicator, task);
 
     case INSTANT_TASK_STATE_WAIT_BUFFER:
-      return TransmitRetreiveRequest(replicator, task);
+      return TransmitRetrieveRequest(replicator, task);
 
     case INSTANT_TASK_STATE_WAIT_DATA:
     case INSTANT_TASK_STATE_WAIT_COMPLETION:
@@ -1513,7 +1513,7 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
         break;
 
       case INSTANT_TYPE_NOTIFY:
-      case INSTANT_TYPE_RETREIVE:
+      case INSTANT_TYPE_RETRIEVE:
         if ((flags & IBV_WC_WITH_IMM) &&
             (length >= (sizeof(struct InstantHeaderData) + sizeof(struct InstantCookieData))))
           CreateTransferTask(replicator, peer, header, length, number);
@@ -1564,7 +1564,7 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
         if ((block->length <= memory->size - offsetof(struct ReliableBlock, data)) &&
             (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)))
         {
-          // Assumption: valid CRC here means the block was updated by this RETREIVE flow.
+          // Assumption: valid CRC here means the block was updated by this RETRIEVE flow.
           // If another writer updates the same block concurrently, hint normalization can be wrong.
           atomic_fetch_add_explicit(&block->hint, peer->vector, memory_order_relaxed);
           CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
