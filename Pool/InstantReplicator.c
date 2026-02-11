@@ -1732,6 +1732,7 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
       (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
   {
     atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
+    CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_LOCK_PENDING, NULL, NULL, 0);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
     WaitForReadyState(replicator);

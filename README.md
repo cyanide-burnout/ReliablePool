@@ -31,6 +31,7 @@ Role:
 
 - Linked monitor chain (`next`) attached to `ReliablePool`.
 - Entry point for lifecycle and block events.
+- A single monitor chain can be shared across multiple pools when this is intentional and lifetime/synchronization are controlled by the application.
 
 Callback:
 
@@ -81,7 +82,7 @@ Main API:
 
 Tracker-specific events:
 
-- `RELIABLE_MONITOR_SHARE_CHANGE` (page-level dirty signal from tracking thread)
+- `RELIABLE_MONITOR_SHARE_CHANGE` (page-level dirty signal from tracking thread; also serves as fallback wake signal when waiter/futex activation path is not used)
 - `RELIABLE_MONITOR_BLOCK_CHANGE` (block changed after flush analysis)
 - `RELIABLE_MONITOR_FLUSH_COMMIT` (flush commit barrier for downstream monitors)
 
@@ -129,9 +130,16 @@ Protocol format:
 
 Callback events (`HandleInstantEventFunction`):
 
+- `INSTANT_REPLICATOR_EVENT_LOCK_PENDING` (`peer == NULL`, `data == NULL`, `parameter == 0`) - emitted when tasks require lock/ready barrier and external wakeup path is needed.
 - `INSTANT_REPLICATOR_EVENT_CONNECTED`
 - `INSTANT_REPLICATOR_EVENT_DISCONNECTED`
 - `INSTANT_REPLICATOR_EVENT_USER_MESSAGE`
+
+Additional `ReliableMonitor` events emitted by `InstantReplicator`:
+
+- `RELIABLE_MONITOR_BLOCK_DAMAGE` - emitted after transfer retries are exhausted and block validation still fails.
+- `RELIABLE_MONITOR_BLOCK_ARRIVAL` - emitted when transferred block data is validated and accepted.
+- `RELIABLE_MONITOR_BLOCK_REMOVAL` - emitted when deferred remote removal reaches a busy local block and requires application-level handling.
 
 ### InstantWaiter
 
