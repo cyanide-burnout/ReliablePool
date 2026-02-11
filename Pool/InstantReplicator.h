@@ -244,6 +244,7 @@ struct InstantTransferTaskData  // INSTANT_TASK_TYPE_READING, INSTANT_TASK_TYPE_
 {
   uint32_t key;
   uint32_t task;
+  uint32_t code;
   uint32_t count;
   uint32_t attempt;
   struct InstantSharedBuffer* buffer;

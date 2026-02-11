@@ -1370,7 +1370,8 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
     return -1;
   }
 
-  task->state = INSTANT_TASK_STATE_WAIT_COMPLETION;
+  task->state         = INSTANT_TASK_STATE_WAIT_COMPLETION;
+  task->transfer.code = IBV_WC_COMP_SWAP;
   return 0;
 }
 
@@ -1670,6 +1671,9 @@ static void HandleCompletedExchange(struct InstantReplicator* replicator, struct
     }
 
     RetireReliablePool(pool);
+
+    task->state         = INSTANT_TASK_STATE_WAIT_COMPLETION;
+    task->transfer.code = IBV_WC_RDMA_WRITE;
   }
 }
 
@@ -1786,7 +1790,7 @@ static int SubmitReceivingBuffer(struct InstantCard* card, uint64_t number)
   element.addr    = (uintptr_t)card->buffers[number];
   element.length  = INSTANT_BUFFER_LENGTH;
   element.lkey    = region->lkey;
-  request.wr_id   = number;
+  request.wr_id   = (uintptr_t)card->buffers[number];
   request.next    = NULL;
   request.sg_list = &element;
   request.num_sge = 1;
@@ -1794,7 +1798,17 @@ static int SubmitReceivingBuffer(struct InstantCard* card, uint64_t number)
   return ibv_post_srq_recv(card->queue1, &request, &temporary);
 }
 
-static int SubmitInitialReceivingBufferList(struct InstantCard* card)
+static int ReplaceReceivingBuffer(struct InstantCard* card, uint64_t work)
+{
+  uint64_t number;
+
+  number  = (work - (uintptr_t)card->buffers) / INSTANT_BUFFER_LENGTH;
+  number ^= 1ULL;
+
+  return SubmitReceivingBuffer(card, number);
+}
+
+static int SubmitReceivingBufferList(struct InstantCard* card)
 {
   uint64_t number;
 
@@ -1828,7 +1842,7 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
           (card->queue2  = ibv_create_cq(context, INSTANT_QUEUE_LENGTH * 2, NULL, card->channel, 0)) &&
           (card->region1 = ibv_reg_mr(card->domain, card->buffers,        sizeof(card->buffers),       IBV_ACCESS_LOCAL_WRITE)) &&
           (card->region2 = ibv_reg_mr(card->domain, &replicator->buffers, sizeof(replicator->buffers), IBV_ACCESS_LOCAL_WRITE)) &&
-          (SubmitInitialReceivingBufferList(card) == 0)))
+          (SubmitReceivingBufferList(card) == 0)))
     {
       if (card->queue1   != NULL)  ibv_destroy_srq(card->queue1);
       if (card->queue2   != NULL)  ibv_destroy_cq(card->queue2);
@@ -1891,6 +1905,30 @@ static void DestroyCard(struct InstantCard* card)
   free(card);
 }
 
+static int EnsureWorkOperationCode(struct InstantReplicator* replicator, struct InstantCard* card, struct ibv_wc* completion)
+{
+  struct InstantTask* task;
+
+  // “If the completion status is other than IBV_WC_SUCCESS, only … wr_id, status, qp_num, vendor_err.”
+  // https://man.archlinux.org/man/ibv_poll_cq.3.en
+
+  if (completion->status == IBV_WC_SUCCESS)
+    return completion->opcode;
+
+  if ((completion->wr_id >= ((uintptr_t)card->buffers)) &&
+      (completion->wr_id <  ((uintptr_t)card->buffers + INSTANT_QUEUE_LENGTH * 2 * INSTANT_BUFFER_LENGTH)))
+    return IBV_WC_RECV;
+
+  if ((completion->wr_id >= ((uintptr_t)&replicator->buffers)) &&
+      (completion->wr_id <  ((uintptr_t)&replicator->buffers) + sizeof(struct InstantSharedBufferList)))
+    return IBV_WC_SEND;
+
+  if (task = (struct InstantTask*)completion->wr_id)
+    return task->transfer.code;
+
+  return -1;
+}
+
 static void HandleCompletionChannel(struct InstantReplicator* replicator, struct InstantCard* card, int result)
 {
   void* context;
@@ -1910,19 +1948,19 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
     {
       for (completion = completions; completion < (completions + result); ++ completion)
       {
-        switch (completion->opcode)
+        switch (EnsureWorkOperationCode(replicator, card, completion))
         {
           case IBV_WC_SEND:
             ReleaseSharedBuffer(&replicator->buffers, (struct InstantSharedBuffer*)completion->wr_id);
             break;
 
           case IBV_WC_RECV:
-            SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
-            HandleReceivedMessage(replicator, card->buffers[completion->wr_id], completion->byte_len, completion->imm_data, completion->status, completion->wc_flags & IBV_WC_WITH_IMM);
+            ReplaceReceivingBuffer(card, completion->wr_id);
+            HandleReceivedMessage(replicator, (uint8_t*)completion->wr_id, completion->byte_len, completion->imm_data, completion->status, completion->wc_flags & IBV_WC_WITH_IMM);
             break;
 
           case IBV_WC_RECV_RDMA_WITH_IMM:
-            SubmitReceivingBuffer(card, completion->wr_id ^ 1ULL);
+            ReplaceReceivingBuffer(card, completion->wr_id);
             HandleTranferredData(replicator, completion->imm_data, completion->status);
             break;
 
