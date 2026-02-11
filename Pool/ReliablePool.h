@@ -150,6 +150,9 @@ template<typename Type> class ReliableHolder
 {
   public:
 
+    static_assert(std::is_trivially_copyable<Type>::value && std::is_trivially_destructible<Type>::value,
+      "ReliableHolder requires a trivially copyable and trivially destructible type");
+
     ReliableHolder()                                                          noexcept  { descriptor = { };                                      }
     ReliableHolder(ReliableHolder&& other)                                    noexcept  { descriptor = other.descriptor, other.descriptor = { }; }
     ReliableHolder(const ReliableHolder& other)                               noexcept  { ShareReliableBlock(&other.descriptor, &descriptor);    }
@@ -159,11 +162,11 @@ template<typename Type> class ReliableHolder
     ReliableHolder(struct ReliablePool* pool, uint32_t number, uint32_t tag)  noexcept  { AttachReliableBlock(&descriptor, pool, number, tag);   }
     ~ReliableHolder()                                                                   { ReleaseReliableBlock(&descriptor, RELIABLE_TYPE_FREE); }
 
-    void release(int type)  { ReleaseReliableBlock(&descriptor, type);           }
-    Type* get()             { return static_cast<Type*>(descriptor.block->data); }
+    void release(int type)  { ReleaseReliableBlock(&descriptor, type);                }
+    Type* get()             { return reinterpret_cast<Type*>(descriptor.block->data); }
 
-    operator bool()         { return descriptor.pool && descriptor.block;        }
-    Type* operator->()      { return static_cast<Type*>(descriptor.block->data); }
+    operator bool()         { return descriptor.pool && descriptor.block;             }
+    Type* operator->()      { return reinterpret_cast<Type*>(descriptor.block->data); }
 
     ReliableHolder& operator=(const ReliableHolder& other)
     {
