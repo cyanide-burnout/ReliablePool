@@ -1736,7 +1736,7 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
       (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
   {
     atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
-    CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_LOCK_PENDING, NULL, NULL, 0);
+    CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_FLUSH, NULL, NULL, 0);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
     WaitForReadyState(replicator);
@@ -2545,6 +2545,44 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
     free(replicator->name);
     free(replicator);
   }
+}
+
+int FlushInstantReplicator(struct InstantReplicator* replicator)
+{
+  uint32_t state;
+
+  if (replicator != NULL)
+  {
+    state = atomic_load_explicit(&replicator->state, memory_order_acquire);
+
+    if (state & INSTANT_REPLICATOR_STATE_LOCK)
+    {
+      atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_READY, memory_order_release);
+
+      while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+             (errno == EINTR));
+
+      state = INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY;
+
+      while ((atomic_load_explicit(&replicator->state, memory_order_relaxed) == state) &&
+             (syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, state, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+             ((errno == EINTR) ||
+              (errno == EAGAIN)));
+
+      state = atomic_load_explicit(&replicator->state, memory_order_relaxed);
+    }
+
+    if ((~state & INSTANT_REPLICATOR_STATE_ACTIVE) ||
+        ( state & INSTANT_REPLICATOR_STATE_FAILURE))
+    {
+      // Indicate a fault
+      return -EFAULT;
+    }
+
+    return 0;
+  }
+
+  return -EINVAL;
 }
 
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length)

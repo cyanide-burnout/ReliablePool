@@ -1,37 +1,17 @@
 #include "InstantWaiter.h"
 
-#include <errno.h>
-#include <limits.h>
-#include <sys/syscall.h>
 #include <linux/futex.h>
-
-#define EXPECTED_STATE  (INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY)
 
 static int HandleWaiterCompletion(struct FastRingDescriptor* descriptor, struct io_uring_cqe* completion, int reason)
 {
   struct InstantReplicator* replicator;
 
   if ((completion != NULL) &&
-      (replicator  = (struct InstantReplicator*)descriptor->closure))
+      (replicator  = (struct InstantReplicator*)descriptor->closure) &&
+      (FlushInstantReplicator(replicator) == 0))
   {
-    if (atomic_load_explicit(&replicator->state, memory_order_acquire) & INSTANT_REPLICATOR_STATE_LOCK)
-    {
-      atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_READY, memory_order_release);
-
-      while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
-             (errno == EINTR));
-
-      while ((atomic_load_explicit(&replicator->state, memory_order_relaxed) == EXPECTED_STATE) &&
-             (syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, EXPECTED_STATE, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
-             ((errno == EINTR) ||
-              (errno == EAGAIN)));
-    }
-
-    if (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_FAILURE)
-    {
-      SubmitFastRingDescriptor(descriptor, 0);
-      return 1;
-    }
+    SubmitFastRingDescriptor(descriptor, 0);
+    return 1;
   }
 
   return 0;

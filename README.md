@@ -130,7 +130,8 @@ Protocol format:
 
 Callback events (`HandleInstantEventFunction`):
 
-- `INSTANT_REPLICATOR_EVENT_LOCK_PENDING` (`peer == NULL`, `data == NULL`, `parameter == 0`) - emitted when tasks require lock/ready barrier and external wakeup path is needed.
+- `INSTANT_REPLICATOR_EVENT_FLUSH` - requests external flush/ready handshake.
+  Contract: call `FlushInstantReplicator(replicator)` from another thread/event-loop context; do not block by calling it re-entrantly from the same replicator callback thread.
 - `INSTANT_REPLICATOR_EVENT_CONNECTED`
 - `INSTANT_REPLICATOR_EVENT_DISCONNECTED`
 - `INSTANT_REPLICATOR_EVENT_USER_MESSAGE`

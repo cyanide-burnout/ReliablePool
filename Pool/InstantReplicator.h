@@ -78,7 +78,7 @@ struct InstantHeaderData
 #define RELIABLE_MONITOR_BLOCK_ARRIVAL  14
 #define RELIABLE_MONITOR_BLOCK_REMOVAL  15
 
-#define INSTANT_REPLICATOR_EVENT_LOCK_PENDING  0
+#define INSTANT_REPLICATOR_EVENT_FLUSH         0
 #define INSTANT_REPLICATOR_EVENT_CONNECTED     1
 #define INSTANT_REPLICATOR_EVENT_DISCONNECTED  2
 #define INSTANT_REPLICATOR_EVENT_USER_MESSAGE  3
@@ -319,6 +319,7 @@ typedef int (*ExecuteInstantTaskFunction)(struct InstantReplicator* replicator, 
 struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, HandleInstantEventFunction function, void* closure, struct ReliableMonitor* next);
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);
 
+int FlushInstantReplicator(struct InstantReplicator* replicator);
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length);
 int TransmitInstantReplicatorUserMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait);
 

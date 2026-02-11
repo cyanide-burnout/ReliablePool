@@ -2,9 +2,9 @@
 #include <fcntl.h>
 #include <time.h>
 
+#include <list>
 #include <cstdio>
 #include <iostream>
-#include <list>
 
 #include "ReliablePool.h"
 
@@ -54,21 +54,17 @@ class Record
 
 int main(int count, char** arguments)
 {
-  int handle;
   std::list<Record> records;
-  struct ReliablePool* pool;
 
-  (void)count;
-  (void)arguments;
+  int handle = open("test.dat", O_RDWR | O_CREAT, 0666);
 
-  handle = open("test.dat", O_RDWR | O_CREAT, 0666);
   if (handle < 0)
   {
     std::cout << "Error opening file\n";
     return 1;
   }
 
-  pool = CreateReliablePool(handle, "Test", sizeof(RecordData), RELIABLE_FLAG_RESET, NULL,
+  struct ReliablePool* pool = CreateReliablePool(handle, "Test", sizeof(RecordData), RELIABLE_FLAG_RESET, NULL,
     [] (struct ReliablePool* pool, struct ReliableBlock* block, void* closure) -> int
     {
       auto records = static_cast<std::list<Record>*>(closure);
