@@ -2566,7 +2566,7 @@ int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t
   return 0;
 }
 
-int TransmitInstantReplicatorUesrMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait)
+int TransmitInstantReplicatorUserMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait)
 {
   struct InstantSharedBuffer* buffer;
   struct InstantHeaderData* header;

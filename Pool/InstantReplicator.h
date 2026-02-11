@@ -318,7 +318,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
 void ReleaseInstantReplicator(struct InstantReplicator* replicator);
 
 int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t identifier, struct sockaddr* address, socklen_t length);
-int TransmitInstantReplicatorUesrMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait);
+int TransmitInstantReplicatorUserMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait);
 
 #ifdef __cplusplus
 }
