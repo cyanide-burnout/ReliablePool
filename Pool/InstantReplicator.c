@@ -1909,7 +1909,7 @@ static int EnsureWorkOperationCode(struct InstantReplicator* replicator, struct 
 {
   struct InstantTask* task;
 
-  // “If the completion status is other than IBV_WC_SUCCESS, only … wr_id, status, qp_num, vendor_err.”
+  // "If the completion status is other than IBV_WC_SUCCESS, only ... wr_id, status, qp_num, vendor_err."
   // https://man.archlinux.org/man/ibv_poll_cq.3.en
 
   if (completion->status == IBV_WC_SUCCESS)
@@ -1923,6 +1923,7 @@ static int EnsureWorkOperationCode(struct InstantReplicator* replicator, struct 
       (completion->wr_id <  ((uintptr_t)&replicator->buffers) + sizeof(struct InstantSharedBufferList)))
     return IBV_WC_SEND;
 
+  // Performance trade-off: no task-list scan here, trust task wr_id for signaled task-bound work.
   if (task = (struct InstantTask*)completion->wr_id)
     return task->transfer.code;
 
@@ -2375,6 +2376,7 @@ static void* DoWork(void* closure)
           break;
 
         default:
+          // Performance trade-off: no card-list scan here, trust user_data payload for poll completions.
           HandleCompletionChannel(replicator, (struct InstantCard*)completion->user_data, completion->res);
           break;
       }

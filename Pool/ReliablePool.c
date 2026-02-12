@@ -358,7 +358,7 @@ static int ExpandMemory(struct ReliablePool* pool)
     return -1;
   }
 
-  ReleaseShare(pool, share, RELIABLE_WEIGHT_STRONG);
+  ReleaseShare(pool, pool->share, RELIABLE_WEIGHT_STRONG);
 
   share->memory = memory;
   share->size   = size;
@@ -464,7 +464,7 @@ int UpdateReliablePool(struct ReliablePool* pool)
     return -ENOMEM;
   }
 
-  ReleaseShare(pool, share, RELIABLE_WEIGHT_STRONG);
+  ReleaseShare(pool, pool->share, RELIABLE_WEIGHT_STRONG);
 
   pool->share   = share;
   share->memory = memory;
