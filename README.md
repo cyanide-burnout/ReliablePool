@@ -172,3 +172,46 @@ Behavior:
 - Browses matching services and resolves endpoints.
 - Calls `RegisterRemoteInstantReplicator(...)` for discovered remote instances.
 - Restarts Avahi client on transient daemon/DBus failures using delayed retry.
+
+## Examples
+
+All examples are self-contained and have their own `Makefile`.
+
+Build and run pattern:
+
+- `make -C Examples/<Name>`
+- `./Examples/<Name>/test`
+
+### Basic (`Examples/Basic`)
+
+- Minimal `ReliablePool` lifecycle.
+- Uses file-backed pool (`test.dat`), recovery callback, allocation/release flow.
+- Good first step to verify persistence and recovery semantics.
+
+### CPP (`Examples/CPP`)
+
+- C++ wrapper usage through `ReliableHolder<T>`.
+- Demonstrates RAII-style block ownership and recovery callback integration.
+- Good first step for C++ API consumers.
+
+### Advanced (`Examples/Advanced`)
+
+- Local tracking pipeline without RDMA.
+- Combines `ReliableTracker` + `ReliableIndexer` + `ReliableWaiter` on a `FastRing` loop.
+- Generates random block activity and prints monitor events.
+- Requires FastRing: https://github.com/cyanide-burnout/FastRing
+
+### RDMA (`Examples/RDMA`)
+
+- Full replication stack example.
+- Combines `ReliableTracker`/`ReliableIndexer` with `InstantReplicator`, `InstantWaiter`, and `InstantDiscovery` (`avahi`).
+- Use to validate peer discovery and block replication behavior across nodes.
+- Requires FastRing: https://github.com/cyanide-burnout/FastRing
+
+### UV (`Examples/UV`)
+
+- Event-loop integration variant based on `libuv`.
+- Uses `uv_async_send` bridge callbacks for:
+  - `RELIABLE_MONITOR_SHARE_CHANGE -> FlushReliableTracker(...)`
+  - `INSTANT_REPLICATOR_EVENT_FLUSH -> FlushInstantReplicator(...)`
+- Use when embedding ReliablePool/InstantReplicator into a `libuv` runtime.
