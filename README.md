@@ -229,7 +229,7 @@ Build:
 
 Run example:
 
-- `cd Lua && luajit Test.lua`
+- `cd Lua && ./Test.lua`
 
 Lua API:
 

@@ -159,7 +159,7 @@ static int UpdatePool(lua_State* state)
   return 1;
 }
 
-static int IndexPool(lua_State* state)
+static int GetPoolIndex(lua_State* state)
 {
   const char* key;
 
@@ -190,7 +190,7 @@ static int ReleaseBlock(lua_State* state)
   return 0;
 }
 
-static int IndexBlock(lua_State* state)
+static int GetBlockIndex(lua_State* state)
 {
   struct ReliableDescriptor* descriptor;
   struct ReliableBlock* block;
@@ -327,14 +327,14 @@ static int OpenPool(lua_State* state)
 LUA_API int luaopen_ReliablePool(lua_State* state)
 {
   luaL_newmetatable(state, "ReliablePool");
-  lua_pushliteral(state, "__gc");     lua_pushcfunction(state, ReleasePool);  lua_settable(state, -3);
-  lua_pushliteral(state, "__index");  lua_pushcfunction(state, IndexPool);    lua_settable(state, -3);
+  lua_pushliteral(state, "__gc");     lua_pushcfunction(state, ReleasePool);   lua_settable(state, -3);
+  lua_pushliteral(state, "__index");  lua_pushcfunction(state, GetPoolIndex);  lua_settable(state, -3);
   lua_pop(state, 1);
 
   luaL_newmetatable(state, "ReliableBlock");
-  lua_pushliteral(state, "__gc");        lua_pushcfunction(state, ReleaseBlock);  lua_settable(state, -3);
-  lua_pushliteral(state, "__index");     lua_pushcfunction(state, IndexBlock);    lua_settable(state, -3);
-  lua_pushliteral(state, "__newindex");  lua_pushcfunction(state, SetBlockIndex); lua_settable(state, -3);
+  lua_pushliteral(state, "__gc");        lua_pushcfunction(state, ReleaseBlock);   lua_settable(state, -3);
+  lua_pushliteral(state, "__index");     lua_pushcfunction(state, GetBlockIndex);  lua_settable(state, -3);
+  lua_pushliteral(state, "__newindex");  lua_pushcfunction(state, SetBlockIndex);  lua_settable(state, -3);
   lua_pop(state, 1);
 
   lua_newtable(state);
