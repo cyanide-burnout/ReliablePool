@@ -212,9 +212,9 @@ static int GetBlockIndex(lua_State* state)
   if (strcmp(key, "type")   == 0)  {  lua_pushinteger(state, block->type);    return 1;  }
   if (strcmp(key, "number") == 0)  {  lua_pushinteger(state, block->number);  return 1;  }
   if (strcmp(key, "length") == 0)  {  lua_pushinteger(state, block->length);  return 1;  }
-  if (strcmp(key, "tag")    == 0)  {  lua_pushnumber(state, (lua_Number)atomic_load_explicit(&block->tag,   memory_order_relaxed));  return 1;  }
-  if (strcmp(key, "mark")   == 0)  {  lua_pushnumber(state, (lua_Number)atomic_load_explicit(&block->mark,  memory_order_relaxed));  return 1;  }
-  if (strcmp(key, "count")  == 0)  {  lua_pushnumber(state, (lua_Number)atomic_load_explicit(&block->count, memory_order_relaxed));  return 1;  }
+  if (strcmp(key, "tag")    == 0)  {  lua_pushnumber(state, atomic_load_explicit(&block->tag,   memory_order_relaxed));  return 1;  }
+  if (strcmp(key, "mark")   == 0)  {  lua_pushnumber(state, atomic_load_explicit(&block->mark,  memory_order_relaxed));  return 1;  }
+  if (strcmp(key, "count")  == 0)  {  lua_pushnumber(state, atomic_load_explicit(&block->count, memory_order_relaxed));  return 1;  }
 
   if (strcmp(key, "identifier") == 0)
   {
