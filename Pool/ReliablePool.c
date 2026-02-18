@@ -201,9 +201,9 @@ static struct ReliablePool* CreateNewMemory(int handle, const char* name, size_t
     return NULL;
   }
 
-  number         = (size - sizeof(struct ReliableMemory)) / length;
-  memory->magic  = RELIABLE_MEMORY_MAGIC;
-  memory->size   = length;
+  number        = (size - sizeof(struct ReliableMemory)) / length;
+  memory->magic = RELIABLE_MEMORY_MAGIC;
+  memory->size  = length;
 
   atomic_store_explicit(&memory->length, number, memory_order_relaxed);
   atomic_store_explicit(&memory->free, (uint64_t)UINT32_MAX, memory_order_relaxed);

@@ -215,3 +215,54 @@ Build and run pattern:
   - `RELIABLE_MONITOR_SHARE_CHANGE -> FlushReliableTracker(...)`
   - `INSTANT_REPLICATOR_EVENT_FLUSH -> FlushInstantReplicator(...)`
 - Use when embedding ReliablePool/InstantReplicator into a `libuv` runtime.
+
+## Lua Module
+
+Location:
+
+- `Lua/Module.c`
+- `Lua/Test.lua`
+
+Build:
+
+- `make -C Lua`
+
+Run example:
+
+- `cd Lua && luajit Test.lua`
+
+Lua API:
+
+- `local module = require("ReliablePool")`
+- `pool = module.open(path_or_fd, name, length[, recover])`
+- `block = pool:allocate([type])`
+- `block = pool:attach(number[, tag])`
+- `result = pool:update()`
+- `pool:close()`
+- `block:release([type])`
+
+Open semantics:
+
+- If `path_or_fd` is string, module opens file with `O_RDWR | O_CREAT` and mode `0660`.
+- If `path_or_fd` is number, it is treated as file descriptor.
+- Pool owns descriptor lifetime and closes it on `pool:close()` / `__gc`.
+- If `recover` callback is provided, module automatically sets `RELIABLE_FLAG_RESET`.
+
+Recover callback:
+
+- Signature: `recover(block)`.
+- Return value is ignored.
+- C callback always returns `RELIABLE_TYPE_RECOVERABLE`.
+- Callback errors are swallowed (do not abort `open`).
+- Keep `block` in Lua scope/table if it must survive callback scope.
+
+Block properties:
+
+- Read-only: `type`, `number`, `count`, `mark`, `tag`, `identifier`
+- Read/write: `length`, `data` (binary Lua string)
+
+Defaults:
+
+- `pool:allocate()` default type: `RELIABLE_TYPE_NON_RECOVERABLE`
+- `pool:attach(number)` default tag: `UINT32_MAX`
+- `block:release()` default type: `RELIABLE_TYPE_FREE`
