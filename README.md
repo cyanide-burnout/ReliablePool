@@ -261,6 +261,10 @@ Block properties:
 - Read-only: `type`, `number`, `count`, `mark`, `tag`, `identifier`
 - Read/write: `length`, `data` (binary Lua string)
 
+Pool properties:
+
+- Read-only: `size`, `length`
+
 Defaults:
 
 - `pool:allocate()` default type: `RELIABLE_TYPE_NON_RECOVERABLE`

@@ -161,6 +161,9 @@ static int UpdatePool(lua_State* state)
 
 static int GetPoolIndex(lua_State* state)
 {
+  struct ReliableMemory* memory;
+  struct ReliableShare* share;
+  struct ReliablePool* pool;
   const char* key;
 
   luaL_checkudata(state, 1, "ReliablePool");
@@ -171,6 +174,13 @@ static int GetPoolIndex(lua_State* state)
   if (strcmp(key, "attach")   == 0)  {  lua_pushcfunction(state, AttachBlock);    return 1;  }
   if (strcmp(key, "update")   == 0)  {  lua_pushcfunction(state, UpdatePool);     return 1;  }
   if (strcmp(key, "close")    == 0)  {  lua_pushcfunction(state, ReleasePool);    return 1;  }
+
+  pool   = GetPool(state);
+  share  = pool->share;
+  memory = share->memory;
+
+  if (strcmp(key, "size")   == 0)  {  lua_pushinteger(state, memory->size);                                                 return 1;  }
+  if (strcmp(key, "length") == 0)  {  lua_pushinteger(state, atomic_load_explicit(&memory->length, memory_order_relaxed));  return 1;  }
 
   lua_pushnil(state);
   return 1;
