@@ -15,8 +15,6 @@
 */
 
 #ifdef __cplusplus
-#include <functional>
-
 extern "C"
 {
 #endif
