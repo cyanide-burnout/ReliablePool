@@ -83,7 +83,9 @@ void* StartRedBlackIteratorFromValue(struct RedBlackIterator* iterator, struct R
 
 int CompareStringKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2);
 int CompareIntegerKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2);
+int CompareUnsignedKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2);
 int CompareLongIntegerKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2);
+int CompareLongUnsignedKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2);
 
 #ifdef __cplusplus
 }

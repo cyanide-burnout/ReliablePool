@@ -122,7 +122,7 @@ int PutIntoRedBlackTree(struct RedBlackTree* tree, const void* key, void* value)
   if ((tree == NULL) ||
       (node == NULL))
   {
-    // Got an error, nothing to do
+    free(node);
     return FALSE;
   }
 
@@ -187,6 +187,16 @@ int PutIntoRedBlackTree(struct RedBlackTree* tree, const void* key, void* value)
     }
 
     result = tree->compare(tree, nodeQ, nodeQ->key, key);
+
+    if ((result == 0) &&
+        (nodeQ  != node))
+    {
+      // This tree behaves like a map/set, not a multimap: equal keys are rejected
+      tree->root        = head.link[REDBLACK_LINK_RIGHT];
+      tree->root->color = REDBLACK_COLOR_BLACK;
+      free(node);
+      return FALSE;
+    }
 
     if (result != 0)
     {
@@ -452,16 +462,15 @@ int CompareStringKeys(struct RedBlackTree* tree, struct RedBlackNode* node, cons
   return strcmp((const char*)key1, (const char*)key2);
 }
 
-int CompareIntegerKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2)
-{
-  register int32_t value1 = *(int32_t*)key1;
-  register int32_t value2 = *(int32_t*)key2;
-  return value1 - value2;
+#define CompareScalarKeysFunction(type, function)                                                       \
+int function(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2)  \
+{                                                                                                       \
+  register type value1 = *(type*)key1;                                                                  \
+  register type value2 = *(type*)key2;                                                                  \
+  return (value1 > value2) - (value1 < value2);                                                         \
 }
 
-int CompareLongIntegerKeys(struct RedBlackTree* tree, struct RedBlackNode* node, const void* key1, const void* key2)
-{
-  register int64_t value1 = *(int64_t*)key1;
-  register int64_t value2 = *(int64_t*)key2;
-  return (value1 > value2) - (value1 < value2);
-}
+CompareScalarKeysFunction(int32_t,  CompareIntegerKeys)
+CompareScalarKeysFunction(uint32_t, CompareUnsignedKeys)
+CompareScalarKeysFunction(int64_t,  CompareLongIntegerKeys)
+CompareScalarKeysFunction(uint64_t, CompareLongUnsignedKeys)
