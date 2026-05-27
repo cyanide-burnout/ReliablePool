@@ -72,7 +72,7 @@ int main(int count, char** arguments)
       return RELIABLE_TYPE_RECOVERABLE;
     }, &records);
 
-  if (pool == NULL)
+  if (pool == nullptr)
   {
     std::cout << "Error opening pool\n";
     close(handle);

@@ -123,7 +123,7 @@ void ReleaseReliablePool(struct ReliablePool* pool);
 int UpdateReliablePool(struct ReliablePool* pool);
 
 void* AllocateReliableBlock(struct ReliableDescriptor* descriptor, struct ReliablePool* pool, int type);
-void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct ReliablePool* pool, uint32_t number, uint32_t tag);
+void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct ReliablePool* pool, uint32_t number, uint32_t tag, int any);
 void* ShareReliableBlock(const struct ReliableDescriptor* source, struct ReliableDescriptor* destination);
 void ReleaseReliableBlock(struct ReliableDescriptor* descriptor, int type);
 
@@ -153,14 +153,14 @@ template<typename Type> class ReliableHolder
     static_assert(std::is_trivially_copyable<Type>::value && std::is_trivially_destructible<Type>::value,
       "ReliableHolder requires a trivially copyable and trivially destructible type");
 
-    ReliableHolder()                                                          noexcept  { descriptor = { };                                      }
-    ReliableHolder(ReliableHolder&& other)                                    noexcept  { descriptor = other.descriptor, other.descriptor = { }; }
-    ReliableHolder(const ReliableHolder& other)                               noexcept  { ShareReliableBlock(&other.descriptor, &descriptor);    }
-    ReliableHolder(struct ReliableDescriptor& other)                          noexcept  { ShareReliableBlock(&other, &descriptor);               }
-    ReliableHolder(struct ReliablePool* pool, int type)                       noexcept  { AllocateReliableBlock(&descriptor, pool, type);        }
-    ReliableHolder(struct ReliablePool* pool, struct ReliableBlock* block)    noexcept  { RecoverReliableBlock(&descriptor, pool, block);        }
-    ReliableHolder(struct ReliablePool* pool, uint32_t number, uint32_t tag)  noexcept  { AttachReliableBlock(&descriptor, pool, number, tag);   }
-    ~ReliableHolder()                                                                   { ReleaseReliableBlock(&descriptor, RELIABLE_TYPE_FREE); }
+    ReliableHolder()                                                                    noexcept  { descriptor = { };                                         }
+    ReliableHolder(ReliableHolder&& other)                                              noexcept  { descriptor = other.descriptor, other.descriptor = { };    }
+    ReliableHolder(const ReliableHolder& other)                                         noexcept  { ShareReliableBlock(&other.descriptor, &descriptor);       }
+    ReliableHolder(struct ReliableDescriptor& other)                                    noexcept  { ShareReliableBlock(&other, &descriptor);                  }
+    ReliableHolder(struct ReliablePool* pool, int type)                                 noexcept  { AllocateReliableBlock(&descriptor, pool, type);           }
+    ReliableHolder(struct ReliablePool* pool, struct ReliableBlock* block)              noexcept  { RecoverReliableBlock(&descriptor, pool, block);           }
+    ReliableHolder(struct ReliablePool* pool, uint32_t number, uint32_t tag, bool any)  noexcept  { AttachReliableBlock(&descriptor, pool, number, tag, any); }
+    ~ReliableHolder()                                                                             { ReleaseReliableBlock(&descriptor, RELIABLE_TYPE_FREE);    }
 
     void release(int type)  { ReleaseReliableBlock(&descriptor, type);                }
     Type* get()             { return reinterpret_cast<Type*>(descriptor.block->data); }

@@ -125,10 +125,12 @@ static int AttachBlock(lua_State* state)
   struct ReliablePool* pool;
   lua_Integer number;
   lua_Integer tag;
+  int any;
 
   pool   = GetPool(state);
   number = luaL_checkinteger(state, 2);
-  tag    = lua_isnoneornil(state, 3) ? UINT32_MAX : luaL_checkinteger(state, 3);
+  any    = lua_isnoneornil(state, 3);
+  tag    = any ? 0 : luaL_checkinteger(state, 3);
 
   if (number < 0)                  return luaL_error(state, "block number must be non-negative");
   if (tag    < 0)                  return luaL_error(state, "block tag must be non-negative");
@@ -136,7 +138,7 @@ static int AttachBlock(lua_State* state)
 
   descriptor = (struct ReliableDescriptor*)lua_newuserdata(state, sizeof(struct ReliableDescriptor));
 
-  if (AttachReliableBlock(descriptor, pool, number, tag) == NULL)
+  if (AttachReliableBlock(descriptor, pool, number, tag, any) == NULL)
     return luaL_error(state, "failed to attach block");
 
   luaL_getmetatable(state, "ReliableBlock");

@@ -201,9 +201,9 @@ static struct ReliablePool* CreateNewMemory(int handle, const char* name, size_t
     return NULL;
   }
 
-  number        = (size - sizeof(struct ReliableMemory)) / length;
-  memory->magic = RELIABLE_MEMORY_MAGIC;
-  memory->size  = length;
+  number         = (size - sizeof(struct ReliableMemory)) / length;
+  memory->magic  = RELIABLE_MEMORY_MAGIC;
+  memory->size   = length;
 
   atomic_store_explicit(&memory->length, number, memory_order_relaxed);
   atomic_store_explicit(&memory->free, (uint64_t)UINT32_MAX, memory_order_relaxed);
@@ -536,7 +536,7 @@ void* AllocateReliableBlock(struct ReliableDescriptor* descriptor, struct Reliab
   return NULL;
 }
 
-void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct ReliablePool* pool, uint32_t number, uint32_t tag)
+void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct ReliablePool* pool, uint32_t number, uint32_t tag, int any)
 {
   struct ReliableBlock* block;
   struct ReliableShare* share;
@@ -567,7 +567,8 @@ void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct Reliable
 
   block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
 
-  if ((tag != atomic_load_explicit(&block->tag, memory_order_acquire)) ||
+  if ((any == 0) &&
+      (tag != atomic_load_explicit(&block->tag, memory_order_acquire)) ||
       (AcquireBlock(&block->count) < 0))
   {
     pthread_rwlock_unlock(&pool->lock);
