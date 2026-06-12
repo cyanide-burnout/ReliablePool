@@ -1822,13 +1822,18 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
   struct InstantCard* card;
   struct InstantCard* other;
   struct io_uring_sqe* submission;
+  struct ibv_device_attr information;
   struct ibv_srq_init_attr attribute;
 
   for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
 
   if ((card == NULL) &&
       (!(other = replicator->cards) ||
-        (other->number < (INSTANT_CARD_COUNT - 1))) &&
+        (other->number < (INSTANT_CARD_COUNT - 1)))  &&
+      (ibv_query_device(context, &information) == 0) &&
+      (information.atomic_cap          != IBV_ATOMIC_NONE)                           &&
+      (information.max_qp_init_rd_atom >= replicator->parameter.initiator_depth)     &&
+      (information.max_qp_rd_atom      >= replicator->parameter.responder_resources) &&
       (card = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
   {
     memset(&attribute, 0, sizeof(struct ibv_srq_init_attr));

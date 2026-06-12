@@ -114,6 +114,12 @@ Main API:
 - `RegisterRemoteInstantReplicator(replicator, identifier, address, length)`
 - `TransmitInstantReplicatorUserMessage(replicator, data, length, wait)`
 
+Requirements:
+
+- `InstantReplicator` requires RDMA remote atomic support for its compare-and-swap transfer path.
+- The HCA must expose atomic capabilities sufficient for the configured initiator/responder RDMA depths.
+- Adapters that do not satisfy these capabilities are rejected during card setup and are treated as unavailable; they will not be considered connected peers.
+
 Protocol format:
 
 - Header: `InstantHeaderData`
@@ -206,6 +212,7 @@ Build and run pattern:
 - Full replication stack example.
 - Combines `ReliableTracker`/`ReliableIndexer` with `InstantReplicator`, `InstantWaiter`, and `InstantDiscovery` (`avahi`).
 - Use to validate peer discovery and block replication behavior across nodes.
+- Requires an RDMA adapter with remote atomic support; adapters without the required atomic capabilities are rejected before the peer is considered connected.
 - Requires FastRing: https://github.com/cyanide-burnout/FastRing
 
 ### UV (`Examples/UV`)
