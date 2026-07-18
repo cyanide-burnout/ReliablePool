@@ -59,7 +59,7 @@ typedef void (*ReliableMonitorFunction)(int event, struct ReliablePool* pool, st
 
 struct ReliableBlock
 {
-  uint32_t type;              // ┌ RELIABLE_TYPE_*                        ┐
+  ATOMIC(uint32_t) type;      // ┌ RELIABLE_TYPE_*                        ┐
   uint32_t number;            // │ Block number                           │
   ATOMIC(uint64_t) next;      // │ Next free block                        ├─ [local only]
   ATOMIC(uint32_t) tag;       // │ Local version tag                      │
@@ -253,12 +253,17 @@ template<typename Type> class ReliableAllocator
       this->block = block;
     }
 
+    struct ReliablePool* source() const noexcept
+    {
+      return pool;
+    }
+
     [[nodiscard]] constexpr Type* allocate(std::size_t count)
     {
       Container* container;
       struct ReliableDescriptor descriptor;
 
-      if ((count <= 1) &&
+      if ((count == 1) &&
           (pool != nullptr) &&
           (pool->share->memory->size >= size))
       {
@@ -278,7 +283,7 @@ template<typename Type> class ReliableAllocator
           return &container->data;
         }
 
-        if (container = reinterpret_cast<Container*>(AllocateReliableBlock(&descriptor, pool, initial)))
+        if ((container = reinterpret_cast<Container*>(AllocateReliableBlock(&descriptor, pool, initial))))
         {
           descriptor.block->length = sizeof(Container);
           container->type          = typeid(Type).hash_code();
@@ -315,7 +320,7 @@ template<typename Type> class ReliableAllocator
 
 template <typename Type1, typename Type2> bool operator==(const ReliableAllocator<Type1>& allocator1, const ReliableAllocator<Type2>& allocator2) noexcept
 {
-  return std::is_same<Type1, Type2>::value;
+  return std::is_same<Type1, Type2>::value && (allocator1.source() == allocator2.source());
 };
 
 #endif

@@ -14,7 +14,7 @@
 
 _Static_assert((offsetof(struct ReliableBlock, next)  % sizeof(uint64_t))      == 0, "ReliableBlock.next must be 64-bit aligned");
 _Static_assert((offsetof(struct ReliableBlock, mark)  % sizeof(uint64_t))      == 0, "ReliableBlock.mark must be 64-bit aligned");
-_Static_assert((offsetof(struct ReliableBlock, data)  % __BIGGEST_ALIGNMENT__) == 0, "RReliableBlock.data must be aligned to __BIGGEST_ALIGNMENT__");
+_Static_assert((offsetof(struct ReliableBlock, data)  % __BIGGEST_ALIGNMENT__) == 0, "ReliableBlock.data must be aligned to __BIGGEST_ALIGNMENT__");
 _Static_assert((offsetof(struct ReliableMemory, free) % sizeof(uint64_t))      == 0, "ReliableMemory.free must be 64-bit aligned");
 _Static_assert((offsetof(struct ReliableMemory, data) % __BIGGEST_ALIGNMENT__) == 0, "ReliableMemory.data must be aligned to __BIGGEST_ALIGNMENT__");
 
@@ -46,32 +46,6 @@ static inline void PushFreeBlock(struct ReliableMemory* memory, struct ReliableB
   while (!atomic_compare_exchange_weak_explicit(&memory->free, &current, next, memory_order_release, memory_order_relaxed));
 }
 
-static inline struct ReliableBlock* PopFreeBlock(struct ReliableMemory* memory)
-{
-  uint64_t current;
-  uint64_t next;
-  uint32_t number;
-  struct ReliableBlock* block;
-
-  do
-  {
-    current = atomic_load_explicit(&memory->free, memory_order_acquire);
-    number  = (uint32_t)current;
-
-    if (number == UINT32_MAX)
-    {
-      block = NULL;
-      break;
-    }
-
-    block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
-    next  = atomic_load_explicit(&block->next, memory_order_relaxed);
-  }
-  while (!atomic_compare_exchange_weak_explicit(&memory->free, &current, next, memory_order_acq_rel, memory_order_relaxed));
-
-  return block;
-}
-
 static inline int CheckShareCapacity(struct ReliableShare* share, uint32_t number)
 {
   struct ReliableMemory* memory;
@@ -83,17 +57,40 @@ static inline int CheckShareCapacity(struct ReliableShare* share, uint32_t numbe
   return -((number != UINT32_MAX) && (number >= length));
 }
 
-static inline int CheckPoolCapacity(struct ReliablePool* pool)
+static inline int PopFreeBlock(struct ReliableShare* share, struct ReliableBlock** result)
 {
-  struct ReliableMemory* memory;
-  struct ReliableShare* share;
+  uint64_t next;
+  uint64_t current;
   uint32_t number;
+  struct ReliableBlock* block;
+  struct ReliableMemory* memory;
 
-  share  = pool->share;
   memory = share->memory;
-  number = (uint32_t)atomic_load_explicit(&memory->free, memory_order_acquire);
 
-  return CheckShareCapacity(share, number);
+  do
+  {
+    current = atomic_load_explicit(&memory->free, memory_order_acquire);
+    number  = (uint32_t)current;
+
+    if (number == UINT32_MAX)
+    {
+      *result = NULL;
+      return 0;
+    }
+
+    if (CheckShareCapacity(share, number) < 0)
+    {
+      *result = NULL;
+      return -1;
+    }
+
+    block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+    next  = atomic_load_explicit(&block->next, memory_order_relaxed);
+  }
+  while (!atomic_compare_exchange_weak_explicit(&memory->free, &current, next, memory_order_acq_rel, memory_order_relaxed));
+
+  *result = block;
+  return 0;
 }
 
 static inline int TruncateFile(int handle, off_t length)
@@ -194,37 +191,34 @@ static struct ReliablePool* CreateNewMemory(int handle, const char* name, size_t
   struct ReliableBlock* block;
   struct ReliableMemory* memory;
 
-  if ((TruncateFile(handle, size) < 0) ||
+  pool   = (struct ReliablePool*)calloc(1, sizeof(struct ReliablePool));
+  share  = (struct ReliableShare*)calloc(1, sizeof(struct ReliableShare));
+
+  if ((pool  == NULL) ||
+      (share == NULL) ||
+      (TruncateFile(handle, size) < 0) ||
       ((memory = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, handle, 0)) == MAP_FAILED))
   {
-    // An error occurred
+    free(pool);
+    free(share);
     return NULL;
   }
 
-  number         = (size - sizeof(struct ReliableMemory)) / length;
-  memory->magic  = RELIABLE_MEMORY_MAGIC;
-  memory->size   = length;
+  number        = (size - sizeof(struct ReliableMemory)) / length;
+  memory->magic = 0;
+  memory->size  = length;
 
   atomic_store_explicit(&memory->length, number, memory_order_relaxed);
   atomic_store_explicit(&memory->free, (uint64_t)UINT32_MAX, memory_order_relaxed);
   strncpy(memory->name, name, RELIABLE_MEMORY_NAME_LENGTH);
 
-  pool   = (struct ReliablePool*)calloc(1, sizeof(struct ReliablePool));
-  share  = (struct ReliableShare*)calloc(1, sizeof(struct ReliableShare));
-
-  if ((pool  == NULL) ||
-      (share == NULL))
-  {
-    free(pool);
-    free(share);
-    munmap(memory, size);
-    return NULL;
-  }
-
   pool->share   = share;
   pool->handle  = handle;
+  pool->grain   = size;
   share->memory = memory;
   share->size   = size;
+
+  pthread_rwlock_init(&pool->lock, NULL);
 
   atomic_store_explicit(&pool->monitor, monitor,                memory_order_relaxed);
   atomic_store_explicit(&pool->count,   1,                      memory_order_relaxed);
@@ -232,16 +226,20 @@ static struct ReliablePool* CreateNewMemory(int handle, const char* name, size_t
 
   while ((number --) > 0)
   {
-    block         = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+    block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+    memset(block, 0, memory->size);
     block->number = number;
     PushFreeBlock(memory, block);
   }
+
+  // The magic is written last: a partially initialized file will not pass UseExistingMemory
+  memory->magic = RELIABLE_MEMORY_MAGIC;
 
   CallReliableMonitor(RELIABLE_MONITOR_POOL_CREATE, pool, share, NULL);
   return pool;
 }
 
-static struct ReliablePool* UseExistingMemory(int handle, const char* name, size_t size, size_t length, uint32_t flags, struct ReliableMonitor* monitor, ReliableRecoveryFunction function, void* closure)
+static struct ReliablePool* UseExistingMemory(int handle, const char* name, size_t size, size_t length, size_t grain, uint32_t flags, struct ReliableMonitor* monitor, ReliableRecoveryFunction function, void* closure)
 {
   uint32_t number;
   struct ReliablePool* pool;
@@ -277,10 +275,13 @@ static struct ReliablePool* UseExistingMemory(int handle, const char* name, size
     return NULL;
   }
 
-  pool->share   = share;
   pool->handle  = handle;
+  pool->grain   = grain;
+  pool->share   = share;
   share->memory = memory;
   share->size   = size;
+
+  pthread_rwlock_init(&pool->lock, NULL);
 
   atomic_store_explicit(&pool->monitor, monitor,                memory_order_relaxed);
   atomic_store_explicit(&pool->count,   1,                      memory_order_relaxed);
@@ -308,6 +309,7 @@ static struct ReliablePool* UseExistingMemory(int handle, const char* name, size
 
         block->type = RELIABLE_TYPE_FREE;
         uuid_clear(block->identifier);
+        atomic_store_explicit(&block->hint,    0, memory_order_relaxed);
         atomic_store_explicit(&block->mark,    0, memory_order_relaxed);
         atomic_store_explicit(&block->control, 0, memory_order_relaxed);
         PushFreeBlock(memory, block);
@@ -397,13 +399,15 @@ struct ReliablePool* CreateReliablePool(int handle, const char* name, size_t len
     grain   = (grain + getpagesize() - 1) & ~(getpagesize() - 1);
 
     if ((fstat(handle, &status) == 0) &&
-        ((pool = UseExistingMemory(handle, name, status.st_size, length, flags, monitor, function, closure)) ||
+        ((pool = UseExistingMemory(handle, name, status.st_size, length, grain, flags, monitor, function, closure)) ||
          (pool = CreateNewMemory(handle, name, grain, length, flags, monitor))))
     {
-      pool->grain = grain;
-      pool->time  = status.st_ctime;
+      if (fstat(handle, &status) == 0)
+      {
+        // The file might be created by CreateNewMemory
+        pool->time = status.st_ctime;
+      }
 
-      pthread_rwlock_init(&pool->lock, NULL);
       UnlockFile(handle);
       return pool;
     }
@@ -448,7 +452,7 @@ int UpdateReliablePool(struct ReliablePool* pool)
   }
 
   if ((share = pool->share) &&
-      (share->size >= status.st_size))
+      (share->size >= (size_t)status.st_size))
   {
     UnlockFile(pool->handle);
     pthread_rwlock_unlock(&pool->lock);
@@ -490,16 +494,21 @@ void* AllocateReliableBlock(struct ReliableDescriptor* descriptor, struct Reliab
   {
     pthread_rwlock_rdlock(&pool->lock);
 
-    if (CheckPoolCapacity(pool) < 0)
-    {
-      pthread_rwlock_unlock(&pool->lock);
-      UpdateReliablePool(pool);
-      continue;
-    }
-
     share  = pool->share;
     memory = share->memory;
-    block  = PopFreeBlock(memory);
+
+    if (PopFreeBlock(share, &block) < 0)
+    {
+      pthread_rwlock_unlock(&pool->lock);
+
+      if (UpdateReliablePool(pool) < 0)
+      {
+        // Error updating the pool
+        break;
+      }
+
+      continue;
+    }
 
     if (block != NULL)
     {
@@ -507,11 +516,13 @@ void* AllocateReliableBlock(struct ReliableDescriptor* descriptor, struct Reliab
       atomic_fetch_add_explicit(&pool->count,   1,                      memory_order_relaxed);
       pthread_rwlock_unlock(&pool->lock);
 
-      block->type   = type;
       block->length = memory->size - offsetof(struct ReliableBlock, data);
-
-      atomic_store_explicit(&block->count, 1, memory_order_relaxed);
       memset(block->data, 0, block->length);
+
+      atomic_store_explicit(&block->count, 1, memory_order_release);
+
+      // The type is published last: FreeReliableBlock sees a non-zero count once a non-free type is visible
+      atomic_store_explicit(&block->type, (uint32_t)type, memory_order_release);
 
       CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ALLOCATE, pool, share, block);
 
@@ -526,12 +537,14 @@ void* AllocateReliableBlock(struct ReliableDescriptor* descriptor, struct Reliab
 
     if (ExpandMemory(pool) < 0)
     {
-      descriptor->pool  = NULL;
-      descriptor->share = NULL;
-      descriptor->block = NULL;
+      // Error expanding the pool
       break;
     }
   }
+
+  descriptor->pool  = NULL;
+  descriptor->share = NULL;
+  descriptor->block = NULL;
 
   return NULL;
 }
@@ -567,8 +580,8 @@ void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct Reliable
 
   block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
 
-  if ((any == 0) &&
-      (tag != atomic_load_explicit(&block->tag, memory_order_acquire)) ||
+  if (((any == 0) &&
+       (tag != atomic_load_explicit(&block->tag, memory_order_acquire))) ||
       (AcquireBlock(&block->count) < 0))
   {
     pthread_rwlock_unlock(&pool->lock);
@@ -583,6 +596,14 @@ void* AttachReliableBlock(struct ReliableDescriptor* descriptor, struct Reliable
   descriptor->block = block;
 
   pthread_rwlock_unlock(&pool->lock);
+
+  if ((any == 0) &&
+      (tag != atomic_load_explicit(&block->tag, memory_order_acquire)))
+  {
+    // The block was recycled between the check of the tag and the acquisition of the count
+    ReleaseReliableBlock(descriptor, RELIABLE_TYPE_FREE);
+    return NULL;
+  }
 
   CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ATTACH, pool, share, block);
 
@@ -615,6 +636,7 @@ void* ShareReliableBlock(const struct ReliableDescriptor* source, struct Reliabl
 
 void ReleaseReliableBlock(struct ReliableDescriptor* descriptor, int type)
 {
+  uint32_t current;
   struct ReliablePool* pool;
   struct ReliableBlock* block;
   struct ReliableShare* share;
@@ -625,20 +647,26 @@ void ReleaseReliableBlock(struct ReliableDescriptor* descriptor, int type)
     share = descriptor->share;
     block = descriptor->block;
 
-    if (atomic_fetch_sub_explicit(&block->count, 1, memory_order_acquire) == 1)
+    // The type is stable while the count is held
+    current = atomic_load_explicit(&block->type, memory_order_acquire);
+
+    if (atomic_fetch_sub_explicit(&block->count, 1, memory_order_acq_rel) == 1)
     {
-      block->type = type;
-
-      CallReliableMonitor(RELIABLE_MONITOR_BLOCK_RELEASE, pool, share, block);
-
-      if (type == RELIABLE_TYPE_FREE)
+      if (atomic_compare_exchange_strong_explicit(&block->type, &current, (uint32_t)type, memory_order_acq_rel, memory_order_relaxed))
       {
-        uuid_clear(block->identifier);
-        atomic_store_explicit(&block->hint,    0, memory_order_relaxed);
-        atomic_store_explicit(&block->mark,    0, memory_order_relaxed);
-        atomic_store_explicit(&block->control, 0, memory_order_relaxed);
-        PushFreeBlock(share->memory, block);
+        CallReliableMonitor(RELIABLE_MONITOR_BLOCK_RELEASE, pool, share, block);
+
+        if (type == RELIABLE_TYPE_FREE)
+        {
+          uuid_clear(block->identifier);
+          atomic_store_explicit(&block->hint,    0, memory_order_relaxed);
+          atomic_store_explicit(&block->mark,    0, memory_order_relaxed);
+          atomic_store_explicit(&block->control, 0, memory_order_relaxed);
+          PushFreeBlock(share->memory, block);
+        }
       }
+
+      // On the failure a concurrent FreeReliableBlock has already freed the block
     }
 
     ReleaseShare(pool, share, RELIABLE_WEIGHT_STRONG);
@@ -677,23 +705,27 @@ uint32_t ReserveReliableBlock(struct ReliablePool* pool, uuid_t identifier, int 
   {
     pthread_rwlock_rdlock(&pool->lock);
 
-    if (CheckPoolCapacity(pool) < 0)
-    {
-      pthread_rwlock_unlock(&pool->lock);
-      UpdateReliablePool(pool);
-      continue;
-    }
-
     share  = pool->share;
     memory = share->memory;
-    block  = PopFreeBlock(memory);
+
+    if (PopFreeBlock(share, &block) < 0)
+    {
+      pthread_rwlock_unlock(&pool->lock);
+
+      if (UpdateReliablePool(pool) < 0)
+      {
+        // Error updating the pool
+        break;
+      }
+
+      continue;
+    }
 
     if (block != NULL)
     {
       atomic_fetch_add_explicit(&share->weight, RELIABLE_WEIGHT_STRONG, memory_order_relaxed);
       pthread_rwlock_unlock(&pool->lock);
 
-      block->type   = (uint32_t)type;
       block->length = memory->size - offsetof(struct ReliableBlock, data);
 
       atomic_store_explicit(&block->count,   0, memory_order_relaxed);
@@ -701,6 +733,9 @@ uint32_t ReserveReliableBlock(struct ReliablePool* pool, uuid_t identifier, int 
       atomic_store_explicit(&block->control, 0, memory_order_relaxed);
       uuid_copy(block->identifier, identifier);
       memset(block->data, 0, block->length);
+
+      // The type is published last: FreeReliableBlock sees a consistent block once a non-free type is visible
+      atomic_store_explicit(&block->type, (uint32_t)type, memory_order_release);
 
       CallReliableMonitor(RELIABLE_MONITOR_BLOCK_RESERVE, pool, share, block);
 
@@ -723,6 +758,7 @@ uint32_t ReserveReliableBlock(struct ReliablePool* pool, uuid_t identifier, int 
 
 int FreeReliableBlock(struct ReliablePool* pool, uint32_t number, uuid_t identifier)
 {
+  uint32_t type;
   struct ReliableBlock* block;
   struct ReliableShare* share;
   struct ReliableMemory* memory;
@@ -747,10 +783,11 @@ int FreeReliableBlock(struct ReliablePool* pool, uint32_t number, uuid_t identif
   }
 
   block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+  type  = atomic_load_explicit(&block->type, memory_order_acquire);
 
-  if ((block->type == RELIABLE_TYPE_FREE) ||
-      (uuid_is_null(identifier) == 0)     &&
-      (uuid_compare(identifier, block->identifier) != 0))
+  if ((type == RELIABLE_TYPE_FREE)     ||
+      ((uuid_is_null(identifier) == 0) &&
+       (uuid_compare(identifier, block->identifier) != 0)))
   {
     pthread_rwlock_unlock(&pool->lock);
     return -ENOENT;
@@ -762,7 +799,21 @@ int FreeReliableBlock(struct ReliablePool* pool, uint32_t number, uuid_t identif
     return -EBUSY;
   }
 
-  block->type = RELIABLE_TYPE_FREE;
+  if (!atomic_compare_exchange_strong_explicit(&block->type, &type, RELIABLE_TYPE_FREE, memory_order_acq_rel, memory_order_relaxed))
+  {
+    // A concurrent FreeReliableBlock or ReleaseReliableBlock has already taken over the block
+    pthread_rwlock_unlock(&pool->lock);
+    return -ENOENT;
+  }
+
+  if (atomic_load_explicit(&block->count, memory_order_acquire) != 0)
+  {
+    // The block was freed and allocated again in between,
+    // the successful exchange means the type still holds the same value, so the store reverts the claim
+    atomic_store_explicit(&block->type, type, memory_order_release);
+    pthread_rwlock_unlock(&pool->lock);
+    return -EBUSY;
+  }
 
   atomic_fetch_add_explicit(&share->weight, RELIABLE_WEIGHT_STRONG, memory_order_relaxed);
   pthread_rwlock_unlock(&pool->lock);

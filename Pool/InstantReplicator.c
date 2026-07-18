@@ -389,6 +389,7 @@ static struct InstantCookie* EnsureCookie(struct InstantReplicator* replicator, 
   }
 
   if ((cookie == NULL) &&
+      (share  != NULL) &&
       (cookie  = (struct InstantCookie*)calloc(1, sizeof(struct InstantCookie))))
   {
     memory              = share->memory;
