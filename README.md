@@ -86,6 +86,25 @@ Tracker-specific events:
 - `RELIABLE_MONITOR_BLOCK_CHANGE` (block changed after flush analysis)
 - `RELIABLE_MONITOR_FLUSH_COMMIT` (flush commit barrier for downstream monitors)
 
+### ReliableFlusher
+
+Role:
+
+- Optional thin consumer of `ReliableTracker` in the `ReliableMonitor` chain.
+- Adds an explicit durability step for file-backed pools by collecting `RELIABLE_MONITOR_BLOCK_CHANGE` reports and synchronizing each completed share with `msync(MS_SYNC)`.
+- On `msync()` failure raises the sticky `RELIABLE_FLUSHER_STATE_FAILURE` flag.
+
+Main API:
+
+- `CreateReliableFlusher(next)` / `ReleaseReliableFlusher(flusher)`
+
+Notes:
+
+- Useful only for pools backed by a real file; `msync()` is a no-op on `memfd` (tmpfs).
+- Coalesces consecutive block-change reports for the same share and synchronizes it when another share begins or `RELIABLE_MONITOR_FLUSH_COMMIT` closes the cycle.
+- Deferring `msync()` until the share is complete ensures that tracker metadata updates for all reported blocks are included.
+- Reports synchronization failures without blocking delivery of monitor events to downstream consumers.
+
 ### ReliableWaiter
 
 Role:
@@ -203,8 +222,8 @@ Build and run pattern:
 ### Advanced (`Examples/Advanced`)
 
 - Local tracking pipeline without RDMA.
-- Combines `ReliableTracker` + `ReliableIndexer` + `ReliableWaiter` on a `FastRing` loop.
-- Generates random block activity and prints monitor events.
+- Combines `ReliableTracker` + `ReliableFlusher` + `ReliableIndexer` + `ReliableWaiter` on a `FastRing` loop.
+- Generates random block activity on a file-backed pool (`test.dat`), prints monitor events and reports `ReliableFlusher` confirmation status on shutdown.
 - Requires FastRing: https://github.com/cyanide-burnout/FastRing
 
 ### RDMA (`Examples/RDMA`)

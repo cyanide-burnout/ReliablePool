@@ -21,6 +21,7 @@ OBJECTS := \
 	../../Tools/RedBlackTree.o \
 	../../Pool/ReliablePool.o \
 	../../Pool/ReliableTracker.o \
+	../../Pool/ReliableFlusher.o \
 	../../Pool/ReliableIndexer.o \
 	../../Pool/ReliableWaiter.o \
 	Test.o
