@@ -6,6 +6,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
 #include <sys/random.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
@@ -1524,6 +1525,22 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
   }
 }
 
+static void SoilReliableBlock(struct ReliableBlock* block, size_t size)
+{
+  uintptr_t cursor;
+  uintptr_t end;
+
+  cursor = (uintptr_t)block & ~(uintptr_t)(size - 1);
+  end    = (uintptr_t)block + sizeof(struct ReliableBlock) + block->length;
+
+  while (cursor < end)
+  {
+    // NIC writes arrived data by DMA bypassing PTE dirty tracking, touch every affected page to make msync() and writeback see the block
+    atomic_fetch_or_explicit((ATOMIC(uint8_t)*)cursor, 0, memory_order_relaxed);
+    cursor += size;
+  }
+}
+
 static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t identifier, int status)
 {
   struct InstantBlockData* entry;
@@ -1569,6 +1586,7 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
           // Assumption: valid CRC here means the block was updated by this RETRIEVE flow.
           // If another writer updates the same block concurrently, hint normalization can be wrong.
           atomic_fetch_add_explicit(&block->hint, peer->vector, memory_order_relaxed);
+          SoilReliableBlock(block, replicator->size);
           CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
           *number = UINT32_MAX;
           continue;
@@ -2428,6 +2446,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     replicator->closure        = closure;
     replicator->secret         = strdup(secret);
     replicator->name           = strdup(name);
+    replicator->size           = sysconf(_SC_PAGESIZE);
 
     if (identifier == NULL)  uuid_generate(replicator->identifier);
     else                     uuid_copy(replicator->identifier, identifier);

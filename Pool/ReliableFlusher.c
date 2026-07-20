@@ -1,4 +1,5 @@
 #include "ReliableFlusher.h"
+#include "ReliableTracker.h"
 
 #include <malloc.h>
 #include <sys/mman.h>

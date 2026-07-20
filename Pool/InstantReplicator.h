@@ -295,6 +295,7 @@ struct InstantReplicator
   struct rdma_cm_id* descriptor;
   struct rdma_event_channel* channel;
 
+  size_t size;
   uint32_t tick;
   pthread_t thread;
   pthread_mutex_t lock;

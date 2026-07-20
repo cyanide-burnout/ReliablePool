@@ -1,7 +1,7 @@
 #ifndef RELIABLEFLUSHER_H
 #define RELIABLEFLUSHER_H
 
-#include "ReliableTracker.h"
+#include "ReliablePool.h"
 
 #ifdef __cplusplus
 extern "C"
