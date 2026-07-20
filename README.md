@@ -198,6 +198,32 @@ Behavior:
 - Calls `RegisterRemoteInstantReplicator(...)` for discovered remote instances.
 - Restarts Avahi client on transient daemon/DBus failures using delayed retry.
 
+## Durability and Crash Consistency
+
+There is no WAL, so `msync()` does not make blocks atomically persistent. A flush cycle is the durability boundary: `FlushReliableTracker()` runs in an idempotent state and updates `control` CRC32C plus `mark`/`hint` for the consistent pool state observed by that cycle. CRC allows recovery to detect a block whose data and metadata were persisted inconsistently.
+
+Persistence behavior:
+
+- `ReliableFlusher` gives the lower bound: everything confirmed by a completed flush cycle survives a crash, provided it did not set `RELIABLE_FLUSHER_STATE_FAILURE`.
+- There is no upper bound: kernel background writeback persists dirty pages between cycles at arbitrary moments, so after a crash the file may additionally contain partial state of later, unconfirmed changes ("torn" blocks).
+- A `memfd`-backed pool has no filesystem writeback tearing. With **FDSTORE** it retains the exact in-memory state across a service restart, including an update interrupted by the dying process; it does not survive a host reboot at all.
+
+Torn blocks come in two kinds:
+
+- Data newer than metadata: the block looks stale to peers and replication re-fetches it — heals itself.
+- Metadata newer than data (or `mark` still carrying the in-flight low bit of an interrupted transfer): the block looks fresh while its data is stale — this kind must be handled explicitly.
+
+Healing is deliberately left to the application. Whether a pool is tracked and replicated is the application's choice, and `block->control` is maintained only under tracking, so no component can decide validity on its own. The right hook is `ReliableRecoveryFunction`: when an existing pool is opened with `RELIABLE_FLAG_RESET`, it runs once for every recoverable block before that block is published through `RELIABLE_MONITOR_BLOCK_RECOVER`. This keeps crash validation on the restart path instead of adding runtime cost.
+
+Recipe for a tracked (and optionally replicated) pool, inside the recovery callback:
+
+- Keep the block as is when `mark & 1` is clear and `GetCRC32C(block->data, block->length, 0)` equals `block->control`.
+- Otherwise pick one of two outcomes:
+  - return `RELIABLE_TYPE_FREE` — discard the block when the data model does not tolerate partial writes;
+  - keep the allocation but zero `mark` and `hint` — the block is declared stale, and startup synchronization can re-fetch it from a peer with a newer valid copy.
+
+Torn blocks cannot poison other nodes either way: receivers validate CRC on every arrival and reject mismatching transfers.
+
 ## Examples
 
 All examples are self-contained and have their own `Makefile`.

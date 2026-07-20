@@ -1525,18 +1525,19 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
   }
 }
 
-static void SoilReliableBlock(struct ReliableBlock* block, size_t size)
+static void TouchReliableBlock(struct ReliableBlock* block, size_t size)
 {
   uintptr_t cursor;
-  uintptr_t end;
+  uintptr_t limit;
 
   cursor = (uintptr_t)block & ~(uintptr_t)(size - 1);
-  end    = (uintptr_t)block + sizeof(struct ReliableBlock) + block->length;
+  limit  = (uintptr_t)block + sizeof(struct ReliableBlock) + block->length;
 
-  while (cursor < end)
+  while (cursor < limit)
   {
     // NIC writes arrived data by DMA bypassing PTE dirty tracking, touch every affected page to make msync() and writeback see the block
-    atomic_fetch_or_explicit((ATOMIC(uint8_t)*)cursor, 0, memory_order_relaxed);
+    // Volatile makes the value-preserving RMW an observable access, the compiler is not allowed to elide it
+    atomic_fetch_or_explicit((volatile ATOMIC(uint8_t)*)cursor, 0, memory_order_relaxed);
     cursor += size;
   }
 }
@@ -1586,7 +1587,7 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
           // Assumption: valid CRC here means the block was updated by this RETRIEVE flow.
           // If another writer updates the same block concurrently, hint normalization can be wrong.
           atomic_fetch_add_explicit(&block->hint, peer->vector, memory_order_relaxed);
-          SoilReliableBlock(block, replicator->size);
+          TouchReliableBlock(block, replicator->size);
           CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
           *number = UINT32_MAX;
           continue;
