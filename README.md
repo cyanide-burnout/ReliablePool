@@ -224,6 +224,28 @@ Recipe for a tracked (and optionally replicated) pool, inside the recovery callb
 
 Torn blocks cannot poison other nodes either way: receivers validate CRC on every arrival and reject mismatching transfers.
 
+## Replication Model Boundaries
+
+`InstantReplicator` is a consensus-free monotonic version-selection replication with per-block granularity. Its guarantees end at well-defined boundaries; they are design choices, not defects.
+
+Trust boundary:
+
+- The HMAC handshake authenticates a peer at connect time, but the handshake blob is static: the nonce and the digest are generated once per replicator instance and resent on every connect — there is no challenge/response and no replay cache. A captured blob is sufficient to authenticate as that peer while the real peer is disconnected.
+- After the handshake the data plane is raw RC verbs, and every authenticated peer holds RDMA write access to entire shares.
+- The effective trust boundary is therefore the fabric itself: the protocol is intended for a closed RDMA fabric (a single network segment) where the ability to capture or inject traffic already implies full compromise.
+
+Convergence boundary:
+
+- Version selection is monotone per block: a node never accepts a version older than the one it committed to. Delivery of the selected version is a separate matter — see the next point.
+- The offered version is recorded before the transfer completes; when the transfer is abandoned (peer death, disconnect), the block lock is rolled back but the recorded version is not, so re-offers of the same and older versions are pruned until the block changes again anywhere. This is an accepted tradeoff, not a fundamental limit: local bookkeeping could allow retrying an equal version after a failure, at the cost of extra state in the selector invariant.
+- At runtime the application-visible signal is `RELIABLE_MONITOR_BLOCK_DAMAGE` (transfer validation retries exhausted); a fetch abandoned by disconnect is silent and heals with the next change. Across restarts, stale-data decisions belong to the recovery callback.
+
+Clocks:
+
+- Cross-node version comparison relies on a one-way CLOCK exchange driven by the periodic 200 ms timer; there is no RTT correction, so the measured vector includes transport and queueing jitter.
+- The ideal clock-offset component of the normalization telescopes across relay chains, but the one-way measurement error does not: it accumulates per hop, so the same version delivered via different routes carries different jitter. Comparisons between versions authored by different nodes additionally see the static clock offset doubled rather than cancelled. Epoch quantization (16.7 ms) keeps NTP-grade offsets and typical jitter below the noise floor; larger offsets skew cross-author freshness decisions until the clocks are fixed.
+- After a backward wall-clock step, the epoch counter keeps ratcheting forward with flush activity, so normalization of that node's versions stays skewed until its wall clock overtakes the counter — a window at least as long as the step, extended by the minting rate.
+
 ## Examples
 
 All examples are self-contained and have their own `Makefile`.
