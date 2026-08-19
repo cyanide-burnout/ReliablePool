@@ -1,17 +1,21 @@
 MODULE := ReliablePool.so
 
 DIRECTORIES = \
-	../Pool
+	../Pool \
+	../Tools
 
 LIBRARIES := \
 	pthread
 
 DEPENDENCIES = \
 	uuid \
-	lua5.1
+	lua5.1 \
+	libsystemd
 
 OBJECTS = \
 	../Pool/ReliablePool.o \
+	../Pool/ReliableTracker.o \
+	../Tools/CRC32C.o \
 	Module.o
 
 ARCHITECTURE ?= $(shell $(CC) -dumpmachine | grep -o -E '^[^-]+')

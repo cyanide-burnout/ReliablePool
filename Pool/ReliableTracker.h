@@ -81,6 +81,10 @@ int UnlockReliableShare(struct ReliableShare* share);
 
 int64_t GetReliableTrackerClockVector(struct timespec* remote);
 
+// Following functions are various helpers
+
+int VerifyReliableBlockIntegrity(const struct ReliableBlock* block);
+
 #ifdef __cplusplus
 }
 #endif

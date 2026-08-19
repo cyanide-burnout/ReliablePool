@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "ReliablePool.h"
+#include "ReliableTracker.h"
 
 struct RecoveryContext
 {
@@ -202,6 +203,18 @@ static int ReleaseBlock(lua_State* state)
   return 0;
 }
 
+static int VerifyBlock(lua_State* state)
+{
+  struct ReliableDescriptor* descriptor;
+  int result;
+
+  descriptor = GetDescriptor(state);
+  result     = VerifyReliableBlockIntegrity(descriptor->block);
+
+  lua_pushboolean(state, result);
+  return 1;
+}
+
 static int GetBlockIndex(lua_State* state)
 {
   struct ReliableDescriptor* descriptor;
@@ -212,11 +225,8 @@ static int GetBlockIndex(lua_State* state)
   descriptor = GetDescriptor(state);
   key        = luaL_checkstring(state, 2);
 
-  if (strcmp(key, "release") == 0)
-  {
-    lua_pushcfunction(state, ReleaseBlock);
-    return 1;
-  }
+  if (strcmp(key, "release") == 0)  {  lua_pushcfunction(state, ReleaseBlock);  return 1;  }
+  if (strcmp(key, "verify")  == 0)  {  lua_pushcfunction(state, VerifyBlock);   return 1;  }
 
   block = descriptor->block;
 

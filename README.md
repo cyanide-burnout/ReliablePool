@@ -79,6 +79,7 @@ Main API:
 - `FlushReliableTracker(tracker)` (must be called in idempotent/safe state)
 - `LockReliableShare(share)` / `UnlockReliableShare(share)`
 - `GetReliableTrackerClockVector(remote_timespec)`
+- `VerifyReliableBlockIntegrity(block)` — returns non-zero when the block is neither `NULL` nor free and its data matches the CRC32C stored by the tracker in `block->control`; intended for validation in application and recovery code
 
 Tracker-specific events:
 
@@ -217,7 +218,7 @@ Healing is deliberately left to the application. Whether a pool is tracked and r
 
 Recipe for a tracked (and optionally replicated) pool, inside the recovery callback:
 
-- Keep the block as is when `mark & 1` is clear and `GetCRC32C(block->data, block->length, 0)` equals `block->control`.
+- Keep the block as is when `mark & 1` is clear and `VerifyReliableBlockIntegrity(block)` returns non-zero.
 - Otherwise pick one of two outcomes:
   - return `RELIABLE_TYPE_FREE` — discard the block when the data model does not tolerate partial writes;
   - keep the allocation but zero `mark` and `hint` — the block is declared stale, and startup synchronization can re-fetch it from a peer with a newer valid copy.
@@ -314,6 +315,7 @@ Lua API:
 - `result = pool:update()`
 - `pool:close()`
 - `block:release([type])`
+- `valid = block:verify()`
 
 Open semantics:
 
@@ -325,6 +327,7 @@ Open semantics:
 Recover callback:
 
 - Signature: `recover(block)`.
+- Use `block:verify()` to check the CRC32C previously stored by `ReliableTracker` before keeping a recovered block.
 - Return value is ignored.
 - C callback always returns `RELIABLE_TYPE_RECOVERABLE`.
 - Callback errors are swallowed (do not abort `open`).

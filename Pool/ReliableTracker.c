@@ -675,3 +675,11 @@ int64_t GetReliableTrackerClockVector(struct timespec* remote)
     (int64_t)(((uint64_t)remote->tv_sec * 1000000000ULL + (uint64_t)remote->tv_nsec) & ~0xffffffULL) -
     (int64_t)(((uint64_t)time.tv_sec    * 1000000000ULL + (uint64_t)time.tv_nsec)    & ~0xffffffULL);
 }
+
+int VerifyReliableBlockIntegrity(const struct ReliableBlock* block)
+{
+  return
+    (block != NULL) &&
+    (block->type != RELIABLE_TYPE_FREE) &&
+    (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed));
+}
