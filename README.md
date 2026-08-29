@@ -243,6 +243,16 @@ Convergence boundary:
 
 Clocks:
 
+- A deployment using `InstantReplicator` should provide every node with a stable,
+  well-synchronized `CLOCK_REALTIME`. PTP is preferred; NTP is suitable only when
+  its worst-case offset and jitter stay comfortably below the 16.7 ms epoch
+  quantum. Bring the clocks into agreement before starting the replicators and
+  avoid backward wall-clock steps while they are running.
+- For KVM guests, synchronize the physical hosts and carry each host clock into its
+  guests through the `ptp_kvm` PHC (commonly `/dev/ptp0`), using `chronyd` or
+  `phc2sys` to discipline the guest `CLOCK_REALTIME`. `kvm-clock` by itself is a
+  clocksource, not wall-clock synchronization. Guests on different physical hosts
+  remain only as well synchronized as those hosts are.
 - Cross-node version comparison relies on a one-way CLOCK exchange driven by the periodic 200 ms timer; there is no RTT correction, so the measured vector includes transport and queueing jitter.
 - The ideal clock-offset component of the normalization telescopes across relay chains, but the one-way measurement error does not: it accumulates per hop, so the same version delivered via different routes carries different jitter. Comparisons between versions authored by different nodes additionally see the static clock offset doubled rather than cancelled. Epoch quantization (16.7 ms) keeps NTP-grade offsets and typical jitter below the noise floor; larger offsets skew cross-author freshness decisions until the clocks are fixed.
 - After a backward wall-clock step, the epoch counter keeps ratcheting forward with flush activity, so normalization of that node's versions stays skewed until its wall clock overtakes the counter — a window at least as long as the step, extended by the minting rate.
