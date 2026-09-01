@@ -4,17 +4,26 @@ ReliablePool was introduced in **2022** as part of the **BrandMeister** and **Te
 
 ## Background
 
-ReliablePool started as an internal building block to support high-reliability, high-throughput components in BrandMeister and TetraPack. Over time it evolved into a standalone subsystem with its own API and supporting components (such as tracking/monitoring and event integration).
+ReliablePool started as an internal building block inside BrandMeister and TetraPack and
+remains actively used by both projects. The standalone repository tracks the same
+implementation used there rather than a detached experimental fork. Over time it evolved
+into a standalone subsystem with its own API and supporting components such as tracking,
+monitoring and event integration.
 
 ## What it is
 
-ReliablePool is a memory/pool subsystem designed around long-lived, stable memory mappings ("shares") and predictable ownership semantics. It is intended for systems that need:
+ReliablePool is not a conventional memory allocator. It is a persistent shared-memory
+object model built around stable mappings, explicit ownership, restart recovery, change
+tracking and replication. It is intended for systems that need:
 
 - stable addresses over time (even as the pool grows),
 - explicit lifetime management and controlled ownership,
 - integration points for replication/monitoring and idempotent processing,
 - capability to recover data on restart (through using `memfd` or an opened file as backends and systemd's **FDSTORE** feature),
 - capability for inter-process sharing.
+
+FastRing provides asynchronous event integration for ReliablePool through
+`ReliableWaiter` and `InstantWaiter`.
 
 ## Related Components
 
