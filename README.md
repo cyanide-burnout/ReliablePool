@@ -31,6 +31,7 @@ ReliablePool is commonly used together with:
 
 - **Reliable components**: `ReliableMonitor`, `ReliableIndexer`, `ReliableTracker`, `ReliableWaiter`
 - **Instant components**: `InstantReplicator`, `InstantWaiter`, `InstantDiscovery`
+- **Restart tools**: `Rescue`, `Collapse` (in `Tools/`)
 
 ## Reliable Components
 
@@ -233,6 +234,57 @@ Recipe for a tracked (and optionally replicated) pool, inside the recovery callb
   - keep the allocation but zero `mark` and `hint` — the block is declared stale, and startup synchronization can re-fetch it from a peer with a newer valid copy.
 
 Torn blocks cannot poison other nodes either way: receivers validate CRC on every arrival and reject mismatching transfers.
+
+## Restart Recovery Tools
+
+A `memfd`-backed pool survives a service restart only while its descriptor is kept by systemd in the unit's fd store. Two helpers in `Tools/` cover this.
+
+### Rescue
+
+`Rescue` owns the fd store of the process:
+
+- at startup (a constructor, when running under systemd with `NOTIFY_SOCKET`) it takes over `LISTEN_FDS` / `LISTEN_FDNAMES`, relocates the descriptors above `FD_SETSIZE` and indexes them by name;
+- `GetRescuedHandle(name)` returns a descriptor restored from the previous run, or `-1`;
+- `AddRescuedHandle(handle, name)` puts a descriptor into the fd store (`FDSTORE=1`, `FDNAME=name`);
+- `RemoveRescuedHandle(handle, RESCUE_REMOVE_CLOSE)` removes it from the fd store (`FDSTOREREMOVE=1`);
+- `CloseUnusedRescuedHandleList()` closes and removes restored descriptors that nobody claimed.
+
+Names must not contain `:` or control characters. A name without `%` is stored by pointer, not copied.
+
+### Collapse
+
+On `SIGTERM` the service has to decide whether to keep its state (and not tear down connections) or to perform a regular destructive stop. systemd does not tell this to the service ([systemd#43880](https://github.com/systemd/systemd/issues/43880)), so `Collapse` asks PID 1 (`ListJobs` over sd-bus) why the unit is being stopped:
+
+- `GetCollapseCause()` returns a bit field of `COLLAPSE_RESTART` (restart job of the unit itself), `COLLAPSE_KEXEC`, `COLLAPSE_SOFT_REBOOT`, `COLLAPSE_REBOOT`, `COLLAPSE_POWEROFF`, `COLLAPSE_HALT`, or a negative errno;
+- `IsLiveUpdateAvailable()` reports whether LUO (Live Update Orchestrator) is active in the running kernel, by checking only that `/dev/liveupdate` exists;
+- `CanSurvive()` returns `1` when the state survives (unit restart, soft-reboot, kexec with LUO), `0` when it does not, or a negative errno — treat an error as "does not survive".
+
+```c
+int cause = CanSurvive();
+
+if (cause > 0)
+  /* keep connections, leave descriptors in the fd store */;
+else
+  /* regular stop, RemoveRescuedHandle(..., RESCUE_REMOVE_CLOSE) */;
+```
+
+Unit requirements (systemd 254 or newer):
+
+```ini
+[Unit]
+After=dbus.service
+
+[Service]
+Type=notify
+FileDescriptorStoreMax=4096
+FileDescriptorStorePreserve=yes
+```
+
+`After=dbus.service` makes the service stop before dbus-daemon, so the query still works during shutdown. `FileDescriptorStorePreserve=yes` keeps the fd store across `stop` + `start` and `soft-reboot`.
+
+The fd store survives kexec only through LUO, which requires systemd 262 or newer, both kernels built with `CONFIG_KEXEC_HANDOVER`, `CONFIG_LIVEUPDATE` and `CONFIG_LIVEUPDATE_MEMFD` (disabled in stock Debian kernels), `liveupdate=on` on the kernel command line, and the new kernel loaded with `kexec -s` (`kexec_file_load`). `IsLiveUpdateAvailable()` sees only the running kernel.
+
+`GetCollapseCause()` was verified on systemd 257 and 262 in arm64 and x86 virtual machines for restart, stop, kill, soft-reboot, kexec, reboot, halt, poweroff and forced reboot, and for restart, stop and kill on x86 bare metal; memfd survival across kexec was verified with a LUO kernel on systemd 262. `IsLiveUpdateAvailable()` and `CanSurvive()` were added after these runs.
 
 ## Replication Model Boundaries
 
