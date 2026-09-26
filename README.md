@@ -31,7 +31,7 @@ ReliablePool is commonly used together with:
 
 - **Reliable components**: `ReliableMonitor`, `ReliableIndexer`, `ReliableTracker`, `ReliableWaiter`
 - **Instant components**: `InstantReplicator`, `InstantWaiter`, `InstantDiscovery`
-- **Restart tools**: `Rescue`, `Collapse` (in `Tools/`)
+- **Restart tools**: `Rescue`, `Collapse`, `Epoch` (in `Tools/`)
 
 ## Reliable Components
 
@@ -237,7 +237,7 @@ Torn blocks cannot poison other nodes either way: receivers validate CRC on ever
 
 ## Restart Recovery Tools
 
-A `memfd`-backed pool survives a service restart only while its descriptor is kept by systemd in the unit's fd store. Two helpers in `Tools/` cover this.
+A `memfd`-backed pool survives a service restart only while its descriptor is kept by systemd in the unit's fd store. Three helpers in `Tools/` cover this.
 
 ### Rescue
 
@@ -285,6 +285,35 @@ FileDescriptorStorePreserve=yes
 The fd store survives kexec only through LUO, which requires systemd 262 or newer, both kernels built with `CONFIG_KEXEC_HANDOVER`, `CONFIG_LIVEUPDATE` and `CONFIG_LIVEUPDATE_MEMFD` (disabled in stock Debian kernels), `liveupdate=on` on the kernel command line, and the new kernel loaded with `kexec -s` (`kexec_file_load`). `IsLiveUpdateAvailable()` sees only the running kernel.
 
 `GetCollapseCause()` was verified on systemd 257 and 262 in arm64 and x86 virtual machines for restart, stop, kill, soft-reboot, kexec, reboot, halt, poweroff and forced reboot, and for restart, stop and kill on x86 bare metal; memfd survival across kexec was verified with a LUO kernel on systemd 262. `IsLiveUpdateAvailable()` and `CanSurvive()` were added after these runs.
+
+### Epoch
+
+Blocks often keep `CLOCK_MONOTONIC` timestamps (last access, expiration). Within one boot they stay valid across restarts and soft-reboot, since the kernel and its clock are the same. After kexec the new kernel starts its own clock: whether it continues the old one depends on the platform and its clock source, and is not guaranteed. A recovered timestamp can then lie far in the future (the entry never expires) or in the past (everything expires at once).
+
+`Epoch` keeps a small record in a memfd named `Epoch`, held by `Rescue`: the boot identifier (`sd_id128_get_boot()`), `CLOCK_MONOTONIC` and `CLOCK_REALTIME` taken as a pair.
+
+- at startup (a constructor, after `Rescue`) it reads the record of the previous instance, computes the correction and immediately stores its own record;
+- at exit (a destructor) it stores the record again, which only narrows the error: any pair of the previous boot is enough;
+- within the same boot the correction is exactly zero; after a boot change it is `monotonic_now − (monotonic_saved + max(0, realtime_now − realtime_saved))`, so the downtime is measured by `CLOCK_REALTIME` and a clock step backwards counts as zero;
+- `GetEpochState()` returns `EPOCH_SAME_BOOT`, `EPOCH_NEW_BOOT`, `EPOCH_UNKNOWN` (no previous record) or a negative errno (the correction stays zero then);
+- `FixEpochTime(time_t)`, `FixEpochCertainTime(struct timeval*)` and `FixEpochPreciseTime(struct timespec*)` apply the correction to a stored value. Zero means "not set" and is kept as is, a result before the start of the current boot is clamped to the smallest non-zero value, so unsigned fields do not wrap around.
+
+The correction has to be applied inside the recovery function, before a recovered timestamp is indexed or compared:
+
+```c
+static int RecoverSession(struct ReliablePool* pool, struct ReliableBlock* block, void* closure)
+{
+  struct SessionData* data = (struct SessionData*)block->data;
+
+  FixEpochPreciseTime(&data->time);
+  data->expires = FixEpochTime(data->expires);
+
+  /* index the block */
+  return RELIABLE_TYPE_RECOVERABLE;
+}
+```
+
+The record of the new instance is stored before any pool is recovered, so a crash inside recovery never applies the correction twice; the price is that blocks left unrecovered by such a crash keep the old time base, and lifetime checks should bound them. The first start of a version that links `Epoch` sees no record and applies no correction.
 
 ## Replication Model Boundaries
 
