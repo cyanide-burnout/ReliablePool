@@ -617,6 +617,13 @@ static void TrackRemovalList(struct InstantReplicator* replicator)
   pthread_mutex_unlock(&replicator->lock);
 }
 
+static int CheckRemovalList(struct InstantReplicator* replicator)
+{
+  // The queue is ordered by expiration, it is enough to check the head
+  return (replicator->removals.head != NULL) &&
+         (replicator->tick > replicator->removals.head->expiration);
+}
+
 // Submissions
 
 static int SubmitSharedBuffer(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantSharedBuffer* buffer)
@@ -1703,17 +1710,28 @@ static void HandleCompletedWrite(struct InstantReplicator* replicator, struct In
   RemoveTask(replicator, task);
 }
 
-static void WaitForReadyState(struct InstantReplicator* replicator)
+static void SubmitReadyStateWait(struct InstantReplicator* replicator)
 {
   struct io_uring_sqe* submission;
 
-  if ((~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY) &&
-      (submission = io_uring_get_sqe(&replicator->ring)))
+  if (submission = io_uring_get_sqe(&replicator->ring))
   {
-    atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
     io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->state, INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
     io_uring_sqe_set_data64(submission, RING_TAG_READY_STATE);
   }
+}
+
+static void WaitForReadyState(struct InstantReplicator* replicator)
+{
+  uint32_t state;
+
+  state = atomic_load_explicit(&replicator->state, memory_order_relaxed);
+
+  // Only ExecuteTaskList raises LOCK (together with INSTANT_REPLICATOR_EVENT_FLUSH and a wake-up),
+  // a late completion after the barrier release must not raise it silently
+  if (( state & INSTANT_REPLICATOR_STATE_LOCK) &&
+      (~state & INSTANT_REPLICATOR_STATE_READY))
+    SubmitReadyStateWait(replicator);
 }
 
 static void ExecuteTaskList(struct InstantReplicator* replicator)
@@ -1731,6 +1749,12 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
   struct InstantTask* task;
   struct InstantTask* next;
   ExecuteInstantTaskFunction function;
+
+  if (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY)
+  {
+    // FreeReliableBlock must not interleave with FlushReliableTracker, so removals are applied under the barrier only
+    TrackRemovalList(replicator);
+  }
 
   do
   {
@@ -1752,17 +1776,20 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
   }
   while (condition != 0);
 
-  if ((replicator->schedule.count != 0) &&
+  if (((replicator->schedule.count != 0) || CheckRemovalList(replicator)) &&
       (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
   {
     atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
     CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_FLUSH, NULL, NULL, 0);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
-    WaitForReadyState(replicator);
+    // Armed unconditionally: when the application has already raised READY, the wait completes at once with -EAGAIN
+    // instead of leaving the application parked until an unrelated completion (up to GENERIC_POLL_TIMEOUT)
+    SubmitReadyStateWait(replicator);
   }
 
   if ((replicator->schedule.count == 0) &&
+      (CheckRemovalList(replicator) == 0) &&
       (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
   {
     atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
@@ -2384,7 +2411,6 @@ static void* DoWork(void* closure)
           replicator->tick ++;
           TrackPeerList(replicator);
           TrackCookieList(replicator);
-          TrackRemovalList(replicator);
           CreateClockingTask(replicator, NULL);
           break;
 
@@ -2583,19 +2609,22 @@ int FlushInstantReplicator(struct InstantReplicator* replicator)
   {
     state = atomic_load_explicit(&replicator->state, memory_order_acquire);
 
+    // READY must be raised only while LOCK is still held, otherwise a stale READY survives the barrier release
+    while ((state & INSTANT_REPLICATOR_STATE_LOCK) &&
+           !atomic_compare_exchange_weak_explicit(&replicator->state, &state, state | INSTANT_REPLICATOR_STATE_READY, memory_order_acq_rel, memory_order_acquire));
+
     if (state & INSTANT_REPLICATOR_STATE_LOCK)
     {
-      atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_READY, memory_order_release);
-
       while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
              (errno == EINTR));
 
       state = INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY;
 
-      while ((atomic_load_explicit(&replicator->state, memory_order_relaxed) == state) &&
-             (syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, state, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
-             ((errno == EINTR) ||
-              (errno == EAGAIN)));
+      while (atomic_load_explicit(&replicator->state, memory_order_acquire) == state)
+      {
+        // Any wake-up is rechecked against the state, only the barrier release lets the caller go
+        syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, state, NULL, NULL, FUTEX_BITSET_MATCH_ANY);
+      }
 
       state = atomic_load_explicit(&replicator->state, memory_order_relaxed);
     }
