@@ -153,15 +153,46 @@ static int CheckFill(const uint8_t* data, size_t length, uint32_t seed)
   return 0;
 }
 
+#define PAYLOAD_VALID      0
+#define PAYLOAD_SHORT      1
+#define PAYLOAD_MAGIC_BAD  2
+#define PAYLOAD_LENGTH     3
+#define PAYLOAD_CONTROL    4
+#define PAYLOAD_FILL       5
+
+static const char* PayloadReasons[] = { "valid", "short", "magic", "length", "control", "fill" };
+
 static int CheckPayload(const struct Payload* payload, uint32_t length)
 {
-  if ((length < sizeof(struct Payload)) ||
-      (payload->magic  != PAYLOAD_MAGIC) ||
-      (payload->length != length) ||
-      (payload->control != GetCRC32C((const uint8_t*)payload + sizeof(uint32_t), length - sizeof(uint32_t), 0)))
-    return -1;
+  if (length < sizeof(struct Payload))                                                                                return PAYLOAD_SHORT;
+  if (payload->magic != PAYLOAD_MAGIC)                                                                                return PAYLOAD_MAGIC_BAD;
+  if (payload->length != length)                                                                                      return PAYLOAD_LENGTH;
+  if (payload->control != GetCRC32C((const uint8_t*)payload + sizeof(uint32_t), length - sizeof(uint32_t), 0))  return PAYLOAD_CONTROL;
+  if (CheckFill(payload->fill, length - sizeof(struct Payload), payload->seed) != 0)                                  return PAYLOAD_FILL;
 
-  return CheckFill(payload->fill, length - sizeof(struct Payload), payload->seed);
+  return PAYLOAD_VALID;
+}
+
+static void ReportCorruption(struct Context* context, struct ReliableBlock* block, int reason)
+{
+  static int count = 0;
+
+  struct Payload* payload;
+  char buffer[40];
+  int consistent;
+
+  if (count ++ >= 20)
+    return;
+
+  // Whether the payload is self-consistent under its own length, i.e. only the block length disagrees
+  payload    = (struct Payload*)block->data;
+  consistent = (payload->length >= sizeof(struct Payload)) && (payload->length <= context->size) && (CheckPayload(payload, payload->length) == PAYLOAD_VALID);
+
+  uuid_unparse_lower(block->identifier, buffer);
+  printf("CORRUPT block %u (%s) reason=%s length=%u payload_length=%u sequence=%llu block_control=%s payload_consistent=%d\n",
+    block->number, buffer, (reason < 0) ? "oversize" : PayloadReasons[reason], block->length, payload->length, (unsigned long long)payload->sequence,
+    (block->length <= context->size) && (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)) ? "ok" : "bad",
+    consistent);
 }
 
 static void AddCounter(ATOMIC(uint64_t)* total, ATOMIC(uint64_t)* period)
@@ -221,15 +252,16 @@ static void HandleArrival(struct Context* context, struct ReliableBlock* block)
   struct Payload* payload;
   struct History* history;
   struct timespec time;
+  int reason;
 
   payload = (struct Payload*)block->data;
 
   AddCounter(&context->total.arrivals, &context->period.arrivals);
 
-  if ((block->length > context->size) ||
-      (CheckPayload(payload, block->length) != 0))
+  if ((reason = (block->length > context->size) ? -1 : CheckPayload(payload, block->length)) != PAYLOAD_VALID)
   {
     AddCounter(&context->total.corrupts, &context->period.corrupts);
+    ReportCorruption(context, block, reason);
     return;
   }
 

@@ -5,8 +5,9 @@ testbed and what the tests showed. It covers replication throughput, delivery la
 convergence of pool contents and behavior under peer failures.
 
 Testing date: 2026-10-08.
-Tested revision: `f5a94e2` plus the replication barrier fixes listed in
-[Defects Found and Fixed](#defects-found-and-fixed).
+Tested revisions: `d39b85d` (replication barrier fixes) for the load sweep, latency and failure
+scenarios; `eacacff` (session recovery fixes) for the [20 000 ops/s](#20-000-opss) results.
+The fixes are listed in [Defects Found and Fixed](#defects-found-and-fixed).
 
 ## Testbed
 
@@ -49,6 +50,7 @@ Each node:
 - verifies every `RELIABLE_MONITOR_BLOCK_ARRIVAL`: payload CRC and fill (`corrupts`), sequence
   regression against the last version seen for the same block (`stales`), equal sequence
   (`repeats`); counts `RELIABLE_MONITOR_BLOCK_DAMAGE` and `RELIABLE_MONITOR_BLOCK_REMOVAL`;
+  prints the failing check (magic, length, control, fill) of the first corrupt arrivals;
 - measures one-way delivery latency as arrival time minus the payload timestamp;
 - starts writing only after the first peer connects, so writes made before the connection
   (delivered later by the initial syncing) do not distort the latency;
@@ -81,7 +83,12 @@ The dumps of both nodes are compared per author:
 - every block that the author still holds must be present on the peer with the same identifier,
   length, CRC32C and sequence — otherwise it is reported as `missing` or `mismatch` (a defect);
 - blocks of an author that exist on the peer but not on the author are `zombies` — removals that
-  were lost while the nodes were disconnected. Without tombstones this is expected by design.
+  were lost while the nodes were disconnected. Without tombstones this is expected by design;
+- own blocks are the ones the author allocated itself; a block that carries the author's payload
+  but is held as a received copy on the author is `resurrected` — the author freed it and then
+  received it back from a peer (see [Known Issues](#known-issues)).
+
+Zombies and resurrected blocks are reported but do not fail the comparison.
 
 When both nodes stop writing at the same time and nothing was lost, the pool digests of the two
 nodes are identical.
@@ -105,8 +112,8 @@ Both nodes write simultaneously for 30 s with 30 % frees, then quiesce for 15 s.
 |---|---|---|---|---|---|---|
 | 1 000 ops/s | ≤ 256 B | ~23 800 | ~0.2 ms | ~1.2 ms | 14 / 12 ms | identical digests |
 | 5 000 ops/s | ≤ 256 B | ~116 000 | ~0.3 ms | ~3.2 ms | 13 / 12 ms | identical digests |
-| 10 000 ops/s | ≤ 256 B | ~231 000 | ~0.5 ms | ~24 ms | 79 / 393 ms | **1 block missing** |
-| 20 000 ops/s | ≤ 256 B | — | — | — | — | **fails**, see [Known Issues](#known-issues) |
+| 10 000 ops/s | ≤ 256 B | ~231 000 | ~0.5 ms | ~24 ms | 79 / 393 ms | live blocks identical, 1 resurrected block |
+| 20 000 ops/s | ≤ 256 B | — | — | — | — | hangs on `d39b85d`, see [20 000 ops/s](#20-000-opss) |
 | 2 000 ops/s | ≤ 4000 B | ~46 900 | ~0.4 ms | ~44 ms | 101 / 89 ms | identical digests |
 
 Additional 60 s runs on the same revision:
@@ -117,8 +124,25 @@ Additional 60 s runs on the same revision:
 | 2 000 ops/s | ≤ 256 B | 30 % | ~0.25 ms | ~2.9 ms | 27 ms | identical digests |
 | 2 000 ops/s | ≤ 256 B | 30 % | — | — | — | identical digests in 3 of 3 consecutive runs |
 
-In every run up to 5 000 ops/s per node: `corrupts = 0`, `stales = 0`, `damages = 0`,
+In every run up to 10 000 ops/s per node: `corrupts = 0`, `stales = 0`, `damages = 0`,
 no disconnects.
+
+### 20 000 ops/s
+
+On `d39b85d`, 4 of 6 runs at 20 000 ops/s per node hung both nodes: an `IBV_WC_REM_ACCESS_ERR`
+within the first seconds left the QP in the error state and the barrier raised forever
+(defects 5–7 below). The unpatched revision `f5a94e2` hangs at this rate as well.
+
+On `eacacff`, three runs of 20 s with 30 % frees:
+
+| Run | Disconnects | Exit status | Live blocks | Damages | Corrupts | Zombies | Resurrected |
+|---|---|---|---|---|---|---|---|
+| 1 | 0 | 0 / 0 | identical | 0 | 0 | 0 | 15 / 6 |
+| 2 | 4 | 2 / 2 | identical | 3 / 3 | 0 / 1 | 1 266 / 1 236 | 36 / 31 |
+| 3 | 0 | 0 / 0 | 1 stale version on node B | 0 | 0 | 0 | 13 / 8 |
+
+The remote access error still occurs; the session is now dropped and re-established and the
+application keeps running. Transfers that keep failing end in `RELIABLE_MONITOR_BLOCK_DAMAGE`.
 
 ### Latency
 
@@ -153,7 +177,7 @@ connection.
 |---|---|---|---|---|
 | `kill -9` of node B, restart after 5 s | CM `DISCONNECTED` | all present, no mismatches | 3 113 | passed |
 | 5 × `kill -9` / restart, 2 s down, 4 s up | CM `DISCONNECTED` each time | all present, no mismatches | 12 240 | passed |
-| `SIGSTOP` of node B for 15 s, then `SIGCONT` | not detected | replication stopped | — | **failed**, see below |
+| `SIGSTOP` of node B for 15 s, then `SIGCONT` | not detected | replication stopped | — | **failed** on `d39b85d`, not re-tested after the session recovery fixes |
 
 After a restart, the initial syncing task restores all live blocks of the surviving node on the
 restarted one. Blocks of the killed incarnation remain on the survivor as zombies: their owner is
@@ -163,41 +187,43 @@ gone and nobody sends removals for them.
 
 These issues were reproduced on the testbed and are open.
 
-1. **Fatal work completions are not handled.** `EnsureWorkOperationCode()` maps an error
-   completion to an ordinary opcode, so the buffer is released and nothing else happens.
-   An error such as `IBV_WC_RNR_RETRY_EXC_ERR` or `IBV_WC_REM_ACCESS_ERR` moves the QP to the
-   error state, every later work request is flushed, but the peer stays `CONNECTED`: there is no
-   disconnect, no reconnect and no resync until a process restarts. Asynchronous events
-   (`ibv_get_async_event()`) are not processed either.
-2. **A frozen peer breaks the pair.** While node B was stopped, its HCA kept acknowledging
-   messages until its shared receive queue (2 048 buffers) was drained. Node A then received
-   `RNR retry counter exceeded` after ~12 s, its QP went to the error state, and issue 1 left
-   it there. During the RNR retries the main thread of node A stalled for 9–12 s waiting for
-   shared buffers.
-3. **The application thread can block indefinitely.** `AllocateSharedBuffer(..., 1)` is called
+1. **Received copies are republished by the tracker.** At 20 000 ops/s the tracker of a node
+   publishes 260–750 received copies (`RELIABLE_TYPE_NON_RECOVERABLE`) per 20 s as local changes.
+   The copies have a valid payload and the mark of the sender, but their `control` no longer
+   matches the data: the data changed after the arrival had been validated. The cause is not
+   determined yet; the candidates are a concurrent transfer into the same block and an RDMA write
+   to a stale address after pool expansion.
+2. **Resurrected blocks on the author.** When issue 1 hits a block that its author has just freed,
+   the author receives the block back during the 10 s removal delay and keeps it forever, while
+   the peer applies the removal. 1–36 such blocks per run were observed.
+3. **Rare corrupt arrival after a reconnect.** At most one per run, only in runs with
+   disconnects: a zero-filled reserved block is accepted as an arrival.
+4. **Stale version without `RELIABLE_MONITOR_BLOCK_DAMAGE`.** In one run without disconnects one
+   block remained on the previous version on the peer. The transfer of the last version was
+   dropped by a path that does not retry.
+5. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** A remote access error occurs within the first
+   seconds while the pools are still growing. The session now recovers, but the cause is not
+   determined; the suspected cause is a mismatch between a block address and the memory region
+   key during pool expansion.
+6. **A frozen peer.** While node B was stopped, its HCA kept acknowledging messages until its
+   shared receive queue (2 048 buffers) was drained. Node A then received
+   `RNR retry counter exceeded` after ~12 s; during the RNR retries its main thread stalled for
+   9–12 s waiting for shared buffers. With defect 5 fixed the session is expected to be dropped
+   and re-established; this scenario has not been re-tested yet.
+7. **The application thread can block indefinitely.** `AllocateSharedBuffer(..., 1)` is called
    from the application thread (block change and release notifications). When all shared
    buffers are held by traffic towards a peer that no longer completes it, the application main
-   loop blocks forever and does not react to `SIGINT`. Node B hung this way right after
-   `SIGCONT`.
-4. **Tasks under the barrier wait without a timeout.** Reading tasks in `WAIT_DATA` keep the
-   LOCK/READY barrier raised until the data arrives. If the QP has died (issue 1), the data
-   never arrives, the barrier is never released and the application thread stays parked in
-   `FlushInstantReplicator()`.
-5. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** In 4 of 6 runs at 20 000 ops/s per node, a
-   remote access error occurred within the first 0.2–2.6 s, while the pools were still growing.
-   Combined with issues 1 and 4 this ends either in a permanent hang of both nodes or in
-   massive loss of later changes. The unpatched revision `f5a94e2` hangs at this rate as well.
-   The suspected cause is a mismatch between a block address and the memory region key during
-   pool expansion; this is not confirmed yet.
-6. **A block lost at 10 000 ops/s.** One live block of node A was missing on node B, without
-   disconnects or error counters. The cause is not determined yet.
-7. **Zombies after a peer restart** are expected: there are no tombstones, removals are sent
-   only to connected peers and the removal queue is not persistent
+   loop blocks and does not react to `SIGINT`. Node B hung this way right after `SIGCONT` on
+   `d39b85d`.
+8. **Tasks under the barrier wait without a timeout.** Tasks of a broken session are dropped now,
+   but a message lost without a QP error would still keep the LOCK/READY barrier raised.
+9. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
+   are sent only to connected peers and the removal queue is not persistent
    (see [Replication Model Boundaries](README.md#replication-model-boundaries)).
 
 ## Defects Found and Fixed
 
-The following defects were found by this test and are fixed in the tested revision.
+The following defects were found by this test: 1–4 are fixed in `d39b85d`, 5–7 in `eacacff`.
 
 1. **Removals raced the tracker flush.** `ApplyRemoval()` freed blocks on the replicator tick
    outside the LOCK/READY barrier. A concurrent `FlushReliableTracker()` could see the block as
@@ -219,6 +245,27 @@ The following defects were found by this test and are fixed in the tested revisi
    unconditionally on raise and completes at once. The maximum time the application thread spent
    parked dropped from 98 ms to 16–22 ms at 2 000 ops/s.
 
-Validation of the fixes: three consecutive runs at 2 000 ops/s per node with 30 % frees produced
+Validation of fixes 1–4: three consecutive runs at 2 000 ops/s per node with 30 % frees produced
 identical digests, no nil-UUID blocks and no hangs, while the unpatched revision produced a
 nil-UUID block in every run at 1 000 ops/s and above.
+
+5. **Fatal work completions were ignored.** `EnsureWorkOperationCode()` mapped an error completion
+   to an ordinary opcode. An error such as `IBV_WC_RNR_RETRY_EXC_ERR` or `IBV_WC_REM_ACCESS_ERR`
+   moved the QP to the error state and every later work request was flushed, but the peer stayed
+   `CONNECTED` until a process restart. Any completion error other than `IBV_WC_WR_FLUSH_ERR` now
+   disconnects the QP; the regular disconnect path reconnects and resyncs.
+6. **Tasks of a broken session kept the barrier raised.** On disconnect, tasks waiting for the
+   completion of work already posted were kept, but the QP was destroyed right after and the
+   completions never arrived. All tasks of the broken session are dropped now; queued work
+   completes its tasks with `IBV_WC_WR_FLUSH_ERR` first.
+7. **An abandoned exchange was accepted as an arrival.** The sender locks the block of the
+   receiver by compare-and-swap (`mark | 1`) and then writes the data. When the sender abandoned
+   the exchange after a successful compare-and-swap, the receiver saw a changed mark and validated
+   the old content: CRC32C of zero data equals the cleared `control` of a reserved block, so a
+   zero-filled block was delivered as an arrival, and an existing block stayed locked. An odd mark
+   is never accepted now: the lock is released and the transfer is retried up to
+   `READING_ATTEMPT_COUNT` times, then `RELIABLE_MONITOR_BLOCK_DAMAGE` is reported.
+
+Validation of fixes 5–7: no hangs in 7 runs at 20 000 ops/s per node (3 on `eacacff`, 4 with
+fixes 5 and 6 only) with up to 4 disconnects per run; corrupt arrivals dropped from 1–3 per run to
+at most one, only in runs with disconnects.
