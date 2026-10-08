@@ -212,9 +212,10 @@ int main(int count, char** arguments)
   Cleanup:
 
   ReleaseReliablePool(pool);
+  // The replicator thread uses the indexer until it is joined, so the replicator goes first
+  ReleaseInstantReplicator(replicator);
   ReleaseReliableTracker(tracker);
   ReleaseReliableIndexer(indexer);
-  ReleaseInstantReplicator(replicator);
   close(handle);
 
   return 0;
