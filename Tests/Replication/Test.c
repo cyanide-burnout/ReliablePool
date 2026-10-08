@@ -30,6 +30,7 @@
 #define PAYLOAD_MAGIC   0x52504c54
 #define HISTORY_LENGTH  (1 << 20)
 #define SAMPLE_LIMIT    (1 << 24)
+#define WRITE_BUDGET    500000  // Nanoseconds of writing per timer tick, keeps the loop responsive for flushes
 
 #define STATE_RUNNING   0
 #define STATE_QUIESCE   1
@@ -391,9 +392,10 @@ static void GenerateOperation(struct Context* context)
 static void HandleWriteTimeout(struct FastRingDescriptor* descriptor)
 {
   struct Context* context;
+  struct timespec current;
   struct timespec time;
   uint64_t target;
-  uint32_t limit;
+  uint32_t count;
 
   context = (struct Context*)descriptor->closure;
 
@@ -410,18 +412,24 @@ static void HandleWriteTimeout(struct FastRingDescriptor* descriptor)
   }
 
   target = (uint64_t)GetElapsedTime(&context->start, &time) * context->rate / 1000000000ULL;
-  limit  = 100000;
+  count  = 0;
 
-  while ((context->done < target) && (limit --))
+  while (context->done < target)
   {
     GenerateOperation(context);
     context->done ++;
-  }
 
-  if (context->done < target)
-  {
-    // Do not accumulate debt when the node cannot keep up
-    context->done = target;
+    if ((++ count & 63) == 0)
+    {
+      clock_gettime(CLOCK_MONOTONIC, &current);
+
+      if (GetElapsedTime(&time, &current) >= WRITE_BUDGET)
+      {
+        // Do not accumulate debt when the node cannot keep up
+        context->done = target;
+        break;
+      }
+    }
   }
 }
 

@@ -55,6 +55,9 @@ Each node:
 - measures one-way delivery latency as arrival time minus the payload timestamp;
 - starts writing only after the first peer connects, so writes made before the connection
   (delivered later by the initial syncing) do not distort the latency;
+- generates writes from a 1 ms timer with a budget of 0.5 ms per tick and drops the backlog when
+  it cannot keep up, so the main loop stays responsive for the tracker flushes and the replicator
+  barrier; above the capacity of the node the actual rate is therefore lower than `-r`;
 - after `-t` seconds stops writing, waits `-q` seconds (removals are applied 10 s after they are
   received, so the quiescence must be longer), prints the totals and an order-independent digest
   of the pool, and dumps every surviving block (`-o`);
@@ -158,6 +161,45 @@ With defect 8 fixed, seven runs of 20 s with 30 % frees, none of them with disco
 | `eacacff` with defect 8 fixed | ~0.85–0.92 ms | ~32–39 ms | 55–180 ms |
 
 At 5 000 ops/s the maximum dropped from 541 ms to 25–38 ms with p50 and p99 unchanged.
+
+### Peak Throughput
+
+Revision `c8b1ad7` with the write budget in the test tool, 20 s runs with 30 % frees and payloads
+up to 256 B. The time of the main thread was measured with debug wrappers around
+`FlushReliableTracker()` and `FlushInstantReplicator()` (not part of the tested revision).
+
+| Requested | Actual writes/s per node | Delivered versions/s per direction | One-way p50 | One-way p99 | Max (raw) |
+|---|---|---|---|---|---|
+| 20 000 ops/s | ~14 700 | ~14 700 | ~0.8 ms | ~14 ms | 47 ms |
+| 40 000 ops/s | ~21 000 | ~20 000 | ~6 ms | ~42 ms | 87 ms |
+| 80 000 ops/s | ~22 000–27 000 | ~18 000–22 000 | ~21 ms | ~80 ms | 0.15 s |
+| 160 000 ops/s | ~36 000–42 000 | ~17 000–19 000 | ~58 ms | ~150 ms | 0.24 s |
+| 40 000 ops/s, 65 536 slots | ~15 000–17 000 | ~15 000–16 500 | ~14 ms | ~100 ms | 0.18 s |
+
+Delivered versions are fewer than writes at high rates because a block rewritten during a
+transfer is delivered only in its latest version; the final pool contents still converge.
+
+Main thread of a node, share of wall time in a single one-second sample per run:
+
+| Requested | Tracker flush | Parked in the replicator barrier | Writing | Flushes per second |
+|---|---|---|---|---|
+| 20 000 ops/s | 15–21 % | 32–34 % | 29–32 % | ~1 700 |
+| 40 000 ops/s | 18–21 % | 35–43 % | 34–46 % | ~200 |
+| 80 000 ops/s | 14–20 % | 39–45 % | 38–40 % | ~50 |
+| 160 000 ops/s | 14–18 % | 33–40 % | 39–50 % | ~25 |
+
+The observed plateau of this testbed and test tool is about 20 000 delivered versions per second
+per direction with small payloads; beyond it the delivery stays flat and only the latency grows.
+In the samples the main thread spends 32–54 % of the wall time parked in the LOCK/READY barrier and
+11–21 % in tracker flushes. Parking is waiting, not CPU time, and what the barrier waits for (RDMA
+execution at the peer, completion processing, retries) has not been broken down yet, so these
+numbers do not show that the barrier can be shortened. The profile is one sample per run, not a
+statistic. With the earlier test tool, payloads up to 4 000 B reached about 13 MB/s per direction,
+far below the link capacity.
+
+With the earlier test tool, which caught up the whole backlog in one timer tick, the generator
+starved the flushes at 80 000 ops/s and above, flushes became rare and huge, and the delivered
+rate fell to 5 000 versions per second instead of reaching the plateau.
 
 ### Latency
 
