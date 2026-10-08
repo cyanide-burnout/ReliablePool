@@ -1586,9 +1586,27 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
       block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)*number);
       mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
 
+      if (mark == (entry->mark | 1ULL))
+      {
+        // Locked by CAS but not written, release the lock and retry
+        atomic_compare_exchange_strong_explicit(&block->mark, &mark, entry->mark, memory_order_relaxed, memory_order_relaxed);
+
+        if (task->transfer.attempt >= READING_ATTEMPT_COUNT)
+        {
+          CallReliableMonitor(RELIABLE_MONITOR_BLOCK_DAMAGE, pool, share, block);
+          *number = UINT32_MAX;
+          continue;
+        }
+
+        count ++;
+        continue;
+      }
+
       if (mark != entry->mark)
       {
-        if ((block->length <= memory->size - offsetof(struct ReliableBlock, data)) &&
+        // An odd mark is a lock, never valid data
+        if ((~mark & 1ULL) &&
+            (block->length <= (memory->size - offsetof(struct ReliableBlock, data))) &&
             (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)))
         {
           // Assumption: valid CRC here means the block was updated by this RETRIEVE flow.
@@ -1815,11 +1833,8 @@ static void ClearTaskList(struct InstantReplicator* replicator, struct InstantPe
         ResetReadingBlockList(replicator, task);
       }
 
-      if (task->state < INSTANT_TASK_STATE_WAIT_COMPLETION)
-      {
-        // Tasks in state INSTANT_TASK_STATE_WAIT_COMPLETION should be removed by HandleCompletedRead() / HandleCompletedWrite()
-        RemoveTask(replicator, task);
-      }
+      // Work posted to the destroyed QP never completes
+      RemoveTask(replicator, task);
     }
   }
 }
@@ -1982,6 +1997,35 @@ static int EnsureWorkOperationCode(struct InstantReplicator* replicator, struct 
   return -1;
 }
 
+static void DisconnectQueuePair(struct InstantReplicator* replicator, uint32_t number)
+{
+  struct InstantPeer* peer;
+  struct rdma_cm_id* descriptor;
+  struct ibv_qp* pair;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    if ((descriptor = peer->descriptor) &&
+        (pair       = descriptor->qp)   &&
+        (pair->qp_num == number))
+    {
+      // Found the connection that owns the failed QP
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+
+  if ((peer != NULL) &&
+      (peer->state == INSTANT_PEER_STATE_CONNECTED))
+  {
+    // Only a new connection recovers the QP in the error state
+    rdma_disconnect(descriptor);
+  }
+}
+
 static void HandleCompletionChannel(struct InstantReplicator* replicator, struct InstantCard* card, int result)
 {
   void* context;
@@ -2001,6 +2045,13 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
     {
       for (completion = completions; completion < (completions + result); ++ completion)
       {
+        if ((completion->status != IBV_WC_SUCCESS) &&
+            (completion->status != IBV_WC_WR_FLUSH_ERR))
+        {
+          // Flush errors are only the consequence of the first failure
+          DisconnectQueuePair(replicator, completion->qp_num);
+        }
+
         switch (EnsureWorkOperationCode(replicator, card, completion))
         {
           case IBV_WC_SEND:
@@ -2188,8 +2239,11 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
     {
       CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_DISCONNECTED, peer, NULL, reason);
 
-      ClearTaskList(replicator, peer);
+      // Refuse new work, queued work completes its tasks before ClearTaskList()
+      peer->state = INSTANT_PEER_STATE_DISCONNECTED;
+
       ClearRequestQueue(replicator, &peer->queue);
+      ClearTaskList(replicator, peer);
     }
 
     peer->state      = INSTANT_PEER_STATE_DISCONNECTED;
