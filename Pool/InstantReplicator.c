@@ -1327,6 +1327,9 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
   struct InstantSharedBuffer* buffer;
   struct InstantRequestItem* item;
   struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
   struct InstantPeer* peer;
   uint32_t number;
   uint32_t index;
@@ -1343,7 +1346,7 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
     return 0;
   }
 
-  if ((FindCookie(replicator, task->name) == NULL) ||
+  if (!(cookie = FindCookie(replicator, task->name)) ||
       (ReserveRequestItemList(replicator, task->transfer.count) < 0))
   {
     TransmitTaskComplete(replicator, task);
@@ -1351,6 +1354,7 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
   }
 
   buffer = task->transfer.buffer;
+  memory = cookie->share->memory;
   peer   = task->peer;
   item   = NULL;
 
@@ -1358,9 +1362,13 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
   {
     entry  = task->transfer.entries + index;
     number = FindReliableBlockNumber(replicator->indexer, task->name, entry->identifier);
+    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
 
-    if (number == UINT32_MAX)
+    if ((number == UINT32_MAX) ||
+        (block->length > (memory->size - offsetof(struct ReliableBlock, data))) ||
+        (GetCRC32C(block->data, block->length, 0) != atomic_load_explicit(&block->control, memory_order_relaxed)))
     {
+      // Missing or not flushed yet, the next flush offers the new version
       task->transfer.count --;
       memmove(entry, entry + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
       continue;
