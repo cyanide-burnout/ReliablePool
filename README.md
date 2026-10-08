@@ -168,6 +168,7 @@ Callback events (`HandleInstantEventFunction`):
 
 - `INSTANT_REPLICATOR_EVENT_FLUSH` - requests external flush/ready handshake.
   Contract: call `FlushInstantReplicator(replicator)` from another thread/event-loop context; do not block by calling it re-entrantly from the same replicator callback thread.
+  While the caller is parked in `FlushInstantReplicator()`, no other thread may modify pool objects: parking the event-loop thread alone does not protect against unrelated writers.
 - `INSTANT_REPLICATOR_EVENT_CONNECTED`
 - `INSTANT_REPLICATOR_EVENT_DISCONNECTED`
 - `INSTANT_REPLICATOR_EVENT_USER_MESSAGE`
@@ -346,6 +347,10 @@ Clocks:
 - Cross-node version comparison relies on a one-way CLOCK exchange driven by the periodic 200 ms timer; there is no RTT correction, so the measured vector includes transport and queueing jitter.
 - The ideal clock-offset component of the normalization telescopes across relay chains, but the one-way measurement error does not: it accumulates per hop, so the same version delivered via different routes carries different jitter. Comparisons between versions authored by different nodes additionally see the static clock offset doubled rather than cancelled. Epoch quantization (16.7 ms) keeps NTP-grade offsets and typical jitter below the noise floor; larger offsets skew cross-author freshness decisions until the clocks are fixed.
 - After a backward wall-clock step, the epoch counter keeps ratcheting forward with flush activity, so normalization of that node's versions stays skewed until its wall clock overtakes the counter — a window at least as long as the step, extended by the minting rate.
+
+Design and testing:
+
+- The design of the replication, its load testing on an InfiniBand testbed, the measured cost of the synchronous transfer and the open issues are described in [REPLICATION.md](REPLICATION.md); the test tool is `Tests/Replication`.
 
 ## Examples
 

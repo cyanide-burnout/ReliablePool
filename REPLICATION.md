@@ -1,14 +1,113 @@
-# InstantReplicator Load Testing
+# InstantReplicator Replication
 
-This document describes how `InstantReplicator` was load-tested on a two-node InfiniBand
-testbed and what the tests showed. It covers replication throughput, delivery latency,
-convergence of pool contents and behavior under peer failures.
+This document describes the replication concept implemented in `InstantReplicator` and how it
+behaves under load. It explains the design choices behind the protocol and backs them with
+measurements on a two-node InfiniBand testbed: replication throughput, delivery latency, the cost
+of the replicator barrier, convergence of pool contents and behavior under peer failures.
 
 Testing date: 2026-10-08.
 Tested revisions: `d39b85d` (replication barrier fixes) for the load sweep, latency and failure
 scenarios; `eacacff` (session recovery fixes) and `eacacff` with defect 8 fixed for the
 [20 000 ops/s](#20-000-opss) results.
 The fixes are listed in [Defects Found and Fixed](#defects-found-and-fixed).
+
+## Design Context
+
+### Transparent Replication of Object State
+
+`InstantReplicator` propagates the state of objects stored in a `ReliablePool`. Application code
+changes their memory through ordinary writes; `ReliableTracker` discovers the changes and the
+replication stack delivers versions to other nodes. The application does not have to construct an
+update message or explicitly commit each change to a replica. It still manages object lifetimes
+through the pool and integrates the tracker and replicator with its execution loop: transparency
+of change detection depends on honoring the flush and barrier contract.
+
+The unit of replication is a block identified within a named pool. Repeated writes to an object
+can be combined before delivery, so replication carries versions of state rather than a log of
+every application operation. Several blocks delivered in a batch do not form an atomic
+transaction or a consistent snapshot of the whole application.
+
+One possible use is connection context replication. While a client is served by node A, A is the
+main writer of that connection object and B holds a copy. If A disappears and the client moves to
+B, B can continue from the context it received and become the main writer of that object. Other
+connections can have the opposite arrangement at the same time. These are roles of individual
+objects in the application, not fixed primary and standby roles of entire nodes. The protocol
+does not elect or enforce an exclusive owner; client routing and the application determine which
+node actually modifies the object.
+
+### Freshness and Integrity
+
+The aim is to bring the latest version to all peers on a best-effort basis while protecting the
+integrity of a version accepted at the receiver. Freshness and integrity are separate concerns:
+an intact but older copy is possible, whereas a mixture of partially transferred versions must
+not be reported as a successful arrival. Validation failures and the implementation defects
+found during testing are discussed below; this is the intended contract, not a claim that every
+failure path has already been verified.
+
+Replication is asynchronous from the application's point of view: a local write is not an
+acknowledgment that any peer has received it. There is no consensus, quorum commit or globally
+agreed order of application writes. Per-block version metadata selects newer offers, with clock
+normalization between peers; it provides best-effort preference for newer state, not a guarantee
+that the last physical writer wins under arbitrary concurrent writes or clock skew.
+
+Peers can lag, intermediate versions can be skipped, and recent changes can be lost when their
+source fails. Reconnection provides an opportunity to synchronize live state, but does not imply
+unconditional eventual delivery: the current selector can suppress a repeated offer after an
+abandoned transfer. Removals also have no persistent tombstones. The precise convergence, clock
+and trust boundaries are documented in [Replication Model Boundaries](README.md#replication-model-boundaries).
+
+### Synchronous Transfer Within Asynchronous Replication
+
+A block is transferred by the sender: after the receiver asks for it, the sender locks the block of
+the receiver by compare-and-swap on `mark` and writes the data with RDMA, while the application of
+the sender is parked in the LOCK/READY barrier. The source cannot change during the transfer, and
+the receiver accepts a version only when it passes validation; data that fails validation can still
+land in the memory of the receiver. An asynchronous mode in which the receiver reads the sender with
+RDMA READ was the original plan (`INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE` is its remnant); it was
+dropped because a read races with the application of the sender, does not guarantee the integrity of
+the received data and produces extra retries and errors. The price of the synchronous transfer is
+that the receiver keeps its own barrier raised while it waits for the sender, so the parked time of
+one node includes the time the other node needs to reach its barrier.
+
+The transfer follows this sequence:
+
+1. A tracker flush identifies a changed block, updates its version and checksum metadata, and
+   the sender advertises it in a NOTIFY batch.
+2. The receiver selects an offered version and prepares its destination under its local barrier,
+   then requests the data with RETRIEVE.
+3. Once the sender's application reaches its own barrier, the sender checks the source against
+   its checksum, attempts the remote CAS, and writes the data for a successful exchange. A source
+   changed since the last tracker flush is skipped until the tracker publishes its updated state.
+4. The receiver checks the resulting mark, length and checksum before reporting an ARRIVAL.
+   Retryable validation failures are retried up to the configured limit and then reported as
+   DAMAGE. This does not make every interrupted transfer a retried or acknowledged operation.
+
+The barrier coordinates access to live pool memory with the application and tracker. It does not
+commit a version across nodes. A synchronous transfer here means participation and coordination
+of both endpoints during that exchange; the overall replication service remains asynchronous.
+The application must arrange that its writers respect these safe points. Parking the event-loop
+thread alone cannot protect against unrelated threads that continue modifying the same objects.
+
+### Reactive Batching and Its Cost
+
+Flushes are driven by the load of the main thread. A busy thread
+flushes less often, so each flush and each barrier carries a larger batch; an idle thread flushes
+often with small batches, which costs resources but keeps the latency low while the thread has
+capacity to spare. The batch size and the barrier rate therefore balance themselves against the
+application load without tuning.
+
+This cadence amortizes coordination over more work under load without adding a fixed collection
+delay when the application has spare capacity. It is not a bound on latency: a long application
+callback can delay a flush or the response to a barrier request. Because the receiver waits for
+the sender, application load on one node can extend the parking of another. Batching is regulated
+locally while transfer waiting couples the peers.
+
+The useful measurements are therefore the rate of delivered versions, their age on arrival,
+the cost of tracking changes, and the time taken away from the application's execution by the
+barrier. Fewer arrivals than writes can reflect useful coalescing. Final-state comparison checks
+whether the live versions reached the replicas in a particular run; throughput and arrival
+latencies alone cannot establish that. The measurements below separate these effects where the
+instrumentation allows it.
 
 ## Testbed
 
@@ -177,7 +276,11 @@ up to 256 B. The time of the main thread was measured with debug wrappers around
 | 40 000 ops/s, 65 536 slots | ~15 000–17 000 | ~15 000–16 500 | ~14 ms | ~100 ms | 0.18 s |
 
 Delivered versions are fewer than writes at high rates because a block rewritten during a
-transfer is delivered only in its latest version; the final pool contents still converge.
+transfer is delivered only in its latest version. The runs in this table used a profiling build. A
+repeated sweep on a clean build of the same revision with block dumps converged in all five runs:
+live blocks identical on both nodes (about 50 300 per node with 65 536 slots), no damages, corrupt,
+stale or resurrected blocks. Its latencies agree with the table, except a maximum of 2.2–2.4 s at
+160 000 ops/s.
 
 Main thread of a node, share of wall time in a single one-second sample per run:
 
@@ -191,15 +294,53 @@ Main thread of a node, share of wall time in a single one-second sample per run:
 The observed plateau of this testbed and test tool is about 20 000 delivered versions per second
 per direction with small payloads; beyond it the delivery stays flat and only the latency grows.
 In the samples the main thread spends 32–54 % of the wall time parked in the LOCK/READY barrier and
-11–21 % in tracker flushes. Parking is waiting, not CPU time, and what the barrier waits for (RDMA
-execution at the peer, completion processing, retries) has not been broken down yet, so these
-numbers do not show that the barrier can be shortened. The profile is one sample per run, not a
-statistic. With the earlier test tool, payloads up to 4 000 B reached about 13 MB/s per direction,
+11–21 % in tracker flushes. Parking is waiting, not CPU time; the profile is one sample per run, not
+a statistic. What the barrier waits for is broken down in [Barrier Breakdown](#barrier-breakdown). With the earlier test tool, payloads up to 4 000 B reached about 13 MB/s per direction,
 far below the link capacity.
 
 With the earlier test tool, which caught up the whole backlog in one timer tick, the generator
 starved the flushes at 80 000 ops/s and above, flushes became rare and huge, and the delivered
 rate fell to 5 000 versions per second instead of reaching the plateau.
+
+### Barrier Breakdown
+
+Every barrier of a run was timed with a debug build (not part of the tested revision), 20 s runs
+with 30 % frees and payloads up to 256 B, statistics over all barriers of a node.
+*Reaction* is the time from raising LOCK to READY, i.e. until the main thread of the node reaches
+`FlushInstantReplicator()`. *Held* is the time from READY to the release, i.e. how long the main
+thread stays parked.
+
+| Requested | Barriers/s | Tasks per barrier | Reaction p50 / p99 | Held p50 / p99 / max | Parked per delivered version |
+|---|---|---|---|---|---|
+| 5 000 ops/s | ~1 560 | 1.2 | 0.01 / 0.2–1.1 ms | 0.10 / 0.8–1.0 / 11–26 ms | ~64 µs |
+| 20 000 ops/s | ~750 | 2.2 | 0.05–0.06 / 1.1–1.8 ms | 0.35–0.37 / 4.7 / 37–41 ms | ~27 µs |
+| 40 000 ops/s | ~160 | 4.0 | 1.5–1.7 / 9–30 ms | 1.9 / 22–36 / 46–47 ms | ~24 µs |
+
+Share of the held time by what the pending tasks were waiting for:
+
+| Requested | Data from the peer (`WAIT_DATA`) | Own RDMA completions | Shared buffers | Other task processing |
+|---|---|---|---|---|
+| 5 000 ops/s | 67–75 % | 15–22 % | 0 % | 9–11 % |
+| 20 000 ops/s | 76–80 % | 7–9 % | 0 % | 11–17 % |
+| 40 000 ops/s | 79–83 % | 4–8 % | 0 % | 9–17 % |
+
+The reactive cadence is visible directly: with growing load the barrier rate drops tenfold, the
+batch per barrier grows, and the parked time per delivered version falls from ~64 to ~24 µs. This is
+the total parking of the main thread divided by the delivered versions, an efficiency measure, not
+the latency of an individual version.
+
+Most of the held time is the receiver waiting for the data of the peer, the expected cost of the
+synchronous transfer. At low and medium load the reaction of the sender is negligible and the held
+time stays in fractions of a millisecond; it consists of the transfer (compare-and-swap, then
+write) and the processing of requests and completions, which the breakdown above does not separate.
+At 40 000 ops/s the main thread of the sender is
+saturated, its reaction grows to 1.5 ms at the median, and the receiver stays parked for that time:
+the busyness of one node is paid by the main thread of the other. The self-balancing is local to a
+node, while the wait couples the two nodes. This explains part of the cost of the protocol and is
+consistent with the observed plateau of about 20 000 delivered versions per second, but the
+measurements do not prove that it is the final limit. It follows from choosing integrity over
+latency and is not a defect; within the synchronous model the lever that keeps the contract is a
+faster reaction of the application to `INSTANT_REPLICATOR_EVENT_FLUSH`.
 
 ### Latency
 
@@ -234,11 +375,12 @@ connection.
 |---|---|---|---|---|
 | `kill -9` of node B, restart after 5 s | CM `DISCONNECTED` | all present, no mismatches | 3 113 | passed |
 | 5 × `kill -9` / restart, 2 s down, 4 s up | CM `DISCONNECTED` each time | all present, no mismatches | 12 240 | passed |
-| `SIGSTOP` of node B for 15 s, then `SIGCONT` | not detected | replication stopped | — | **failed** on `d39b85d`, not re-tested after the session recovery fixes |
+| `SIGSTOP` of node B for 15 s, then `SIGCONT` | `RNR retry counter exceeded` after ~10 s, then reconnect after `SIGCONT` | all present, no mismatches | 18–50 (867–892 on node B) | passed on `ec029f4` (2 runs); failed on `d39b85d` |
 
 After a restart, the initial syncing task restores all live blocks of the surviving node on the
 restarted one. Blocks of the killed incarnation remain on the survivor as zombies: their owner is
-gone and nobody sends removals for them.
+gone and nobody sends removals for them. After a freeze, the removals sent while the peer was
+stopped are lost in the same way, mostly on the frozen node.
 
 ## Known Issues
 
@@ -246,25 +388,29 @@ These issues were reproduced on the testbed and are open.
 
 1. **Rare corrupt arrival after a reconnect.** At most one per run, only in runs with
    disconnects: a zero-filled reserved block is accepted as an arrival. Observed before defect 8
-   was fixed; runs with disconnects have not been repeated since.
-2. **Stale version without `RELIABLE_MONITOR_BLOCK_DAMAGE`.** In 2 of 10 runs at 20 000 ops/s
-   without disconnects 1–2 blocks remained on the previous version on the peer. The last versions
-   were written about 0.2 s before the writing stopped; their transfer was dropped by a path that
-   does not retry.
-3. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** A remote access error occurs within the first
-   seconds while the pools are still growing. The session now recovers, but the cause is not
-   determined; the suspected cause is a mismatch between a block address and the memory region
-   key during pool expansion.
-4. **A frozen peer.** While node B was stopped, its HCA kept acknowledging messages until its
-   shared receive queue (2 048 buffers) was drained. Node A then received
-   `RNR retry counter exceeded` after ~12 s; during the RNR retries its main thread stalled for
-   9–12 s waiting for shared buffers. With defect 5 fixed the session is expected to be dropped
-   and re-established; this scenario has not been re-tested yet.
+   was fixed; since then disconnects occurred only in the two freeze runs, which had no corrupt
+   arrivals. Not enough to call it fixed.
+2. **Stale version without `RELIABLE_MONITOR_BLOCK_DAMAGE`.** In 3 of 15 runs at 20 000 ops/s
+   without disconnects 1–2 blocks remained on the previous version on the peer; none in the runs
+   at other rates. The last versions were written shortly before the writing stopped; their
+   transfer was dropped by a path that does not retry.
+3. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** Before defect 8 was fixed, a remote access error
+   occurred within the first seconds in most runs at 20 000 ops/s and in every run with payloads
+   up to 4 000 B; the session recovers from it since defect 5. Since defect 8 was fixed it has not
+   occurred in 20 runs: 12 at 20 000 ops/s, 4 at 10 000 ops/s with payloads up to 4 000 B and 4 at
+   higher rates. The cause was not determined, so it is only likely, not
+   shown, that defect 8 was the trigger.
+4. **A frozen peer stalls the survivor.** While node B is stopped, its HCA keeps acknowledging
+   messages until its shared receive queue (2 048 buffers) is drained. Node A then waits for
+   `RNR retry counter exceeded` (about 10 s); during the RNR retries its main thread stalls for
+   8.5–8.9 s waiting for shared buffers (issue 5). Since defect 5 is fixed, the error drops the
+   session, node A continues and the pair reconnects after `SIGCONT`.
 5. **The application thread can block indefinitely.** `AllocateSharedBuffer(..., 1)` is called
    from the application thread (block change and release notifications). When all shared
    buffers are held by traffic towards a peer that no longer completes it, the application main
    loop blocks and does not react to `SIGINT`. Node B hung this way right after `SIGCONT` on
-   `d39b85d`.
+   `d39b85d`. Since the session recovery fixes the wait ends when the failed session is dropped,
+   but it still lasts as long as the RDMA retries (issue 4).
 6. **Tasks under the barrier wait without a timeout.** Tasks of a broken session are dropped now,
    but a message lost without a QP error would still keep the LOCK/READY barrier raised.
 7. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
