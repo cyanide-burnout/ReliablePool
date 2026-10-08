@@ -668,12 +668,18 @@ int UnlockReliableShare(struct ReliableShare* share)
 int64_t GetReliableTrackerClockVector(struct timespec* remote)
 {
   struct timespec time;
+  int64_t vector;
 
   clock_gettime(CLOCK_REALTIME, &time);
 
-  return
-    (int64_t)(((uint64_t)remote->tv_sec * 1000000000ULL + (uint64_t)remote->tv_nsec) & ~0xffffffULL) -
-    (int64_t)(((uint64_t)time.tv_sec    * 1000000000ULL + (uint64_t)time.tv_nsec)    & ~0xffffffULL);
+  vector =
+    (int64_t)((uint64_t)remote->tv_sec * 1000000000ULL + (uint64_t)remote->tv_nsec) -
+    (int64_t)((uint64_t)time.tv_sec    * 1000000000ULL + (uint64_t)time.tv_nsec);
+
+  // Round the whole difference to the epoch, a difference of truncated times flips by an epoch on every boundary between them
+  vector += (1 - 2 * (vector < 0)) * 0x800000LL;
+
+  return vector - vector % 0x1000000LL;
 }
 
 int VerifyReliableBlockIntegrity(const struct ReliableBlock* block)

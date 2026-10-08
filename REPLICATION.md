@@ -252,7 +252,7 @@ With defect 8 fixed, seven runs of 20 s with 30 % frees, none of them with disco
 | Result | Runs |
 |---|---|
 | Live blocks identical, no damages, corrupts or resurrected blocks | 6 of 7 |
-| 2 stale versions on node B, otherwise as above | 1 of 7 |
+| 2 stale versions on node B (defect 9, fixed since), otherwise as above | 1 of 7 |
 
 | | One-way p50 | One-way p99 | Max (raw) |
 |---|---|---|---|
@@ -390,37 +390,33 @@ These issues were reproduced on the testbed and are open.
    disconnects: a zero-filled reserved block is accepted as an arrival. Observed before defect 8
    was fixed; since then disconnects occurred only in the two freeze runs, which had no corrupt
    arrivals. Not enough to call it fixed.
-2. **Stale version without `RELIABLE_MONITOR_BLOCK_DAMAGE`.** In 3 of 15 runs at 20 000 ops/s
-   without disconnects 1–2 blocks remained on the previous version on the peer; none in the runs
-   at other rates. The last versions were written shortly before the writing stopped; their
-   transfer was dropped by a path that does not retry.
-3. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** Before defect 8 was fixed, a remote access error
+2. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** Before defect 8 was fixed, a remote access error
    occurred within the first seconds in most runs at 20 000 ops/s and in every run with payloads
    up to 4 000 B; the session recovers from it since defect 5. Since defect 8 was fixed it has not
    occurred in 20 runs: 12 at 20 000 ops/s, 4 at 10 000 ops/s with payloads up to 4 000 B and 4 at
    higher rates. The cause was not determined, so it is only likely, not
    shown, that defect 8 was the trigger.
-4. **A frozen peer stalls the survivor.** While node B is stopped, its HCA keeps acknowledging
+3. **A frozen peer stalls the survivor.** While node B is stopped, its HCA keeps acknowledging
    messages until its shared receive queue (2 048 buffers) is drained. Node A then waits for
    `RNR retry counter exceeded` (about 10 s); during the RNR retries its main thread stalls for
-   8.5–8.9 s waiting for shared buffers (issue 5). Since defect 5 is fixed, the error drops the
+   8.5–8.9 s waiting for shared buffers (issue 4). Since defect 5 is fixed, the error drops the
    session, node A continues and the pair reconnects after `SIGCONT`.
-5. **The application thread can block indefinitely.** `AllocateSharedBuffer(..., 1)` is called
+4. **The application thread can block indefinitely.** `AllocateSharedBuffer(..., 1)` is called
    from the application thread (block change and release notifications). When all shared
    buffers are held by traffic towards a peer that no longer completes it, the application main
    loop blocks and does not react to `SIGINT`. Node B hung this way right after `SIGCONT` on
    `d39b85d`. Since the session recovery fixes the wait ends when the failed session is dropped,
-   but it still lasts as long as the RDMA retries (issue 4).
-6. **Tasks under the barrier wait without a timeout.** Tasks of a broken session are dropped now,
+   but it still lasts as long as the RDMA retries (issue 3).
+5. **Tasks under the barrier wait without a timeout.** Tasks of a broken session are dropped now,
    but a message lost without a QP error would still keep the LOCK/READY barrier raised.
-7. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
+6. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
    (see [Replication Model Boundaries](README.md#replication-model-boundaries)).
 
 ## Defects Found and Fixed
 
 The following defects were found by this test: 1–4 are fixed in `d39b85d`, 5–7 in `eacacff`,
-8 after `eacacff`.
+8 and 9 after `eacacff`.
 
 1. **Removals raced the tracker flush.** `ApplyRemoval()` freed blocks on the replicator tick
    outside the LOCK/READY barrier. A concurrent `FlushReliableTracker()` could see the block as
@@ -479,3 +475,15 @@ at most one, only in runs with disconnects.
 Validation of fix 8: no resurrected blocks and no damages in 7 runs at 20 000 ops/s per node
 (1–36 resurrected blocks per run before); the maximum one-way latency dropped from seconds to
 55–180 ms with p50 and p99 unchanged.
+
+9. **The clock vector flipped by an epoch.** `GetReliableTrackerClockVector()` subtracted two
+   timestamps truncated to the epoch (16.7 ms). Whenever an epoch boundary fell between the send
+   time of the CLOCK message and its receipt, the vector became one epoch smaller, so with an
+   offset of 1–4 ms it toggled between 0 and −1 epoch every few measurements. When it changed
+   between two close versions of the same author, the newer version was normalized below the
+   stored hint of the older one, rejected as older and never offered again, leaving the peer on a
+   stale version without `RELIABLE_MONITOR_BLOCK_DAMAGE`. The vector is now the whole difference
+   rounded to the epoch.
+
+Validation of fix 9: no stale versions in 17 runs at 20 000 ops/s per node (3 of 15 runs before),
+the vector at connection was 0 in all of them.
