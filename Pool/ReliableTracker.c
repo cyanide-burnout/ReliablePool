@@ -37,13 +37,13 @@ static inline uint64_t MakeEpoch(struct ReliableTracker* tracker)
   result =
     (((uint64_t)time.tv_sec * 1000000000ULL + (uint64_t)time.tv_nsec) & ~0xffffffULL) |
     ((uint64_t)(tracker->node & UINT16_MAX) << 8) |
-    ((uint64_t)(atomic_fetch_add_explicit(&tracker->epoch, 2, memory_order_relaxed) & UINT8_MAX));
+    ((uint64_t)(atomic_fetch_add_explicit(&tracker->epoch, 4, memory_order_relaxed) & UINT8_MAX));
 
   do
   {
     if (result <= last)
     {
-      number  = (last + 2) & UINT8_MAX;
+      number  = (last + 4) & UINT8_MAX;
       result  = (last & ~UINT8_MAX) | number;
       result += (number == 0) * 0x1000000;
     }
@@ -260,8 +260,10 @@ static void HandleDirtyBlock(struct ReliableTracker* tracker, struct ReliableTra
   uint32_t control;
 
   if ((epoch != atomic_load_explicit(&block->mark, memory_order_acquire)) &&
+      (~atomic_load_explicit(&block->hint, memory_order_relaxed) & 1ULL)  &&
       (block->type != RELIABLE_TYPE_FREE))
   {
+    // A pending hint marks a damaged copy, it is published only after an install or RepairReliableBlock()
     control = GetCRC32C(block->data, block->length, 0);
 
     if (control != atomic_load_explicit(&block->control, memory_order_relaxed))

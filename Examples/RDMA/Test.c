@@ -163,7 +163,7 @@ int main(int count, char** arguments)
   monitor.function = HandleMonitorEvent;
 
   handle     = memfd_create("Test", MFD_CLOEXEC);
-  replicator = CreateInstantReplicator(0, NULL, "Test", "Secret", HandleReplicatorEvent, NULL, &monitor);
+  replicator = CreateInstantReplicator(0, NULL, "Test", "Secret", 0, 0, HandleReplicatorEvent, NULL, &monitor);
   indexer    = CreateReliableIndexer(&replicator->super);
   tracker    = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
   pool       = CreateReliablePool(handle, "Test", 50, 0, &tracker->super, NULL, NULL);

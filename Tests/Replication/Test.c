@@ -3,6 +3,7 @@
 #include <time.h>
 #include <netdb.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
@@ -28,6 +29,8 @@
 #define POOL_NAME       "Test"
 #define SERVICE_NAME    "Replication"
 #define PAYLOAD_MAGIC   0x52504c54
+#define MESSAGE_MAGIC   0x52504d53
+#define STREAM_COUNT    16
 #define HISTORY_LENGTH  (1 << 20)
 #define SAMPLE_LIMIT    (1 << 24)
 #define WRITE_BUDGET    500000  // Nanoseconds of writing per timer tick, keeps the loop responsive for flushes
@@ -48,10 +51,34 @@ struct Payload
   uint8_t fill[0];
 };
 
+struct Message
+{
+  uint32_t magic;        // MESSAGE_MAGIC
+  uint32_t reserved;     //
+  uint64_t incarnation;  // Random per process, a restarted author starts its sequence again
+  uint64_t sequence;     // Author-wide counter of transmitted user messages
+  uuid_t author;         // Identifier of the sending node
+};
+
+struct Stream
+{
+  uuid_t author;
+  uint64_t incarnation;
+  uint64_t sequence;     // Last received sequence
+  int broken;            // The connection to the author was broken since the last received message
+};
+
 struct History
 {
   uuid_t identifier;
   uint64_t sequence;
+};
+
+struct Released
+{
+  uint32_t count;
+  uint32_t length;
+  uuid_t* data;
 };
 
 struct Counters
@@ -66,6 +93,13 @@ struct Counters
   ATOMIC(uint64_t) repeats;
   ATOMIC(uint64_t) connects;
   ATOMIC(uint64_t) disconnects;
+  ATOMIC(uint64_t) messages;   // User messages transmitted
+  ATOMIC(uint64_t) refused;    // User messages refused by TransmitInstantReplicatorUserMessage()
+  ATOMIC(uint64_t) received;   // User messages received
+  ATOMIC(uint64_t) skipped;    // User messages missing before a connection to their author or across its disconnect
+  ATOMIC(uint64_t) lost;       // User messages missing within a connection
+  ATOMIC(uint64_t) disorders;  // User messages received out of order or malformed
+  ATOMIC(uint64_t) waited;     // Longest TransmitInstantReplicatorUserMessage() in nanoseconds
 };
 
 struct Samples
@@ -85,8 +119,12 @@ struct Context
   uint32_t ratio;
   uint32_t duration;
   uint32_t quiescence;
+  uint32_t messages;
   uint64_t sequence;
   uint64_t done;
+  uint64_t transmitted;
+  uint64_t posted;
+  uint64_t incarnation;
   int peers;
   struct timespec launch;
   struct timespec start;
@@ -95,10 +133,12 @@ struct Context
   struct InstantReplicator* replicator;
   struct ReliableDescriptor* descriptors;
   struct History* history;
+  struct Released released;
   struct Counters total;
   struct Counters period;
   struct Samples overall;
   struct Samples recent;
+  struct Stream streams[STREAM_COUNT];
 };
 
 static ATOMIC(int) signaled = { 0 };
@@ -200,6 +240,15 @@ static void AddCounter(ATOMIC(uint64_t)* total, ATOMIC(uint64_t)* period)
 {
   atomic_fetch_add_explicit(total,  1, memory_order_relaxed);
   atomic_fetch_add_explicit(period, 1, memory_order_relaxed);
+}
+
+static void RaiseCounter(ATOMIC(uint64_t)* counter, uint64_t value)
+{
+  uint64_t current;
+
+  current = atomic_load_explicit(counter, memory_order_relaxed);
+  while ((current < value) &&
+         !atomic_compare_exchange_weak_explicit(counter, &current, value, memory_order_relaxed, memory_order_relaxed));
 }
 
 static void AddSample(struct Samples* samples, int64_t value)
@@ -323,6 +372,78 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
   }
 }
 
+static void ReceiveMessage(struct Context* context, const struct Message* message, int length)
+{
+  struct Stream* stream;
+  uint32_t index;
+
+  if ((length         != sizeof(struct Message)) ||
+      (message->magic != MESSAGE_MAGIC))
+  {
+    AddCounter(&context->total.disorders, &context->period.disorders);
+    return;
+  }
+
+  for (index = 0; (index < STREAM_COUNT) && !uuid_is_null(context->streams[index].author) && (uuid_compare(context->streams[index].author, message->author) != 0); index ++);
+
+  if (index == STREAM_COUNT)
+  {
+    // More authors than the test expects
+    return;
+  }
+
+  stream = context->streams + index;
+
+  if (uuid_is_null(stream->author) ||
+      (stream->incarnation != message->incarnation))
+  {
+    // A new or restarted author, the stream may start after a gap: messages sent before the connection are not delivered
+    uuid_copy(stream->author, message->author);
+    stream->incarnation = message->incarnation;
+    stream->sequence    = 0;
+    stream->broken      = 1;
+  }
+
+  if (message->sequence <= stream->sequence)
+  {
+    // Messages are delivered in order within a connection, and a lost one is never sent again
+    AddCounter(&context->total.disorders, &context->period.disorders);
+    return;
+  }
+
+  if (stream->broken)
+  {
+    // Messages queued while the connection was down are lost with it
+    atomic_fetch_add_explicit(&context->total.skipped,  message->sequence - stream->sequence - 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&context->period.skipped, message->sequence - stream->sequence - 1, memory_order_relaxed);
+  }
+  else
+  {
+    // Within a connection every message must arrive
+    atomic_fetch_add_explicit(&context->total.lost,  message->sequence - stream->sequence - 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&context->period.lost, message->sequence - stream->sequence - 1, memory_order_relaxed);
+  }
+
+  AddCounter(&context->total.received, &context->period.received);
+
+  stream->sequence = message->sequence;
+  stream->broken   = 0;
+}
+
+static void BreakStream(struct Context* context, uuid_t author)
+{
+  uint32_t index;
+
+  for (index = 0; index < STREAM_COUNT; index ++)
+  {
+    if (uuid_compare(context->streams[index].author, author) == 0)
+    {
+      // Events and messages come from the replicator thread in order, the next message may follow a gap
+      context->streams[index].broken = 1;
+    }
+  }
+}
+
 static void HandleReplicatorEvent(int event, struct InstantPeer* peer, const char* data, int parameter, void* closure)
 {
   struct Context* context;
@@ -342,7 +463,30 @@ static void HandleReplicatorEvent(int event, struct InstantPeer* peer, const cha
       AddCounter(&context->total.disconnects, &context->period.disconnects);
       uuid_unparse_lower(peer->identifier, buffer);
       printf("DISCONNECTED %s\n", buffer);
+      BreakStream(context, peer->identifier);
       break;
+
+    case INSTANT_REPLICATOR_EVENT_USER_MESSAGE:
+      ReceiveMessage(context, (const struct Message*)data, parameter);
+      break;
+  }
+}
+
+static void AppendReleased(struct Released* released, uuid_t identifier)
+{
+  uuid_t* data;
+
+  if ((released->count == released->length) &&
+      (data = (uuid_t*)realloc(released->data, (released->length + 4096) * sizeof(uuid_t))))
+  {
+    released->data    = data;
+    released->length += 4096;
+  }
+
+  if (released->count < released->length)
+  {
+    // The dump lists released objects, so Compare.py can tell a confirmed removal from a lost object
+    uuid_copy(released->data[released->count ++], identifier);
   }
 }
 
@@ -360,6 +504,7 @@ static void GenerateOperation(struct Context* context)
   if ((descriptor->block != NULL) &&
       ((numbers[1] % 100) < context->ratio))
   {
+    AppendReleased(&context->released, descriptor->block->identifier);
     ReleaseReliableBlock(descriptor, RELIABLE_TYPE_FREE);
     AddCounter(&context->total.frees, &context->period.frees);
     return;
@@ -387,6 +532,50 @@ static void GenerateOperation(struct Context* context)
   descriptor->block->length = length;
 
   AddCounter(&context->total.writes, &context->period.writes);
+}
+
+static void TransmitMessages(struct Context* context, struct timespec* time, uint64_t target)
+{
+  struct Message message;
+  struct timespec before;
+  struct timespec after;
+  int result;
+
+  memset(&message, 0, sizeof(struct Message));
+
+  message.magic       = MESSAGE_MAGIC;
+  message.incarnation = context->incarnation;
+  uuid_copy(message.author, context->identifier);
+
+  while (context->transmitted < target)
+  {
+    // Sent from the application thread with wait, the way an application relies on the delivery
+    message.sequence = context->posted + 1;
+
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    result = TransmitInstantReplicatorUserMessage(context->replicator, (const char*)&message, sizeof(struct Message), 1);
+    clock_gettime(CLOCK_MONOTONIC, &after);
+
+    RaiseCounter(&context->total.waited,  GetElapsedTime(&before, &after));
+    RaiseCounter(&context->period.waited, GetElapsedTime(&before, &after));
+
+    if (result == 0)
+    {
+      context->posted ++;
+      AddCounter(&context->total.messages, &context->period.messages);
+    }
+    else
+      AddCounter(&context->total.refused, &context->period.refused);
+
+    context->transmitted ++;
+
+    if (GetElapsedTime(time, &after) >= WRITE_BUDGET)
+    {
+      // Do not accumulate debt after a wait
+      context->transmitted = target;
+      break;
+    }
+  }
 }
 
 static void HandleWriteTimeout(struct FastRingDescriptor* descriptor)
@@ -431,9 +620,11 @@ static void HandleWriteTimeout(struct FastRingDescriptor* descriptor)
       }
     }
   }
+
+  TransmitMessages(context, &time, (uint64_t)GetElapsedTime(&context->start, &time) * context->messages / 1000000000ULL);
 }
 
-static void ComputeDigest(struct Context* context, uint32_t* count, uint32_t* own, uint32_t* stamped, uint64_t* digest)
+static void ComputeDigest(struct Context* context, uint32_t* count, uint32_t* own, uint32_t* stamped, uint32_t* damaged, uint64_t* digest)
 {
   struct ReliableMemory* memory;
   struct ReliableBlock* block;
@@ -445,6 +636,7 @@ static void ComputeDigest(struct Context* context, uint32_t* count, uint32_t* ow
   *count   = 0;
   *own     = 0;
   *stamped = 0;
+  *damaged = 0;
   *digest  = 0;
 
   pthread_rwlock_rdlock(&context->pool->lock);
@@ -461,6 +653,9 @@ static void ComputeDigest(struct Context* context, uint32_t* count, uint32_t* ow
       *stamped += (atomic_load_explicit(&block->mark, memory_order_relaxed) != 0) || (atomic_load_explicit(&block->hint, memory_order_relaxed) != 0);
       continue;
     }
+
+    // Outside the barrier a pending hint means a copy damaged by a transfer and not repaired yet
+    *damaged += (atomic_load_explicit(&block->hint, memory_order_relaxed) & 1ULL) != 0;
 
     if (block->length > memory->size - sizeof(struct ReliableBlock))
       continue;
@@ -485,6 +680,7 @@ static void DumpBlocks(struct Context* context, const char* path)
   struct ReliableBlock* block;
   struct Payload* payload;
   uint32_t number;
+  uint32_t index;
   char buffer[2][40];
   FILE* file;
 
@@ -501,23 +697,48 @@ static void DumpBlocks(struct Context* context, const char* path)
     block   = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
     payload = (struct Payload*)block->data;
 
-    if ((atomic_load_explicit(&block->type, memory_order_relaxed) == RELIABLE_TYPE_FREE) ||
-        (block->length > memory->size - sizeof(struct ReliableBlock)))
+    if (atomic_load_explicit(&block->type, memory_order_relaxed) == RELIABLE_TYPE_FREE)
       continue;
 
     uuid_unparse_lower(block->identifier, buffer[0]);
 
-    if (block->length >= sizeof(struct Payload))
+    if (atomic_load_explicit(&block->hint, memory_order_relaxed) & 1ULL)
     {
-      uuid_unparse_lower(payload->author, buffer[1]);
-      fprintf(file, "%s %u %08x %s %llu # %u %u %u\n", buffer[0], block->length, GetCRC32C(block->data, block->length, 0), buffer[1], (unsigned long long)payload->sequence, number, block->type, block->count);
+      // A pending hint outside the barrier marks a copy damaged by a transfer, only its restored identifier can be trusted
+      fprintf(file, "%s - - - - # %u %u %u 1\n", buffer[0], number, block->type, block->count);
       continue;
     }
 
-    fprintf(file, "%s %u %08x - - # %u %u %u\n", buffer[0], block->length, GetCRC32C(block->data, block->length, 0), number, block->type, block->count);
+    if (block->length > memory->size - sizeof(struct ReliableBlock))
+      continue;
+
+    if (block->length >= sizeof(struct Payload))
+    {
+      uuid_unparse_lower(payload->author, buffer[1]);
+      fprintf(file, "%s %u %08x %s %llu # %u %u %u 0\n", buffer[0], block->length, GetCRC32C(block->data, block->length, 0), buffer[1], (unsigned long long)payload->sequence, number, block->type, block->count);
+      continue;
+    }
+
+    fprintf(file, "%s %u %08x - - # %u %u %u 0\n", buffer[0], block->length, GetCRC32C(block->data, block->length, 0), number, block->type, block->count);
   }
 
   pthread_rwlock_unlock(&context->pool->lock);
+
+  for (index = 0; index < context->released.count; ++ index)
+  {
+    uuid_unparse_lower(context->released.data[index], buffer[0]);
+    fprintf(file, "released %s\n", buffer[0]);
+  }
+
+  // Compare.py checks that the last message of every author has arrived, a lost tail leaves no gap to count
+  fprintf(file, "sent %016llx %llu\n", (unsigned long long)context->incarnation, (unsigned long long)context->posted);
+
+  for (index = 0; (index < STREAM_COUNT) && !uuid_is_null(context->streams[index].author); ++ index)
+  {
+    uuid_unparse_lower(context->streams[index].author, buffer[0]);
+    fprintf(file, "received %s %016llx %llu\n", buffer[0], (unsigned long long)context->streams[index].incarnation, (unsigned long long)context->streams[index].sequence);
+  }
+
   fclose(file);
 }
 
@@ -529,11 +750,12 @@ static uint64_t TakeCounter(ATOMIC(uint64_t)* counter, int reset)
 
 static void PrintCounters(const char* label, struct Context* context, struct Counters* counters, struct Samples* samples, int reset)
 {
-  uint64_t values[10];
+  uint64_t values[17];
   int64_t latencies[4];
   uint32_t blocks;
   uint32_t own;
   uint32_t stamped;
+  uint32_t damaged;
   uint64_t digest;
   uint32_t delay;
   uint32_t state;
@@ -551,9 +773,16 @@ static void PrintCounters(const char* label, struct Context* context, struct Cou
   values[7] = TakeCounter(&counters->repeats,     reset);
   values[8] = TakeCounter(&counters->connects,    reset);
   values[9] = TakeCounter(&counters->disconnects, reset);
+  values[10] = TakeCounter(&counters->messages,   reset);
+  values[11] = TakeCounter(&counters->refused,    reset);
+  values[12] = TakeCounter(&counters->received,   reset);
+  values[13] = TakeCounter(&counters->skipped,    reset);
+  values[14] = TakeCounter(&counters->disorders,  reset);
+  values[15] = TakeCounter(&counters->waited,     reset);
+  values[16] = TakeCounter(&counters->lost,       reset);
 
   SummarizeSamples(samples, latencies, reset);
-  ComputeDigest(context, &blocks, &own, &stamped, &digest);
+  ComputeDigest(context, &blocks, &own, &stamped, &damaged, &digest);
   clock_gettime(CLOCK_MONOTONIC, &time);
 
   // Replicator internals are read without its lock, the values are for diagnostics only
@@ -564,13 +793,16 @@ static void PrintCounters(const char* label, struct Context* context, struct Cou
 
   printf(
     "%s t=%.1f writes=%llu frees=%llu arrivals=%llu removals=%llu damages=%llu corrupts=%llu stales=%llu repeats=%llu "
-    "connects=%llu disconnects=%llu latency_us(min=%lld p50=%lld p99=%lld max=%lld) blocks=%u own=%u stamped=%u digest=%016llx state=%x tasks=%u removal_delay=%d\n",
+    "connects=%llu disconnects=%llu latency_us(min=%lld p50=%lld p99=%lld max=%lld) blocks=%u own=%u stamped=%u damaged=%u digest=%016llx state=%x tasks=%u removal_delay=%d "
+    "messages=%llu refused=%llu received=%llu skipped=%llu lost=%llu disorders=%llu wait_max_ms=%.1f\n",
     label, GetElapsedTime(&context->start, &time) / 1e9,
     (unsigned long long)values[0], (unsigned long long)values[1], (unsigned long long)values[2], (unsigned long long)values[3],
     (unsigned long long)values[4], (unsigned long long)values[5], (unsigned long long)values[6], (unsigned long long)values[7],
     (unsigned long long)values[8], (unsigned long long)values[9],
     (long long)latencies[0], (long long)latencies[1], (long long)latencies[2], (long long)latencies[3],
-    blocks, own, stamped, (unsigned long long)digest, state, tasks, (int32_t)delay);
+    blocks, own, stamped, damaged, (unsigned long long)digest, state, tasks, (int32_t)delay,
+    (unsigned long long)values[10], (unsigned long long)values[11], (unsigned long long)values[12], (unsigned long long)values[13],
+    (unsigned long long)values[16], (unsigned long long)values[14], values[15] / 1e6);
 
   fflush(stdout);
 }
@@ -666,9 +898,15 @@ static void PrintUsage(const char* name)
     "  -t SECONDS       writing duration counted from the first peer connection, 0 = until SIGINT (default 0)\n"
     "  -q SECONDS       quiescence before the final digest, removals apply after 10 s (default 15)\n"
     "  -S SECRET        replicator secret (default Secret)\n"
-    "  -o FILE          dump surviving blocks (identifier, length, CRC32C, author, sequence # number, type, count) at exit\n"
+    "  -u RATE          user messages per second, sent by the application thread with wait (default 0)\n"
+    "  -e MS            time a peer may go without progress before its connection is closed, 0 = default 1000 ms\n"
+    "  -O               optimistic mode: RDMA READ under the receiver barrier, synchronous transfer as a fallback;\n"
+    "                   DAMAGE is expected there, Compare.py judges the blocks left damaged\n"
+    "  -o FILE          dump surviving blocks (identifier, length, CRC32C, author, sequence # number, type, count, damaged)\n"
+    "                   and the identifiers of released own blocks (released IDENTIFIER) at exit\n"
     "SIGUSR1 prints totals with the current digest\n"
-    "Exit status: 0 = passed, 1 = setup or runtime failure, 2 = verification failure (corrupt, damaged or stale arrivals, no peer connected)\n",
+    "Exit status: 0 = passed, 1 = setup or runtime failure, 2 = verification failure (corrupt or stale arrivals,\n"
+    "DAMAGE without -O, user messages out of order or lost without a disconnect, no peer connected)\n",
     name);
 }
 
@@ -679,9 +917,12 @@ int main(int count, char** arguments)
   const char* name;
   const char* secret;
   const char* path;
+  uint32_t options;
+  uint32_t timeout;
   char buffer[40];
   uint16_t port;
   int option;
+  int status;
   int failure;
   int result;
 
@@ -709,12 +950,16 @@ int main(int count, char** arguments)
   context.ratio      = 10;
   context.quiescence = 15;
 
-  name   = NULL;
-  path   = NULL;
-  secret = "Secret";
-  port   = 7400;
+  getrandom(&context.incarnation, sizeof(context.incarnation), 0);
 
-  while ((option = getopt(count, arguments, "n:l:p:r:k:s:f:t:q:S:o:h")) != -1)
+  name    = NULL;
+  path    = NULL;
+  secret  = "Secret";
+  port    = 7400;
+  options = 0;
+  timeout = 0;
+
+  while ((option = getopt(count, arguments, "n:l:p:r:k:s:f:t:q:S:o:u:e:Oh")) != -1)
   {
     switch (option)
     {
@@ -729,6 +974,9 @@ int main(int count, char** arguments)
       case 'q':  context.quiescence = atoi(optarg);  break;
       case 'S':  secret             = optarg;        break;
       case 'o':  path               = optarg;        break;
+      case 'u':  context.messages   = atoi(optarg);  break;
+      case 'O':  options           |= INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE;  break;
+      case 'e':  timeout            = atoi(optarg);  break;
 
       default:
         PrintUsage(arguments[0]);
@@ -794,7 +1042,7 @@ int main(int count, char** arguments)
   reporter     = NULL;
   result       = 1;
   handle       = memfd_create(POOL_NAME, MFD_CLOEXEC);
-  replicator   = (handle >= 0) ? CreateInstantReplicator(port, context.identifier, SERVICE_NAME, secret, HandleReplicatorEvent, &context, &monitor) : NULL;
+  replicator   = (handle >= 0) ? CreateInstantReplicator(port, context.identifier, SERVICE_NAME, secret, options, timeout, HandleReplicatorEvent, &context, &monitor) : NULL;
   indexer      = (replicator != NULL) ? CreateReliableIndexer(&replicator->super) : NULL;
   tracker      = (indexer    != NULL) ? CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super) : NULL;
   context.pool = (tracker    != NULL) ? CreateReliablePool(handle, POOL_NAME, context.size, 0, &tracker->super, NULL, NULL) : NULL;
@@ -831,7 +1079,7 @@ int main(int count, char** arguments)
   optind = 1;
 
   while ((result == 0) &&
-         ((option = getopt(count, arguments, "n:l:p:r:k:s:f:t:q:S:o:h")) != -1))
+         ((option = getopt(count, arguments, "n:l:p:r:k:s:f:t:q:S:o:u:e:Oh")) != -1))
   {
     if ((option == 'p') &&
         (RegisterPeer(replicator, optarg, port) != 0))
@@ -869,9 +1117,11 @@ int main(int count, char** arguments)
 
   while (result == 0)
   {
-    if (WaitForFastRing(ring, 200, NULL) < 0)
+    if (((status = WaitForFastRing(ring, 200, NULL)) < 0) &&
+        (status != -EINTR))
     {
-      printf("FAILED: WaitForFastRing() returned an error\n");
+      // A stop and continue of the process (SIGSTOP / SIGCONT in failure runs) interrupts the wait
+      printf("FAILED: WaitForFastRing() returned %d\n", status);
       result = 1;
       break;
     }
@@ -947,10 +1197,19 @@ int main(int count, char** arguments)
       result = 1;
     }
     else if (atomic_load_explicit(&context.total.corrupts, memory_order_relaxed) ||
-             atomic_load_explicit(&context.total.damages,  memory_order_relaxed) ||
-             atomic_load_explicit(&context.total.stales,   memory_order_relaxed))
+             atomic_load_explicit(&context.total.stales,   memory_order_relaxed) ||
+             (atomic_load_explicit(&context.total.damages, memory_order_relaxed) &&
+              (~options & INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE)))
     {
+      // A rejected optimistic read overwrites the copy, so DAMAGE is expected in this mode until a later version repairs it
       printf("FAILED: corrupt, damaged or stale arrivals\n");
+      result = 2;
+    }
+    else if (atomic_load_explicit(&context.total.disorders, memory_order_relaxed) ||
+             atomic_load_explicit(&context.total.lost,      memory_order_relaxed))
+    {
+      // A user message may be lost only with a broken connection to its author
+      printf("FAILED: user messages out of order or lost without a disconnect\n");
       result = 2;
     }
     else if (atomic_load_explicit(&context.total.connects, memory_order_relaxed) == 0)
@@ -962,6 +1221,7 @@ int main(int count, char** arguments)
 
   free(context.descriptors);
   free(context.history);
+  free(context.released.data);
   free(context.overall.data);
   free(context.recent.data);
 

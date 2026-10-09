@@ -139,15 +139,25 @@ Role:
 
 Main API:
 
-- `CreateInstantReplicator(port, identifier, name, secret, function, closure, next)`
+- `CreateInstantReplicator(port, identifier, name, secret, options, timeout, function, closure, next)` (`timeout` in milliseconds: how long a peer may go without progress before its connection is closed, 0 = 1 000 ms, rounded up to 200 ms ticks)
 - `ReleaseInstantReplicator(replicator)`
 - `RegisterRemoteInstantReplicator(replicator, identifier, address, length)`
-- `TransmitInstantReplicatorUserMessage(replicator, data, length, wait)`
+- `TransmitInstantReplicatorUserMessage(replicator, data, length, wait)` (queued and delivered in order to every connected peer, lost only with a broken connection; with `wait` it sleeps until the queue has a place and a buffer is free, otherwise returns `-EBUSY`; `-EFAULT` when the replicator has stopped or failed; event handlers run on the replicator thread and never wait)
+
+Options:
+
+- `INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE`: under the receiver barrier, offered blocks are first read by RDMA READ straight into the locked local blocks, without involving the sender's barrier, and the source `mark` is read after the data. A block is accepted when the source still shows the offered `mark`, the identifier matches and the CRC32C matches the control; the rest go through the synchronous CAS/WRITE transfer. The synchronous transfer stays the default: the option trades a part of the parking of the main thread for DAMAGE on copies overwritten by a rejected read, mostly of objects already released at the source. The design, its correctness argument and the measurements are in [REPLICATION.md](REPLICATION.md#optimistic-mode).
+
+Buffers:
+
+- The application thread never waits for replication buffers, except in `TransmitInstantReplicatorUserMessage()` with `wait`, and cannot take the last `INSTANT_RESERVE_COUNT` of them, which stay for the replicator thread. A block change notification that does not fit is counted as lost and the affected peers are synchronized again; removals and user messages are built once in a shared buffer, queued and sent in order to every peer.
+- Every peer grants a window of messages that consume its receiving buffers, so a stopped or slow peer never gets more than it can receive: a SEND never waits for `RNR` and never holds up the reads and writes posted after it on the same connection. The count of received messages returns in `imm_data` of every SEND, windows are announced and confirmed by `INSTANT_TYPE_CREDIT`.
+- A peer that stops answering without breaking the connection is disconnected by the replicator after about 1 s by default: when a transfer waiting for it does not advance or its credit window stays used up while it sends nothing. The barrier and the queued messages never wait longer for a stopped peer; it is caught up after it connects again. The time is the `timeout` of `CreateInstantReplicator()`, a failure budget of the instance, see [Timeouts](REPLICATION.md#timeouts).
 
 Requirements:
 
 - `InstantReplicator` requires RDMA remote atomic support for its compare-and-swap transfer path.
-- The HCA must expose atomic capabilities sufficient for the configured initiator/responder RDMA depths.
+- The HCA must expose atomic capabilities. Up to `INSTANT_ATOMIC_COUNT` (16) RDMA READ and atomic operations are kept in flight per connection, limited by the weakest local card and by the depths the peer requests.
 - Adapters that do not satisfy these capabilities are rejected during card setup and are treated as unavailable; they will not be considered connected peers.
 
 Protocol format:
@@ -158,6 +168,7 @@ Protocol format:
   - `INSTANT_TYPE_NOTIFY` / `INSTANT_TYPE_RETRIEVE`: transfer metadata and registered keys
   - `INSTANT_TYPE_COMPLETE`: task completion marker
   - `INSTANT_TYPE_REMOVE`: `InstantRemovalData`
+  - `INSTANT_TYPE_CREDIT`: `InstantCreditData` (window granted to the peer, window of the peer being applied)
   - `INSTANT_TYPE_USER`: arbitrary user payload
 
 `INSTANT_TYPE_REMOVE` message format:
@@ -229,12 +240,14 @@ Healing is deliberately left to the application. Whether a pool is tracked and r
 
 Recipe for a tracked (and optionally replicated) pool, inside the recovery callback:
 
-- Keep the block as is when `mark & 1` is clear and `VerifyReliableBlockIntegrity(block)` returns non-zero.
+- Keep the block as is when `hint & 1` is clear and `VerifyReliableBlockIntegrity(block)` returns non-zero. Opening the pool already turns the lock of a transfer interrupted by the crash (`mark & 1`) into the damaged state: `mark` 0 and a pending `hint` (`hint & 1`).
 - Otherwise pick one of two outcomes:
   - return `RELIABLE_TYPE_FREE` — discard the block when the data model does not tolerate partial writes;
   - keep the allocation but zero `mark` and `hint` — the block is declared stale, and startup synchronization can re-fetch it from a peer with a newer valid copy.
 
 Torn blocks cannot poison other nodes either way: receivers validate CRC on every arrival and reject mismatching transfers.
+
+A transfer that ended after it may have overwritten a block reports `RELIABLE_MONITOR_BLOCK_DAMAGE` and leaves the block damaged: `mark` 0 and a pending `hint`. Neither the tracker nor the replicator publishes such a block. It leaves this state when a later transfer from a peer installs a version, or when the application rewrites the content and calls `RepairReliableBlock(pool, block)`, which clears the pending `hint` and inverts `control`, so the next tracker flush sees a changed checksum and publishes the block even when the content was restored to the bytes that matched the old `control`.
 
 ## Restart Recovery Tools
 

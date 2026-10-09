@@ -12,11 +12,12 @@
 
 #define GRANULARITY  1024
 
-_Static_assert((offsetof(struct ReliableBlock, next)  % sizeof(uint64_t))      == 0, "ReliableBlock.next must be 64-bit aligned");
-_Static_assert((offsetof(struct ReliableBlock, mark)  % sizeof(uint64_t))      == 0, "ReliableBlock.mark must be 64-bit aligned");
-_Static_assert((offsetof(struct ReliableBlock, data)  % __BIGGEST_ALIGNMENT__) == 0, "ReliableBlock.data must be aligned to __BIGGEST_ALIGNMENT__");
-_Static_assert((offsetof(struct ReliableMemory, free) % sizeof(uint64_t))      == 0, "ReliableMemory.free must be 64-bit aligned");
-_Static_assert((offsetof(struct ReliableMemory, data) % __BIGGEST_ALIGNMENT__) == 0, "ReliableMemory.data must be aligned to __BIGGEST_ALIGNMENT__");
+_Static_assert((offsetof(struct ReliableBlock, next)   % sizeof(uint64_t))      == 0, "ReliableBlock.next must be 64-bit aligned");
+_Static_assert((offsetof(struct ReliableBlock, mark)   % sizeof(uint64_t))      == 0, "ReliableBlock.mark must be 64-bit aligned");
+_Static_assert((offsetof(struct ReliableBlock, data)   % __BIGGEST_ALIGNMENT__) == 0, "ReliableBlock.data must be aligned to __BIGGEST_ALIGNMENT__");
+_Static_assert((offsetof(struct ReliableMemory, floor) % sizeof(uint64_t))      == 0, "ReliableMemory.floor must be 64-bit aligned");
+_Static_assert((offsetof(struct ReliableMemory, free)  % sizeof(uint64_t))      == 0, "ReliableMemory.free must be 64-bit aligned");
+_Static_assert((offsetof(struct ReliableMemory, data)  % __BIGGEST_ALIGNMENT__) == 0, "ReliableMemory.data must be aligned to __BIGGEST_ALIGNMENT__");
 
 static inline int AcquireBlock(ATOMIC(uint32_t)* counter)
 {
@@ -204,8 +205,9 @@ static struct ReliablePool* CreateNewMemory(int handle, const char* name, size_t
     return NULL;
   }
 
+  memset(memory, 0, sizeof(struct ReliableMemory));
+
   number        = (size - sizeof(struct ReliableMemory)) / length;
-  memory->magic = 0;
   memory->size  = length;
 
   atomic_store_explicit(&memory->length, number, memory_order_relaxed);
@@ -286,6 +288,19 @@ static struct ReliablePool* UseExistingMemory(int handle, const char* name, size
   atomic_store_explicit(&pool->monitor, monitor,                memory_order_relaxed);
   atomic_store_explicit(&pool->count,   1,                      memory_order_relaxed);
   atomic_store_explicit(&share->weight, RELIABLE_WEIGHT_STRONG, memory_order_relaxed);
+
+  for (number = 0; number < atomic_load_explicit(&memory->length, memory_order_relaxed); ++ number)
+  {
+    block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+
+    if ((block->type != RELIABLE_TYPE_FREE) &&
+        (atomic_load_explicit(&block->mark, memory_order_relaxed) & 1ULL))
+    {
+      // A transfer interrupted by the crash left its lock, the copy is damaged
+      atomic_fetch_or_explicit(&block->hint, 1ULL, memory_order_relaxed);
+      atomic_store_explicit(&block->mark, 0ULL, memory_order_relaxed);
+    }
+  }
 
   CallReliableMonitor(RELIABLE_MONITOR_POOL_CREATE, pool, share, NULL);
 
@@ -693,6 +708,14 @@ void* RecoverReliableBlock(struct ReliableDescriptor* descriptor, struct Reliabl
   atomic_fetch_add_explicit(&share->weight, RELIABLE_WEIGHT_STRONG, memory_order_relaxed);
 
   return block->data;
+}
+
+void RepairReliableBlock(struct ReliablePool* pool, struct ReliableBlock* block)
+{
+  // The damaged state is cleared, the inverted control differs from the checksum of content that matched it,
+  // and the store marks the page dirty, so the next tracker flush publishes the block
+  atomic_store_explicit(&block->hint, 0ULL, memory_order_relaxed);
+  atomic_fetch_xor_explicit(&block->control, UINT32_MAX, memory_order_relaxed);
 }
 
 uint32_t ReserveReliableBlock(struct ReliablePool* pool, uuid_t identifier, int type)

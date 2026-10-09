@@ -5,10 +5,12 @@ behaves under load. It explains the design choices behind the protocol and backs
 measurements on a two-node InfiniBand testbed: replication throughput, delivery latency, the cost
 of the replicator barrier, convergence of pool contents and behavior under peer failures.
 
-Testing date: 2026-10-08.
+Testing dates: 2026-10-08 and 2026-10-09.
 Tested revisions: `d39b85d` (replication barrier fixes) for the load sweep, latency and failure
 scenarios; `eacacff` (session recovery fixes) and `eacacff` with defect 8 fixed for the
-[20 000 ops/s](#20-000-opss) results.
+[20 000 ops/s](#20-000-opss) results; the revision that adds the [Optimistic Mode](#optimistic-mode)
+and the fixes 10–15 for the final series of 2026-10-09 in [Latency](#latency) and
+[Failure Scenarios](#failure-scenarios).
 The fixes are listed in [Defects Found and Fixed](#defects-found-and-fixed).
 
 ## Design Context
@@ -65,9 +67,10 @@ the receiver accepts a version only when it passes validation; data that fails v
 land in the memory of the receiver. An asynchronous mode in which the receiver reads the sender with
 RDMA READ was the original plan (`INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE` is its remnant); it was
 dropped because a read races with the application of the sender, does not guarantee the integrity of
-the received data and produces extra retries and errors. The price of the synchronous transfer is
-that the receiver keeps its own barrier raised while it waits for the sender, so the parked time of
-one node includes the time the other node needs to reach its barrier.
+the received data and produces extra retries and errors. It returns as an opt-in first attempt in
+front of this transfer, see [Optimistic Mode](#optimistic-mode). The price of the synchronous
+transfer is that the receiver keeps its own barrier raised while it waits for the sender, so the
+parked time of one node includes the time the other node needs to reach its barrier.
 
 The transfer follows this sequence:
 
@@ -108,6 +111,454 @@ barrier. Fewer arrivals than writes can reflect useful coalescing. Final-state c
 whether the live versions reached the replicas in a particular run; throughput and arrival
 latencies alone cannot establish that. The measurements below separate these effects where the
 instrumentation allows it.
+
+### Timeouts
+
+The replicator bounds the wait for a failed peer by one failure budget per instance, the
+`timeout` of `CreateInstantReplicator()` in milliseconds (0 selects the default of 1 000 ms). It
+closes the connection of a peer when either of two waits shows no progress for that long:
+
+- a reading or writing task waits for data, a buffer or a completion of the peer and does not
+  advance;
+- the credit window of the peer is used up, a zero window included, and the peer sends nothing.
+
+Both checks run in ticks of the replicator thread (`GENERIC_POLL_TIMEOUT`, 200 ms): the timeout is
+rounded up to whole ticks and the actual bound is up to one tick longer, 1.0–1.2 s by default; on
+the testbed the connection was closed 1.0–1.3 s after the peer stopped. The closed peer is caught
+up by the initial syncing after it connects again. Everything that waits for a peer is released by
+its disconnect: a barrier held by a transfer, the queued messages and a
+`TransmitInstantReplicatorUserMessage()` waiting with `wait`.
+
+There is one parameter and not one per mechanism, since to the application they mean the same: the
+peer does not advance. It sets how long a node tolerates a peer without any progress before it
+declares the peer broken, not the latency of individual operations. A live peer answers a transfer
+in milliseconds, announces its window right after the connect and reports its credit at the latest
+when half of the window is used, so an idle peer never reaches the timeout and a slow one reaches
+it only when it stalls for longer than the budget; then its connection is closed as for a stopped
+peer, and the budget has to be raised if such stalls are expected.
+The default suits ordinary deployments. A node with a dedicated replication thread or a near
+real-time event loop can lower it to 400–600 ms for a faster failover; a virtual machine, a lossy
+RoCE fabric or an overloaded host can raise it to 2–3 s. Values below a few ticks turn scheduling
+hiccups and load peaks into disconnects, resyncs and zombies; tens of seconds bring back the
+stalls of the barrier and the application thread that the timeouts removed (defect 15).
+
+An application that cannot afford its thread waiting for the timeout on the failure path does not
+fit the execution model of `InstantReplicator`, in which the application thread takes part in the
+barrier, and lowering the timeout does not change that. Such an application should isolate access
+to the replicated memory instead: move the writers and the replication safe point to a thread or
+event domain of their own, synchronize the objects locally by other means, or transfer the state
+in a way that keeps the application path out of the barrier.
+
+### Why RDMA
+
+The protocol is built on one-sided operations, so it cannot be moved to a socket transport by
+replacing the transport; an IP version would be a different protocol:
+
+- **No copies.** Block data goes by RDMA READ and WRITE from one pool directly into the other.
+  Through sockets a transfer is usually copied twice, from the pool into the kernel and from the
+  kernel into the pool, with system calls for every message or batch; `MSG_ZEROCOPY` removes the
+  copy on the sending side for large buffers, but not the system calls or the work of the remote
+  CPU below.
+- **No remote CPU on the data path.** The HCA executes READ and CAS without the sender's
+  processor. Through sockets a thread of the remote node has to receive each request, find and
+  check the block and answer, so the latency follows the load and the scheduling of that node.
+- **Locking in memory.** The fencing by CAS on `mark` with a token would become an exchange of
+  messages with its own locking on the remote side and an extra round trip.
+- **Optimistic mode** reads a block without the source taking part and validates it afterwards;
+  this exists only with one-sided reads.
+
+Most of the median latency measured below is spent outside the network, in change detection, the
+queues and the barrier of the receiver. A socket version would pay for the same stages plus its
+copies and system calls, so RDMA is expected to win, most of all in the tail and under load. No IP
+variant was built or measured on the testbed, and this document reports only the absolute values.
+
+## Optimistic Mode
+
+Status: implemented; load runs on the testbed are in [Measurements](#measurements), failure
+scenarios in [Failure Scenarios](#failure-scenarios). The other measurements in this document were
+taken without this mode and before the token scheme.
+
+With `INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE` the receiver makes one attempt per offered block
+to read the source by RDMA READ under its own barrier, without involving the barrier of the sender.
+Blocks that fail the attempt continue through the synchronous transfer described above. The aim is
+to remove the coupling of the parked time of the receiver to the barrier of the sender: in the
+[barrier breakdown](#barrier-breakdown) most of the held time of the receiver is spent waiting
+for the peer.
+
+### Contract
+
+The source is not locked during an optimistic read, so the application of the sender can change
+the block and flush it while the HCA reads it.
+
+- An optimistic read may accept an intact state of the source that is newer than the offered
+  version. In this case the receiver installs the label of the offer.
+- Accepting a state older than the label is not allowed.
+
+A label that lags behind the data is therefore a permitted outcome. A newer offer allows the label
+to be realigned; the [waiting rule](#ownership-and-conflicts) ensures that such an offer is not
+dropped while the block is busy.
+
+### Roles of `hint` and `mark`
+
+The two fields have separate roles:
+
+- **`hint`** is the version of the state: the offer selected for a block, or the version installed
+  in it. Versions come from `MakeEpoch()` of the author and are normalized to the local clock.
+  A version may legitimately be installed again.
+- **`mark`** is the fencing token of the content of this local block, and its lock. It never
+  carries the version or the mark of another node.
+
+| Field | Value | Meaning |
+|---|---|---|
+| `hint` | even | Label of the installed version |
+| `hint` | odd | Pending: an offer is selected but not installed, or the copy is damaged. Not publishable |
+| `mark` | `& 3 == 0`, non-zero | Epoch of a local tracker flush |
+| `mark` | `& 3 == 2` | Token T of an install by the replicator |
+| `mark` | odd | Locked by a transfer owned by a local task: `T \| 1` |
+| `mark` | 0 | No published content: a fresh or freed block, or a copy that may be damaged |
+
+Invariants:
+
+1. **I1.** The content of a block is never older than its `hint` when the `hint` is even.
+2. **I2.** A token (`& 3 == 2`) appears in a block at most once: the replicator leaves a value
+   only for a fresh token or for 0. An epoch can appear again, but only written by a tracker
+   flush, which stores the epoch together with the current content of the application (or, with
+   `RELIABLE_TRACKER_FLAG_FORCE_MARK`, over unchanged content). Such content is never older than an
+   earlier offer of the block. The tracker runs on the application thread, which is parked while a
+   task owns a block, and it skips damaged blocks (I4), so it never writes `mark` of an owned or
+   damaged block.
+3. **I3.** Every odd `mark` has a local owner task. A pool opened after a crash converts leftover
+   odd marks into the damaged state (`mark` 0, pending `hint`).
+4. **I4.** Nothing publishes a block with an odd `hint`, an odd `mark`, `mark` 0 or a local owner:
+   neither the syncing task, nor the source of a WRITE, nor the tracker. Ownership is checked in
+   addition to the bit because a transfer in progress overwrites `hint`.
+
+### Tokens
+
+The replicator owns the generator of T; it does not depend on an instance of `ReliableTracker`.
+The arithmetic shared with `MakeEpoch()` can move to a common helper.
+
+1. **Classes.** The generator only issues values with `T & 3 == 2`. `MakeEpoch()` steps its counter
+   by 4, so new tracker epochs have `epoch & 3 == 0` and never equal a token.
+2. **Persistent floor.** Each pool stores a floor of tokens in its header
+   (`ReliableMemory::floor`). The generator keeps its next value in memory and reserves ranges of
+   2²⁰ tokens: when the range is used up, it raises the floor by the range first and only then
+   issues values from it. After a restart it starts at the floor, so the unused rest of the last
+   range is skipped; the space of 2⁶² tokens leaves room for 2⁴² restarts. The header is written
+   once per range, not once per install.
+3. **Durability of the floor** matches that of the blocks. A pool backed by a file can be
+   recovered after a machine failure, and the page cache writes pages back in any order, so a block
+   carrying a token could reach the disk while the header with the raised floor does not.
+   The generator therefore calls `msync(MS_SYNC)` on the header page after raising the floor and
+   before the first value of the range is used. The call is unconditional: on a `memfd` or another
+   tmpfs-backed pool it does nothing, and the backend is not detected. On a file the write runs on
+   the replicator thread under the barrier once per range, which is about once a minute at 20 000
+   installs per second.
+4. **Initial floor without clocks.** A pool of the old format is recreated (see
+   [Compatibility](#compatibility)), so a new pool starts with zero marks and any initial floor
+   of the class is above them. Old epochs with bit 1 set therefore never meet tokens. If a
+   migration in place is ever added, its initial floor must be strictly above every existing `mark`
+   of the pool, lock bit included.
+5. **Overflow** stops issuing tokens: optimistic reads and synchronous transfers into the
+   pool fail, and the counter never wraps.
+
+### Receiver Procedure
+
+1. **Collect**, under READY. The task acquires all its blocks in one pass or none of them. A block
+   owned by another task makes the whole task wait in `WAIT_LOCK`; busyness never drops an entry.
+   An entry is dropped only when the local version is not older than the offer. A damaged block
+   (`mark` 0, pending `hint`, no owner) accepts any offer. For an acquired block the task saves the
+   current `hint` and writes `hint = offer | 1`; `mark` does not change.
+2. **Clean exit.** An entry that leaves the task while its content is untouched (`mark` is still the
+   value C seen in Collect, for example because the sender skipped the block) gets the saved `hint`
+   back. For a block that was damaged before Collect the saved value is the pending `hint`, so the
+   block stays damaged.
+3. **Fetch**, once per task. For every entry the task takes a fresh T and writes `mark = T | 1`,
+   then posts an RDMA READ of the replicable part from `hint` to the end of the data straight into
+   the local block. The local `mark` is not overwritten. After all data reads it posts one RDMA
+   READ of the source `mark` per entry into the registered task buffer; the first of them carries
+   `IBV_SEND_FENCE`, so every mark is read after every data read has completed. Entries whose length
+   does not fit go straight to the synchronous transfer.
+4. **Acceptance**, per entry, all of:
+   - the completion status is success;
+   - the source `mark` read after the data equals the offered `mark`, which is even and non-zero;
+   - the identifier equals the offered one;
+   - the length fits the read range, checked before the checksum;
+   - CRC32C of the data equals the control.
+
+   On acceptance the receiver writes `hint` = the offered label, then `mark = T` last (release),
+   touches the pages and reports ARRIVAL.
+5. **Rejection.** The data was overwritten, so the entry is flagged as damaged-by-read. The read
+   also overwrote `hint` and the identifier, so the receiver restores the identifier, writes the
+   pending `hint = offer | 1` explicitly, then `mark` 0, and keeps the ownership. From the start of
+   the read until this point the pending bit is gone and only the ownership keeps the block from
+   being published. The entry continues with the synchronous transfer. An ARRIVAL clears the flag;
+   any other exit of a flagged entry reports DAMAGE regardless of the checksum and leaves the block
+   damaged.
+
+### Synchronous Transfer With Tokens
+
+Attempt k of an entry takes a fresh token Tk. RETRIEVE carries for every entry, besides the
+destination, `compare` = the current `mark` C of the destination and Tk in `hint`, which the sender
+does not need otherwise.
+
+| Step | Destination `mark` | Written by |
+|---|---|---|
+| RETRIEVE sent | C (unchanged) | — |
+| CAS of the sender | `C → Tk \| 1` | HCA of the sender |
+| WRITE of the data | `Tk \| 1` | HCA of the sender |
+| Final WRITE | `Tk`, taken from `hint` of RETRIEVE, never the `mark` of the source | HCA of the sender |
+
+The sender copies the token into `buffer->values[index]`, where the result of its CAS was read, and
+writes the final mark from there. The value and its registered buffer stay unchanged until the WR
+completes or the QP is confirmed to be stopped.
+
+Validation of the receiver per entry:
+
+| Destination after the transfer | Meaning | Action |
+|---|---|---|
+| `mark == Tk`, length in range, checksum holds, `hint` even | Complete | ARRIVAL |
+| `mark == Tk`, but length out of range, checksum fails or `hint` pending | Written, not valid | Touched |
+| `mark == Tk \| 1` | Locked, the data may be written in part | Touched |
+| `mark == C` | The CAS did not succeed | Untouched: clean exit |
+| Anything else | Unexpected | Touched |
+
+Touched means: `mark` 0, the entry is flagged and retried with a fresh T until the attempt limit,
+then DAMAGE.
+
+Further requirements of the synchronous transfer:
+
+- The sender never waits for a block: a block with a pending `hint` or owned by a local task is
+  skipped like an unflushed one.
+- A WRITE that lands a pending `hint` is a validation failure.
+- On a disconnect, the entries of the task are abandoned after the QP is destroyed: an entry
+  locked by `Tk | 1` is touched, `mark` 0, DAMAGE.
+
+### Why the Accepted State Is Not Older Than the Label
+
+The offered state of the source B carries the version V1 in `hint` and the content token M1 in
+`mark`. B publishes only blocks without an owner, with an even `hint` and a non-zero even `mark`
+(I4), and its content is not older than V1 (I1). The receiver accepts only when B still shows M1
+after the data has been read.
+
+By I2, `mark` of B equal to M1 after the read means that no install, lock or invalidation happened
+to that block between the offer and the check: each of them leaves M1 for good. The changes that
+keep M1 are only those of the application of B before its next flush:
+
+| Change of the source during the read | What the receiver sees | Outcome |
+|---|---|---|
+| Write and flush of V2 | The flush writes `control`, then a new `mark`, then `hint`. With M1 still visible after the data, the data is V1 or V2 | V1 or label lag |
+| Write without a flush | Newer data with the old control | Rejected by the checksum (probabilistic, 2⁻³²) |
+| Mark refresh with an unchanged checksum (`RELIABLE_TRACKER_FLAG_FORCE_MARK`) | A new epoch | Rejected, conservative |
+| Install of any version, by WRITE or by READ | `T \| 1`, then a fresh T | Rejected |
+| Interrupted transfer | `T \| 1`, then 0 | Rejected |
+| Release or reuse of the block | 0, then a new epoch or token; the identifier is checked | Rejected |
+
+The data accepted is therefore V1 or a later state written by the application of B, never an
+earlier one. If M1 is an epoch, a tracker restart can write M1 again (I2), but only with a flush of
+content written by the application after the offer: the same outcome as the first row, label lag.
+A token never comes back, because the persistent floor guards it.
+
+### Damaged Blocks
+
+A block is damaged when a transfer ended after its content may have been overwritten: `mark` 0 and
+a pending `hint`, without an owner. Such a block is reported by DAMAGE and is not published (I4),
+so content damaged by DMA never leaves the node as a new version. The tracker cannot tell a repair
+by the application from damage: DMA does not mark the page table entries dirty, but a write to a
+neighboring block of the same page does, so a dirty page says nothing about this block.
+
+A damaged block leaves this state in one of two ways:
+
+- **An install** by a later transfer from a peer, which repairs the copy (see the conflict table).
+- **`RepairReliableBlock(pool, block)`**, a function of `ReliablePool`. The application calls it
+  after it has rewritten the content, on the application thread outside the barrier, where no task
+  owns the block. It writes `hint` 0, an even label older than any version, and inverts `control`.
+  Content restored to the bytes that matched the old `control` now differs from it for certain;
+  other content matches the inverted value only by chance (2⁻³²), which is accepted as residual
+  risk: computing the checksum in `ReliablePool` would pull CRC32C into the pool. The store also
+  marks the page dirty, so the next tracker flush checks the block even when the application did
+  not rewrite it, sees a changed checksum, writes a new epoch to `mark` and `hint` and publishes
+  the block. Whether and how to repair stays the decision of the application; the alternative of
+  releasing the block and reserving a new one needs no call.
+
+### Ownership and Conflicts
+
+Rules:
+
+1. **R1.** Acquisition is all or nothing, so a waiting task holds no block and tasks of one node
+   cannot form a cycle.
+2. **R2.** Only a reading task waits, only in Collect and only for a local owner.
+3. **R3.** A writing task never waits: it skips a busy block, and sends COMPLETE when it skipped
+   everything.
+4. **R4.** A block that a writing task holds is busy for Collect, so a pending `hint` cannot be
+   raised between the source check of the sender and its WRITE.
+
+| Holder of X on the node | New reading task for X | New writing task for X (incoming RETRIEVE) |
+|---|---|---|
+| None | Acquires | Serves |
+| Reading task | Waits in `WAIT_LOCK` | Skips |
+| Writing task | Waits | Skips |
+| Nobody, damaged | Acquires, the install repairs the copy | Skips |
+
+When nodes A and B both hold X for reading and request it from each other, the writing task on
+each side skips the block. Without a preceding optimistic read both reading tasks end with
+untouched content: concurrent writers of one block, resolved by the next change, as with a failed
+CAS before. If both had already overwritten their copies by a rejected optimistic read, both
+report DAMAGE and the previous copies are not restored. This is permitted by the contract and is
+the cost of reading into the live block.
+
+Local acquisition cannot form a cycle: a reading task waits for a local owner, which waits either
+for its own DMA or for a remote writing task, which waits for nothing. The wait for a network
+response is bounded by the timeouts of a stopped peer (defect 15): a transfer that does not advance
+for about 1 s, or a credit window that a peer leaves exhausted for about 1 s, closes the
+connection.
+
+### Connection Teardown
+
+All reads and writes of a task must have stopped before its blocks are restored, unlocked,
+reported or its buffers are released. On a disconnect:
+
+1. The peer stops accepting new work (`INSTANT_PEER_STATE_DISCONNECTED`).
+2. `ibv_destroy_qp()` destroys the QP and its result is checked. `rdma_destroy_qp()` cannot be
+   used because it does not report errors.
+3. Only after a successful destruction are the pending requests and the tasks of the peer cleared
+   by the rules above and their memory released.
+4. If the destruction fails, DMA into pool memory may still be in progress. Nothing of the peer is
+   cleared or released, `DestroyDescriptor()` is not called, the peer is not reconnected, the
+   memory regions stay registered and the replicator enters `INSTANT_REPLICATOR_STATE_FAILURE`.
+   The barrier is never released in this state: LOCK and READY stay raised, including when the
+   replicator thread exits, which today clears them. `FlushInstantReplicator()` returns `-EFAULT`
+   without releasing anything. The application must treat it as fatal and stop without touching
+   pool memory; the pool is recovered by the next process.
+
+`ReleaseInstantReplicator()` follows the same order. The replicator thread, before it leaves,
+passes every connection that has not failed through the disconnect path: the QP is destroyed, the
+unfinished transfers are abandoned and reported, and only then the barrier is released. After a
+failure `ReleaseInstantReplicator()` releases nothing, since DMA may still reach the buffers and
+the pools; the resources are kept until the process exits.
+
+A peer that stops answering without breaking the connection, for example a stopped process whose
+HCA still acknowledges the transport, is closed by the replicator itself (defect 15). Such a peer
+does not answer DREQ either, so `rdma_disconnect()` would leave the connection open until the peer
+resumes; instead the replicator passes it through the same disconnect path as
+`ReleaseInstantReplicator()` and destroys the CM identifier. The peer finds the connection broken
+when it resumes and connects again.
+
+This relies on the provider removing the completions of a destroyed QP from the shared completion
+queue, as mlx5 does. The rule is not claimed for other providers.
+
+### Compatibility
+
+- **Network protocol.** RETRIEVE carries the token in `hint` and the lock value changes to `Tk | 1`;
+  the size of `InstantBlockData` does not change.
+  `INSTANT_MAGIC` changes, so nodes of different versions refuse each other in the handshake.
+- **Pool format.** The floor is `ReliableMemory::floor`, a 64-bit field of the pool header, which
+  makes `RELIABLE_MEMORY_MAGIC` 7. The header grows to 64 bytes with `flags` and room for future
+  fields, and `data` starts on a cache line boundary.
+  Memory of the old layout is never interpreted with the new one: on a magic mismatch
+  `CreateReliablePool()` recreates the pool, as for any format change, and its content returns
+  from the peers by synchronization. A recreated pool has only zero marks, so the
+  initial floor needs no scan; a migration of old pools in place is not planned.
+- **Tracker epochs.** The counter step of `MakeEpoch()` changes from 2 to 4.
+
+### Assumptions
+
+- `node & UINT16_MAX` differs between nodes. Otherwise two authors in one epoch produce equal
+  versions for different content.
+- After a tracker restart, `CLOCK_REALTIME` does not step back by more than one epoch slot. This
+  concerns how version labels are ordered. Correctness of `mark` does not depend on clocks:
+  tokens rely on the floor, and a repeated epoch is covered by I2.
+- Stores of the tracker become visible to the HCA in program order (x86 TSO with coherent DMA).
+- A CRC32C collision (2⁻³²) is accepted as residual risk, as in the synchronous transfer.
+
+### Measurements
+
+Two nodes as in [Testbed](#testbed), 20 s of writes with 30 % frees and payloads up to 256 B, then
+15 s of quiescence, one run per row, the same token revision in both modes, two RDMA READ and
+atomic operations in flight per connection (see [Read Depth and Peak](#read-depth-and-peak) for
+16). A debug build (not part of the tree) counted the barriers, the time the main thread stayed in
+`FlushInstantReplicator()` and the outcome of every optimistic read. Both modes converged fully in
+every run, with no corrupt or stale arrivals and no damaged block left at the end.
+
+| Requested | Mode | Barriers per node | Parked, ms (scull / sandbox) | Reads accepted | DAMAGE (scull / sandbox) |
+|---|---|---|---|---|---|
+| 5 000 ops/s | synchronous | ~35 200 | 4 763 / 4 918 | — | 0 / 0 |
+| 5 000 ops/s | optimistic | ~19 100 | 2 617 / 3 002 | 99.99 % | 4 / 1 |
+| 20 000 ops/s | synchronous | ~15 850 | 8 933 / 8 367 | — | 0 / 0 |
+| 20 000 ops/s | optimistic | ~16 850 | 5 695 / 6 409 | 99.7 % | 346 / 267 |
+
+The optimistic mode takes 21–45 % of the parking away from the main thread; at 5 000 ops/s it also
+halves the number of barriers. Most rejected reads see a changed source `mark`, a few a length or
+checksum torn by a concurrent write of the source.
+
+DAMAGE comes from rejected reads whose synchronous fallback found nothing to transfer. Two further
+optimistic runs at 20 000 ops/s counted the cause at the moment it happened: every DAMAGE on one
+node matched a block that the sender on the other node skipped when it served RETRIEVE.
+
+| Run | DAMAGE (scull / sandbox) | Skipped as missing | Skipped as not flushed | Repaired by a later install | Released by a removal |
+|---|---|---|---|---|---|
+| 1 | 323 / 289 | 306 / 282 | 17 / 7 | 17 / 7 | 302 / 275 |
+| 2 | 320 / 225 | 289 / 216 | 31 / 9 | 31 / 8 | 284 / 214 |
+
+Skipped counts are listed under the receiver that reported the DAMAGE. In 90–98 % of the cases the
+source had released the block by the time RETRIEVE was served: `FreeReliableBlock()` had cleared
+it, often after the read, which then saw a changed `mark` rather than 0 (the read saw 0 in 21–40 %
+of the DAMAGE). In the remaining 2–10 % the source block was live but changed again without a flush,
+4–7 such cases per 100 000 installs. Copies of released objects stayed damaged until the delayed
+removal released them, which is why the count of damaged blocks grows during the writes, up to
+~190 per node, and returns to zero after the removals. The repaired copies match the live cases:
+63 of the 64 were repaired by a later install, and one was released by a removal. The synchronous
+mode skips the same blocks with the content untouched (466 and 368 skips in a run at
+20 000 ops/s), so its old copies stay intact until the removal.
+
+### Read Depth and Peak
+
+`initiator_depth` and `responder_resources` limit the RDMA READ and atomic operations in flight per
+connection. They were 2, which serializes the reads of a batch pairwise. Both ConnectX-4 functions
+of the testbed allow 16, which is now `INSTANT_ATOMIC_COUNT`: the replicator lowers it to the
+weakest local card, and the accepting side does not exceed the depths requested by the initiator.
+
+Parking at 20 000 ops/s, ms (scull / sandbox), one run per cell unless a range is given:
+
+| Mode | Depth 2 | Depth 16 |
+|---|---|---|
+| synchronous | 8 933–9 118 / 8 227–8 560 | 9 098 / 8 311 |
+| optimistic | 5 652–5 924 / 6 357–6 827 | 4 718–4 803 / 4 540–4 584 |
+
+Delivered versions per second in both directions together, 20 s of writes, one run per cell. Above
+the capacity of a node its main thread saturates and writes less, so one direction takes most of
+the transfer; the sum is the comparable figure:
+
+| Requested | Synchronous, depth 2 | Synchronous, depth 16 | Optimistic, depth 2 | Optimistic, depth 16 |
+|---|---|---|---|---|
+| 40 000 ops/s | ~34 000 | ~36 000 | ~41 000 | ~45 000 |
+| 60 000 ops/s | ~35 000 | — | ~42 000 | ~44 000 |
+
+All runs converged for the live objects, with no corrupt or stale arrivals and no damaged block
+left. The optimistic mode raises the ceiling by about 20 %. Depth 16 takes about another fifth of
+the parking away from the optimistic mode and adds 5–10 % at the peak; the synchronous mode, whose
+transfer needs one atomic operation per block, stays within the spread of the runs.
+
+### When to Enable It
+
+The synchronous transfer stays the default; the optimistic mode is an option:
+
+- It trades a part of the parking of the main thread for DAMAGE reported on copies the receiver
+  overwrote by a rejected read. In the runs above 90–98 % of them belonged to objects the source had
+  released by the time it served RETRIEVE; of the live ones, 63 of 64 were repaired by a later
+  install and one was released, all before the end of the run. An application that wants DAMAGE
+  to mean a real transfer failure keeps the synchronous mode.
+- The correctness argument above does not require a single writer per block. A damaged replica is
+  not published (I4), and a reader holding an older offer of it sees a lock, 0 or a fresh token
+  after its read, never the offered `mark` again (I2). A single writer is still advisable: blocks
+  written on two nodes at once can end in DAMAGE on both sides (see
+  [Ownership and Conflicts](#ownership-and-conflicts)).
+
+### Open Questions
+
+- **Released source.** A read rejected because the source released the block could be handled as
+  the removal of the object instead of DAMAGE. It needs a criterion that proves the release of the
+  offered object from a rejected read, including the reuse of the block; none is established yet.
 
 ## Testbed
 
@@ -159,15 +610,27 @@ Each node:
   barrier; above the capacity of the node the actual rate is therefore lower than `-r`;
 - after `-t` seconds stops writing, waits `-q` seconds (removals are applied 10 s after they are
   received, so the quiescence must be longer), prints the totals and an order-independent digest
-  of the pool, and dumps every surviving block (`-o`);
+  of the pool, and dumps every surviving block with a flag for a damaged copy, followed by the
+  identifiers of the own blocks it released (`-o`);
 - keeps its own blocks allocated at exit, because releasing a block of any type sends
-  `INSTANT_TYPE_REMOVE` to the peers that may still be collecting their dumps.
+  `INSTANT_TYPE_REMOVE` to the peers that may still be collecting their dumps;
+- with `-u` sends that many user messages per second from the application thread with `wait`,
+  each carrying a random incarnation of the process and a sequence number; the receiver counts
+  messages out of order (`disorders`), missing before the first connection to their author or
+  across its disconnect (`skipped`) and missing within a connection (`lost`), and the sender the
+  longest wait in
+  `TransmitInstantReplicatorUserMessage()` (`wait_max_ms`); the dump lists the count of sent
+  messages and the last message received from every author, so `Compare.py` detects a lost tail,
+  which leaves no gap to count.
 
 Node identifiers are derived from the node name (`uuid_generate_sha1()` in the OID namespace),
 so a restarted process keeps its identity.
 
 Exit status: `0` passed, `1` setup or runtime failure, `2` verification failure
-(corrupt, damaged or stale arrivals, or no peer connected).
+(corrupt or stale arrivals, DAMAGE without `-O`, user messages out of order or lost without a
+disconnect, or no peer connected). With `-O` a rejected
+optimistic read overwrites the copy, so DAMAGE is expected; the blocks left damaged are judged by
+`Compare.py`, which knows whether the object is still alive at its author.
 
 Example (node A, node B is symmetric):
 
@@ -193,12 +656,25 @@ The dumps of both nodes are compared per author:
 
 Zombies and resurrected blocks are reported but do not fail the comparison.
 
+A damaged block is judged by its identifier, since its payload cannot be trusted:
+
+- a damaged copy of an object that its author still holds fails the comparison;
+- a damaged copy of an object that its author listed as released is a damaged zombie, reported
+  only: a lost removal left it, as for an intact zombie;
+- otherwise the fate of the object is unknown, for example after a restart of the author, which
+  loses its list of released objects; the result is unconfirmed.
+
 When both nodes stop writing at the same time and nothing was lost, the pool digests of the two
 nodes are identical.
 
+With user messages (`-u`), every peer must have received the last message of the incarnation
+of an author that wrote the dump; gaps inside the stream are judged by the test itself, which
+allows them only before the first connection to the author and across its disconnect.
+
 `Tests/Replication/Compare.py` performs this comparison. It takes pairs of node name and dump
-file and exits with `0` when the nodes converged, `1` when blocks are missing or mismatched and
-`2` on a usage error:
+file and exits with `0` when the nodes converged, `1` when blocks are missing or mismatched, a
+live object is damaged or the tail of user messages was lost, `2` on a usage error and `3` when
+damaged blocks of unknown objects are left:
 
 ```bash
 Tests/Replication/Compare.py nodeA nodeA.dump nodeB nodeB.dump
@@ -349,6 +825,25 @@ the clock offset with opposite signs. The one-way values in the tables are the m
 directions for the same percentile, which cancels the static offset; the raw maxima are shown
 per direction.
 
+The final series of 2026-10-09 measured the latency in both modes, 30 s of writes with 30 % frees
+and 2 000 user messages per second on both nodes at once (offset between the nodes about 0.4–0.8
+ms):
+
+| Rate per node | Mode | One-way p50 | One-way p99 | Max (raw, A→B / B→A) |
+|---|---|---|---|---|
+| 5 000 ops/s | optimistic | ~0.27 ms | ~7.5 ms | 25 / 35 ms |
+| 5 000 ops/s | synchronous | ~0.28 ms | ~4.8 ms | 27 / 25 ms |
+| 20 000 ops/s | optimistic | ~0.66 ms | ~21 ms | 43 / 41 ms |
+| 20 000 ops/s | synchronous | ~1.2 ms | ~22 ms | 66 / 66 ms |
+
+The latency covers the whole path from the write to the version seen by the application of the
+peer: change detection by the tracker, the queues, the network, the read or the transfer and the
+barrier of the receiver. The median at 5 000 ops/s is the same as on `d39b85d` (~0.3 ms), while the
+p99 is higher (~3.2 ms there) and varied between 4.8 and 7.5 ms in the runs of 2026-10-09; the
+cause was not analyzed. At 20 000 ops/s the
+optimistic mode halves the median, since most blocks arrive without waiting for the barrier of the
+sender.
+
 Per-stage instrumentation at 100 and 2 000 ops/s (debug builds, not part of the tested revision)
 showed where the time goes:
 
@@ -382,13 +877,61 @@ restarted one. Blocks of the killed incarnation remain on the survivor as zombie
 gone and nobody sends removals for them. After a freeze, the removals sent while the peer was
 stopped are lost in the same way, mostly on the frozen node.
 
+The token revision repeated the scenarios in both modes at 5 000 ops/s with 30 % frees, node B
+disturbed after 8 s: `kill -9` with a restart after 2 s, `SIGSTOP` for 2 s (flap) and for 15 s
+(freeze). Every run converged for the live objects, with no corrupt or stale arrivals; the
+connection teardown that destroys the QP before abandoning the transfers recovered all
+disconnects. Synchronous runs had no DAMAGE. Optimistic runs had 4–51 DAMAGE after a kill or a
+freeze and 1 222 on the node that resumed after the flap, which processed a backlog of offers for
+objects that its peer had released meanwhile (1 194 blocks skipped as missing at the source).
+One optimistic freeze run left a single damaged copy of a released object on the frozen node: its
+removal was lost with the disconnect, as for the 202 intact zombies of that run. A repeated run
+left none.
+
+Before defect 14 was fixed, whether a freeze dropped the connection depended on the moment it hit,
+not on the mode; a debug build logged the failed completions. If the survivor had tasks waiting
+for data of the frozen node (`tasks=9`, LOCK held in one synchronous run), its main thread stayed
+parked in the barrier for the whole stop, sent nothing, and the connection survived. Otherwise the
+survivor kept writing, its NOTIFY messages filled the shared receive queue of the frozen node, and
+the send failed with `RNR retry counter exceeded` (vendor error 0x87) after about 10 s; the pair
+reconnected after `SIGCONT`. Until defect 12 was fixed, the main thread of the survivor also
+stalled for about 9 s of these retries waiting for shared buffers. Since the receiver grants the
+credit (defect 14), the survivor stops sending once the window of the frozen node is used, the
+connection survives the freeze in both modes, the survivor keeps writing with its parking under
+25 ms, and syncing tasks catch the frozen node up after `SIGCONT`.
+
+Since the timeouts of defect 15, a stop longer than about 1 s closes the connection: the window of
+the frozen node is used within a fraction of a second at 5 000 ops/s, the survivor closes the
+connection about 1 s later and connects again after `SIGCONT`, when the initial syncing catches the
+frozen node up. The removals of the survivor during the stop are lost with the connection, so a
+15 s freeze leaves about 2 200 zombies of the survivor on the frozen node (Known Issue 3), where a
+connection kept open had left none.
+
+The final series of 2026-10-09 repeated the scenarios in both modes at 5 000 ops/s with 30 % frees
+and 2 000 user messages per second sent with `wait`, node B disturbed after 8 s: `kill -9` with a
+restart after 2 s and `SIGSTOP` for 2 s (flap), 7 s and 15 s (freeze), with the default timeout of
+1 s. Every run converged for the live objects with no corrupt or stale arrivals and no damaged
+blocks left; synchronous runs had no DAMAGE, optimistic runs 1–94 per node. Each scenario
+disconnected once, the stops included, since even the 2 s flap outlasts the timeout. No user
+message arrived out of order. The test of this series allowed gaps of user messages in any run
+with a disconnect and did not compare the ends of the streams; the stricter check described with
+[defect 15](#defects-found-and-fixed) showed that messages were missing only across the
+disconnect. The
+application thread of node A waited in `TransmitInstantReplicatorUserMessage()` for at most
+1.0–1.2 s while node B was stopped, until the timeout closed the connection, and kept writing
+after it. The zombies followed the length of the disconnect: those of the killed incarnation on
+node A (3 125–3 142), and those of node A on node B after a stop, 483–1 130 after 2 s,
+2 280–2 287 after 7 s and 2 622–2 632 after 15 s. The longest one-way latency on node B, up to
+7.2 s after the 7 s stop and 15.2 s after the freeze, is the age of the versions node A wrote while
+node B was stopped, delivered by the syncing after the reconnect.
+
 ## Known Issues
 
 These issues were reproduced on the testbed and are open.
 
 1. **Rare corrupt arrival after a reconnect.** At most one per run, only in runs with
    disconnects: a zero-filled reserved block is accepted as an arrival. Observed before defect 8
-   was fixed; since then disconnects occurred only in the two freeze runs, which had no corrupt
+   was fixed; the kill, freeze and timeout runs with disconnects since then had no corrupt
    arrivals. Not enough to call it fixed.
 2. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** Before defect 8 was fixed, a remote access error
    occurred within the first seconds in most runs at 20 000 ops/s and in every run with payloads
@@ -396,27 +939,16 @@ These issues were reproduced on the testbed and are open.
    occurred in 20 runs: 12 at 20 000 ops/s, 4 at 10 000 ops/s with payloads up to 4 000 B and 4 at
    higher rates. The cause was not determined, so it is only likely, not
    shown, that defect 8 was the trigger.
-3. **A frozen peer stalls the survivor.** While node B is stopped, its HCA keeps acknowledging
-   messages until its shared receive queue (2 048 buffers) is drained. Node A then waits for
-   `RNR retry counter exceeded` (about 10 s); during the RNR retries its main thread stalls for
-   8.5–8.9 s waiting for shared buffers (issue 4). Since defect 5 is fixed, the error drops the
-   session, node A continues and the pair reconnects after `SIGCONT`.
-4. **The application thread can block indefinitely.** `AllocateSharedBuffer(..., 1)` is called
-   from the application thread (block change and release notifications). When all shared
-   buffers are held by traffic towards a peer that no longer completes it, the application main
-   loop blocks and does not react to `SIGINT`. Node B hung this way right after `SIGCONT` on
-   `d39b85d`. Since the session recovery fixes the wait ends when the failed session is dropped,
-   but it still lasts as long as the RDMA retries (issue 3).
-5. **Tasks under the barrier wait without a timeout.** Tasks of a broken session are dropped now,
-   but a message lost without a QP error would still keep the LOCK/READY barrier raised.
-6. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
+3. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
    (see [Replication Model Boundaries](README.md#replication-model-boundaries)).
 
 ## Defects Found and Fixed
 
 The following defects were found by this test: 1–4 are fixed in `d39b85d`, 5–7 in `eacacff`,
-8 and 9 after `eacacff`.
+8 and 9 after `eacacff`. Defects 10 and 11 were found by code review while specifying the
+[Optimistic Mode](#optimistic-mode) and are fixed in both modes by the token revision, defects
+12–15 after it.
 
 1. **Removals raced the tracker flush.** `ApplyRemoval()` freed blocks on the replicator tick
    outside the LOCK/READY barrier. A concurrent `FlushReliableTracker()` could see the block as
@@ -487,3 +1019,155 @@ Validation of fix 8: no resurrected blocks and no damages in 7 runs at 20 000 op
 
 Validation of fix 9: no stale versions in 17 runs at 20 000 ops/s per node (3 of 15 runs before),
 the vector at connection was 0 in all of them.
+
+10. **A selected but not installed version leaked into offers.** `CollectReadingBlockList()`
+    raised `hint` to the offered version before the data arrived. A block in this state could be
+    offered by the syncing task with its old `mark` and the raised `hint`, and could serve a
+    RETRIEVE: the sender checked only the checksum, and the WRITE carried the raised `hint` with
+    the old data. The peer then held the old data under the newer label and dropped the real newer
+    version until the next change. `Collect` now writes the offer with the pending bit
+    (`hint | 1`); the syncing task and the sender skip a block with a pending `hint` or a local
+    owner, and a WRITE that lands a pending `hint` is rejected.
+11. **An offer was dropped while the block was in transfer.** `CollectReadingBlockList()` dropped
+    an entry whose `mark` was odd, so a newer offer that arrived during a transfer of the same block
+    was lost until the next change. A reading task now acquires all its blocks or none and waits
+    while another task owns one of them.
+
+Validation of fixes 10 and 11: by code; neither defect was reproduced directly. The load and
+failure runs of the token revision in both modes had no stale arrivals and converged for the live
+objects.
+
+12. **A stalled peer blocked the application thread.** The application thread built NOTIFY and
+    REMOVE messages in shared buffers and waited for a free one. A buffer returns to the pool only
+    when its SEND has completed at every peer, so a frozen peer whose sends were retried after
+    `RNR` held all 2 048 buffers, and the main thread of the survivor stalled for 8.5–8.9 s until
+    the session dropped; node B once hung this way right after `SIGCONT` on `d39b85d`. Now:
+    - the application thread never waits and cannot take the last `INSTANT_RESERVE_COUNT` (256)
+      buffers, which stay for RETRIEVE, COMPLETE, CLOCK and syncing;
+    - every connected peer may hold an equal share of the remaining buffers in unfinished sends;
+      a NOTIFY beyond it, or one that found no buffer, is counted as lost for the peer;
+    - a peer whose count of lost notifications differs from the value at the start of its last
+      syncing (`lost` and `last`) gets a new syncing task once its unfinished sends have dropped
+      below half of its share; the syncing takes at most that half, so notifications keep the
+      rest, and losses during a syncing start the next one; a block skipped by a syncing because
+      a transfer holds it counts as lost;
+    - REMOVE and user messages are built once in a shared buffer and go through the lock-free
+      sending queue, like NOTIFY, so the application thread takes no lock; the replicator thread
+      moves them to an ordered list of its own and sends them to every connected peer within its
+      credit, returning the buffer when every peer has it, so a busy peer delays them instead of
+      losing them; a peer that connects later starts at the end of the list, as before. At most
+      `INSTANT_MESSAGE_COUNT` (512) messages are queued: beyond it, or without a free buffer, a
+      removal is dropped, which leaves a zombie on the peers like a removal lost with a
+      disconnect, and a user message is refused with `-EBUSY`, or with `wait` the application
+      thread waits until the peers take the queued messages (`-EFAULT` when the replicator has
+      stopped or failed); the replicator thread, including the event handlers, never waits, since
+      it is the one that empties the queue. A stopped peer delays the waiting thread for about 1 s
+      (defect 15).
+
+Validation of fix 12: in freeze runs of both modes the survivor kept writing about 3 800 versions
+per second through the whole stop, where it had stalled for about 9 s; the send still failed with
+`RNR retry counter exceeded` and the pair reconnected. Load runs at 20 000 ops/s converged in both
+modes, and in a kill run the zombies were only those of the killed incarnation. With node B stopped
+for 7 s at 20 000 ops/s, short of the RNR timeout, node A counted the notifications it could not
+send and caught node B up with 1–2 syncing tasks after the stop (11 in a row before the syncing
+yielded half of the share to the notifications); the live objects converged.
+
+13. **A removal released a block owned by a transfer.** `ApplyRemoval()` freed the block of an
+    expired removal under the barrier without checking whether a reading task had acquired it. The
+    transfer then wrote into a free block: a READ or WRITE could still land there, and the abandoned
+    entry stored its pending `hint` and identifier into it. When the application allocated the
+    block for a new object of its own, the object kept the pending bit, and the tracker never
+    published it. A removal of a block that a transfer owns now waits at the head of the queue
+    until the transfer ends.
+
+Validation of fix 13: one run with node B stopped for 7 s left three own objects of node B with a
+pending `hint`, found by `Compare.py`, which now fails on a damaged own block; the repeated runs
+after the fix left none.
+
+14. **A SEND stuck in `RNR` held up the transfers of the connection.** Messages and transfers share
+    one RC connection per peer. When the shared receive queue of a peer was full, because its
+    process was stopped or behind, a SEND was retried after `RNR`, and the READ, CAS and WRITE work
+    requests posted after it on the same send queue waited too. The survivor of a 7 s stop stayed
+    parked for 1–2 s per barrier on optimistic reads that could not complete, the resumed node for
+    up to 10 s on reads and on data from the survivor, and a 15 s freeze ended with
+    `RNR retry counter exceeded` and a reconnect. The local credit of fix 12 limits unfinished
+    sends, but the HCA of the peer completes a SEND as soon as it places it into a receiving buffer,
+    so the queue of a stopped peer still filled up. Now the receiver grants the credit:
+    - every peer gets a window of messages that consume a receiving buffer: SEND and
+      `RDMA_WRITE_WITH_IMM`; the windows of all connected peers together stay within the shared
+      receive queue less `INSTANT_CREDIT_RESERVE` (64) buffers kept for the credit reports;
+    - every SEND returns in its `imm_data` the count of messages received from the peer (the card
+      number keeps the low `INSTANT_CREDIT_SHIFT` bits); `INSTANT_TYPE_CREDIT` announces a window
+      and confirms the window applied to the peer, and is sent when the window changes, when the
+      peer must be confirmed or when half of the window was used without another message to carry
+      the count; at most one report per peer is in flight;
+    - a window starts at 0, so nothing but reports goes to a peer before it has announced one; a
+      peer may use any window announced to it until it confirms the last one, so the receiver
+      counts the largest of them as used and a new peer gets only what the others leave free;
+      a new window is announced only after the previous change is confirmed, so a confirmation
+      cannot be taken for a later change of the same size;
+    - a writing task takes its credit before the CAS, for the `RDMA_WRITE_WITH_IMM` or COMPLETE
+      that ends it; a message without a credit waits (RETRIEVE, syncing, queued messages) or counts
+      as lost (NOTIFY).
+
+    Buffers are returned to the receive queue on the replicator thread at once, so credits come
+    back while the application is parked and the barriers of two nodes do not wait for each other.
+
+    A reading batch of a barrier is also bounded now. A barrier serves the reading tasks known when
+    it was raised, at most `INSTANT_BARRIER_COUNT` (1 024) entries, and the next barrier is raised
+    only after the application has returned from the previous one; writing tasks are always served,
+    since deferring them would make two barriers wait for each other. This keeps a backlog from
+    holding one barrier, but alone it shortened the stall after a 7 s stop only from about 16 s to
+    4–10 s: the rest was this defect.
+
+Validation of fix 14 at 20 000 ops/s with 30 % frees: with node B stopped for 7 s, the longest
+single parking was 35–52 ms on both nodes (4–10 s before), with 2 syncing tasks and no disconnect;
+a 15 s freeze in both modes no longer dropped the connection, the survivor was parked for at most
+14–23 ms, and 3 syncing tasks caught the frozen node up; a kill with a restart reconnected from
+windows of 0.
+All runs converged for the live objects. Load runs without failures changed within the spread of
+the runs: parking 5.0–5.5 s optimistic and 9.5–10.2 s synchronous per node over 20 s, the same
+delivered versions.
+
+15. **A stopped peer held the barrier and the queues without a limit.** The barrier waited for its
+    transfers without a timeout (formerly Known Issue 3): a RETRIEVE lost without a QP error, or a
+    peer that stopped while its HCA still acknowledged the transport, kept LOCK and READY raised
+    until the peer resumed. With the credit of defect 14 a stopped peer no longer breaks the
+    connection by `RNR`, so the queued messages for it, and a user message waiting for a place in the
+    queue, also waited for it. Now:
+    - a reading or writing task that waits for data, a buffer or a completion and has not advanced
+      for the timeout of the replicator (1 s by default, see [Timeouts](#timeouts)) closes the
+      connection of its peer; a change of the state of the task and a completed CAS count as
+      progress;
+    - a peer whose credit window is used up, a zero window included, and which has sent nothing for
+      the same timeout is closed too: a live peer announces its first window right after the
+      connect and reports at the latest when half of the window is used, so this covers a peer
+      stopped before its first announcement;
+    - the connection is closed by the replicator itself through the disconnect path, since a stopped
+      peer does not answer DREQ: with `rdma_disconnect()` alone the disconnect came only after
+      `SIGCONT`, 13 s after the timeout of a 15 s freeze.
+
+Validation of fix 15 at 5 000 ops/s with 30 % frees: a RETRIEVE dropped on purpose by node B kept a
+synchronous reading task of node A waiting until the task timeout closed the connection about 1 s
+later; the pair reconnected 1.2 s after and converged. In a 15 s freeze of node B in both modes, node
+A closed the connection about 1.3 s after the stop began and reconnected after `SIGCONT`; a kill
+with a restart behaved as before. Load runs without failures had no timeouts and no disconnects.
+All runs converged for the live objects, with no corrupt or stale arrivals.
+
+Further checks with 2 000 user messages per second sent with `wait` from the application thread:
+under load without failures every message arrived in order and the longest wait was 0.1 ms; in a
+15 s freeze the sender waited 1.15–1.21 s until the connection was closed, and the messages missing
+at the receiver were exactly those sent while the connection was down. A RETRIEVE dropped in the
+optimistic mode closed the connection about 1 s later as well. Node B stopped right after
+`RDMA_CM_EVENT_ESTABLISHED`, before it announced a window, was closed by node A about 1 s later in
+both modes, connected again after `SIGCONT` and converged. With the timeout set to 400 ms and
+3 000 ms the sender waited 0.58 s and 3.06 s in a freeze, the bound rounded up to whole ticks.
+
+The stricter check of the test allows a gap of user messages only before the first connection to
+the author and across its disconnect, and `Compare.py` compares the last message received from
+every author with the count it sent, since a lost tail leaves no gap. Load, `kill -9` with a restart
+in both modes, flaps in both modes, a 7 s stop and a freeze all passed it: no message was lost
+within a connection, every stream ended with the last message sent, and the messages missing
+across a disconnect were those sent while the connection was down (1 040–23 320 per run); a
+restarted node received the stream of its peer from the point of its connection. A dump with one
+more sent message than was received was reported by `Compare.py` as a lost tail.

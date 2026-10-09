@@ -25,7 +25,7 @@ extern "C"
 {
 #endif
 
-#define RELIABLE_MEMORY_MAGIC        5
+#define RELIABLE_MEMORY_MAGIC        7
 #define RELIABLE_MEMORY_NAME_LENGTH  8
 
 #define RELIABLE_TYPE_FREE             0
@@ -75,10 +75,12 @@ struct ReliableBlock
 struct ReliableMemory  // Structure behind the mmap
 {
   uint32_t magic;                          // RELIABLE_MEMORY_MAGIC
+  uint32_t flags;                          // Optional pool flags
   uint32_t size;                           // Block size including sizeof(struct ReliableBlock)
-  ATOMIC(uint64_t) free;                   // First free block
   ATOMIC(uint32_t) length;                 // Length of pool in blocks
-  uint32_t reserved;                       //
+  ATOMIC(uint64_t) free;                   // First free block
+  ATOMIC(uint64_t) floor;                  // Floor of tokens reserved by monitors
+  uint64_t reserved[3];                    //
   char name[RELIABLE_MEMORY_NAME_LENGTH];  //
   uint8_t data[0];
 };
@@ -129,6 +131,9 @@ void ReleaseReliableBlock(struct ReliableDescriptor* descriptor, int type);
 
 // Should be used inside the call of ReliableRecoveryFunction
 void* RecoverReliableBlock(struct ReliableDescriptor* descriptor, struct ReliablePool* pool, struct ReliableBlock* block);
+
+// Should be used by the application after rewriting a block reported by RELIABLE_MONITOR_BLOCK_DAMAGE
+void RepairReliableBlock(struct ReliablePool* pool, struct ReliableBlock* block);
 
 // Following functions should be use internally
 

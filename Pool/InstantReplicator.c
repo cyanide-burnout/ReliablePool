@@ -7,6 +7,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
@@ -19,10 +20,12 @@
 #define RING_TAG_READY_STATE    (LIBURING_UDATA_TIMEOUT - 2ULL)
 #define RING_TAG_EVENT_CHANNEL  (LIBURING_UDATA_TIMEOUT - 3ULL)
 #define RING_TAG_SENDING_QUEUE  (LIBURING_UDATA_TIMEOUT - 4ULL)
+#define RING_TAG_RETURN_STATE   (LIBURING_UDATA_TIMEOUT - 5ULL)
 
 #define GENERIC_POLL_TIMEOUT       200
 #define COOKIE_EXPIRATION_COUNT    (60000 / GENERIC_POLL_TIMEOUT)
 #define REMOVAL_EXPIRATION_COUNT   (10000 / GENERIC_POLL_TIMEOUT)
+#define PEER_EXPIRATION_TIMEOUT    1000
 #define CONNECTION_ATTEMPT_COUNT   128
 #define READING_ATTEMPT_COUNT      3
 
@@ -32,11 +35,12 @@
 #define io_uring_set_iowait(ring, value)
 #endif
 
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-#define WATCH(address)  ((uint32_t*)(address))
-#else
-#define WATCH(address)  ((uint32_t*)(address) + 1)
-#endif
+#define RELEASE(variable, function)                                         \
+  for (__typeof__(variable) temporary; (temporary = (variable)) != NULL; )  \
+  {                                                                         \
+    (variable) = temporary->next;                                           \
+    function(temporary);                                                    \
+  }
 
 _Static_assert(sizeof(struct InstantHandshakeData) <= 56,                                                 "private_data_len for RDMA_PS_TCP must be maximum 56 bytes in length");
 _Static_assert((sizeof(struct InstantSharedBuffer)             % sizeof(uint64_t)) == 0,                  "Size of InstantSharedBuffer must be 64-bit aligned");
@@ -44,6 +48,7 @@ _Static_assert((offsetof(struct InstantSharedBuffer, values)   % sizeof(uint64_t
 _Static_assert((offsetof(struct InstantSharedBufferList, data) % sizeof(uint64_t)) == 0,                  "InstantSharedBufferList.data must be 64-bit aligned");
 _Static_assert((offsetof(struct InstantReplicator, buffers)    % sizeof(uint64_t)) == 0,                  "InstantReplicator.buffers must be 64-bit aligned");
 _Static_assert((INSTANT_QUEUE_LENGTH != 0) && ((INSTANT_QUEUE_LENGTH & (INSTANT_QUEUE_LENGTH - 1)) == 0), "INSTANT_QUEUE_LENGTH must be a power of two");
+_Static_assert(INSTANT_CARD_COUNT <= (1 << INSTANT_CREDIT_SHIFT),                                         "Card number must fit into the low bits of imm_data");
 
 // Helpers
 
@@ -72,6 +77,7 @@ static inline uint32_t PushSharedBuffer(struct InstantSharedBufferList* list, st
   }
   while (!atomic_compare_exchange_weak_explicit(&list->stack, &current, next, memory_order_release, memory_order_relaxed));
 
+  atomic_fetch_add_explicit(&list->count, 1, memory_order_seq_cst);
   return current;
 }
 
@@ -98,6 +104,12 @@ static inline struct InstantSharedBuffer* PopSharedBuffer(struct InstantSharedBu
   }
   while (!atomic_compare_exchange_weak_explicit(&list->stack, &current, next, memory_order_acq_rel, memory_order_relaxed));
 
+  if (buffer != NULL)
+  {
+    // Counted after the pop, so the count never exceeds the buffers on the stack
+    atomic_fetch_sub_explicit(&list->count, 1, memory_order_relaxed);
+  }
+
   return buffer;
 }
 
@@ -117,26 +129,51 @@ static void InitializeSharedBufferList(struct InstantSharedBufferList* list)
   }
 }
 
-static struct InstantSharedBuffer* AllocateSharedBuffer(struct InstantSharedBufferList* list, int wait)
+static struct InstantSharedBuffer* AllocateSharedBuffer(struct InstantSharedBufferList* list, uint32_t reserve, int wait)
 {
   struct InstantSharedBuffer* buffer;
+  struct timespec interval;
+  uint32_t count;
+  int result;
+
+  interval.tv_sec  = 0;
+  interval.tv_nsec = GENERIC_POLL_TIMEOUT * 1000000L;
 
   for ( ; ; )
   {
-    if (buffer = PopSharedBuffer(list))
+    if ((atomic_load_explicit(&list->count, memory_order_seq_cst) > reserve) &&
+        (buffer = PopSharedBuffer(list)))
     {
       buffer->length = 0U;
       atomic_store_explicit(&buffer->count, 1, memory_order_relaxed);
       return buffer;
     }
 
-    if ((wait == 0) ||
-        (syscall(SYS_futex, WATCH(&list->stack), FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, UINT32_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+    if (wait == 0)
+    {
+      // Do not wait
+      return NULL;
+    }
+
+    // The waiter is registered before the count is read again, so a release in between wakes it or changes the count
+    atomic_fetch_add_explicit(&list->waiters, 1, memory_order_seq_cst);
+
+    result = 0;
+    count  = atomic_load_explicit(&list->count, memory_order_seq_cst);
+
+    if (count <= reserve)
+    {
+      // Sleep until the count of free buffers changes, on a timeout the caller rechecks its own conditions
+      result = syscall(SYS_futex, (uint32_t*)&list->count, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, count, &interval, NULL, 0);
+    }
+
+    atomic_fetch_sub_explicit(&list->waiters, 1, memory_order_seq_cst);
+
+    if ((result < 0)     &&
         (errno != EINTR) &&
         (errno != EAGAIN))
-
     {
-      //
+      // Timed out or unexpected failure of futex
       return NULL;
     }
   }
@@ -145,11 +182,16 @@ static struct InstantSharedBuffer* AllocateSharedBuffer(struct InstantSharedBuff
 static void ReleaseSharedBuffer(struct InstantSharedBufferList* list, struct InstantSharedBuffer* buffer)
 {
   if ((buffer != NULL) &&
-      (atomic_fetch_sub_explicit(&buffer->count, 1, memory_order_relaxed) == 1) &&
-      (PushSharedBuffer(list, buffer) == UINT32_MAX))
+      (atomic_fetch_sub_explicit(&buffer->count, 1, memory_order_relaxed) == 1))
   {
-    while ((syscall(SYS_futex, WATCH(&list->stack), FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
-           (errno == EINTR));
+    PushSharedBuffer(list, buffer);
+
+    if (atomic_load_explicit(&list->waiters, memory_order_seq_cst) != 0)
+    {
+      // Every waiter rechecks the count against its own reserve
+      while ((syscall(SYS_futex, (uint32_t*)&list->count, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+             (errno == EINTR));
+    }
   }
 }
 
@@ -317,8 +359,9 @@ static void SubmitTask(struct InstantReplicator* replicator, struct InstantTask*
 {
   struct InstantTask* other;
 
-  task->previous = replicator->schedule.tail;
-  task->number   = replicator->schedule.number ++;
+  task->previous   = replicator->schedule.tail;
+  task->number     = replicator->schedule.number ++;
+  task->expiration = replicator->tick + replicator->timeout;
 
   if (other = task->previous)  other->next               = task;
   else                         replicator->schedule.head = task;
@@ -356,6 +399,43 @@ static void RemoveTask(struct InstantReplicator* replicator, struct InstantTask*
     replicator->tasks           = task;
     replicator->schedule.count -= task->type >= INSTANT_TASK_TYPE_READING;
   }
+}
+
+static void RemoveTransferEntry(struct InstantTask* task, uint32_t index)
+{
+  task->transfer.count --;
+
+  memmove(task->transfer.entries + index, task->transfer.entries + index + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
+  memmove(task->transfer.states  + index, task->transfer.states  + index + 1, (task->transfer.count - index) * sizeof(struct InstantEntryState));
+}
+
+static int CheckBlockOwner(struct InstantReplicator* replicator, struct InstantTask* self, const char* name, uint32_t number)
+{
+  struct InstantTask* task;
+  uint32_t index;
+
+  for (task = replicator->schedule.head; task != NULL; task = task->next)
+  {
+    if ((task != self) &&
+        (((task->type  == INSTANT_TASK_TYPE_READING) &&
+          (task->state != INSTANT_TASK_STATE_IDLE)   &&
+          (task->state != INSTANT_TASK_STATE_WAIT_LOCK)) ||
+         ((task->type  == INSTANT_TASK_TYPE_WRITING) &&
+          (task->state == INSTANT_TASK_STATE_WAIT_COMPLETION))) &&
+        (memcmp(task->name, name, RELIABLE_MEMORY_NAME_LENGTH) == 0))
+    {
+      for (index = 0; index < task->transfer.count; ++ index)
+      {
+        if (task->transfer.states[index].number == number)
+        {
+          // Acquired by a reading task or served by a writing task
+          return 1;
+        }
+      }
+    }
+  }
+
+  return 0;
 }
 
 // Cookies
@@ -447,6 +527,38 @@ static struct InstantCookie* FindCookie(struct InstantReplicator* replicator, co
   }
 
   return cookie;
+}
+
+static uint64_t MakeToken(struct InstantReplicator* replicator, struct InstantCookie* cookie)
+{
+  struct ReliableMemory* memory;
+  uint64_t floor;
+
+  if (cookie->token == cookie->limit)
+  {
+    memory = cookie->share->memory;
+    floor  = atomic_load_explicit(&memory->floor, memory_order_relaxed);
+
+    if (floor > ((UINT64_MAX >> 2) - INSTANT_TOKEN_RANGE))
+    {
+      // Exhausted, the counter never wraps
+      return 0ULL;
+    }
+
+    // The range is reserved before use, its unused rest is skipped after a restart
+    atomic_store_explicit(&memory->floor, floor + INSTANT_TOKEN_RANGE, memory_order_release);
+
+    if (msync(memory, replicator->size, MS_SYNC) < 0)
+    {
+      // The floor of a file-backed pool must reach the disk before any block with a token of the range
+      return 0ULL;
+    }
+
+    cookie->token = floor;
+    cookie->limit = floor + INSTANT_TOKEN_RANGE;
+  }
+
+  return ((cookie->token ++) << 2) | 2ULL;
 }
 
 static void RetireCookie(struct InstantReplicator* replicator, struct ReliablePool* pool)
@@ -555,7 +667,7 @@ static void CreateRemoval(struct InstantReplicator* replicator, struct InstantRe
   }
 }
 
-static void ApplyRemoval(struct InstantReplicator* replicator, struct InstantRemoval* removal)
+static int ApplyRemoval(struct InstantReplicator* replicator, struct InstantRemoval* removal)
 {
   struct ReliableMemory* memory;
   struct InstantCookie* cookie;
@@ -567,6 +679,13 @@ static void ApplyRemoval(struct InstantReplicator* replicator, struct InstantRem
   pool   = NULL;
   cookie = NULL;
   number = FindReliableBlockNumber(replicator->indexer, removal->data.name, removal->data.identifier);
+
+  if ((number != UINT32_MAX) &&
+      (CheckBlockOwner(replicator, NULL, removal->data.name, number) != 0))
+  {
+    // A transfer still owns the block and DMA may reach it, the removal waits for the transfer
+    return -1;
+  }
 
   if ((number != UINT32_MAX) &&
       (pool    = FindReliablePool(replicator->indexer, removal->data.name, 1)) &&
@@ -590,6 +709,7 @@ static void ApplyRemoval(struct InstantReplicator* replicator, struct InstantRem
   }
 
   RetireReliablePool(pool);
+  return 0;
 }
 
 static void TrackRemovalList(struct InstantReplicator* replicator)
@@ -599,13 +719,12 @@ static void TrackRemovalList(struct InstantReplicator* replicator)
   pthread_mutex_lock(&replicator->lock);
 
   while ((removal = replicator->removals.head) &&
-         (replicator->tick > removal->expiration))
+         (replicator->tick > removal->expiration) &&
+         (ApplyRemoval(replicator, removal) == 0))
   {
     replicator->removals.head  = removal->next;
     removal->next              = replicator->removals.stack;
     replicator->removals.stack = removal;
-
-    ApplyRemoval(replicator, removal);
   }
 
   if (replicator->removals.head == NULL)
@@ -626,36 +745,202 @@ static int CheckRemovalList(struct InstantReplicator* replicator)
 
 // Submissions
 
-static int SubmitSharedBuffer(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantSharedBuffer* buffer)
+static uint32_t GetPeerCredit(struct InstantReplicator* replicator)
 {
-  struct InstantRequestItem* item;
-  struct InstantCard* card;
-  struct ibv_mr* region;
+  struct InstantPeer* peer;
+  uint32_t count;
 
-  if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
-      (card = peer->card)                           &&
-      (item = AllocateRequestItem(replicator)))
+  count = 0;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
   {
-    region                   = card->region2;
-    item->element.addr       = (uintptr_t)buffer->data;
-    item->element.length     = buffer->length;
-    item->element.lkey       = region->lkey;
-    item->request.wr_id      = (uintptr_t)buffer;
-    item->request.sg_list    = &item->element;
-    item->request.num_sge    = 1;
-    item->request.opcode     = IBV_WR_SEND_WITH_IMM;
-    item->request.send_flags = IBV_SEND_SIGNALED;
-    item->request.imm_data   = card->number;
+    // Every connected peer gets an equal share of the buffers beyond the reserve
+    count += (peer->state == INSTANT_PEER_STATE_CONNECTED);
+  }
 
-    atomic_fetch_add_explicit(&buffer->count, 1, memory_order_relaxed);
-    AppendRequestQueue(&peer->queue, item);
+  pthread_mutex_unlock(&replicator->lock);
+
+  return (INSTANT_QUEUE_LENGTH - INSTANT_RESERVE_COUNT) / (count | !count);
+}
+
+static int AcquirePeerCredit(struct InstantPeer* peer)
+{
+  if ((peer->credit.sent - peer->credit.acknowledged) < peer->credit.window)
+  {
+    // A receiving buffer of the peer is free for this message
+    peer->credit.sent ++;
     return 0;
   }
 
   return -1;
 }
 
-static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block)
+static void ReleasePeerCredit(struct InstantReplicator* replicator, struct InstantCard* card, uint32_t number, uint64_t work)
+{
+  struct InstantPeer* peer;
+  struct rdma_cm_id* descriptor;
+  struct ibv_qp* pair;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    if ((peer->card == card)            &&
+        (descriptor = peer->descriptor) &&
+        (pair       = descriptor->qp)   &&
+        (pair->qp_num == number)        &&
+        (peer->pending > 0))
+    {
+      // A SEND of this connection has completed
+      peer->credit.buffer = (peer->credit.buffer == (struct InstantSharedBuffer*)work) ? NULL : peer->credit.buffer;
+      peer->pending --;
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
+static uint32_t UpdatePeerCredit(struct InstantReplicator* replicator, struct InstantCard* card, struct ibv_wc* completion)
+{
+  struct InstantPeer* peer;
+  struct rdma_cm_id* descriptor;
+  struct ibv_qp* pair;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    if ((peer->card == card)            &&
+        (descriptor = peer->descriptor) &&
+        (pair       = descriptor->qp)   &&
+        (pair->qp_num == completion->qp_num))
+    {
+      // The receiving buffer has been posted again, the peer gets the credit back with the next report
+      peer->credit.received ++;
+
+      if ((completion->opcode   == IBV_WC_RECV) &&
+          (completion->wc_flags &  IBV_WC_WITH_IMM))
+      {
+        // The count of our messages received by the peer comes in the high bits of imm_data
+        peer->credit.acknowledged += ((completion->imm_data >> INSTANT_CREDIT_SHIFT) - peer->credit.acknowledged) & (UINT32_MAX >> INSTANT_CREDIT_SHIFT);
+      }
+
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+
+  return completion->imm_data & ((1U << INSTANT_CREDIT_SHIFT) - 1);
+}
+
+static int SubmitSharedBuffer(struct InstantReplicator* replicator, struct InstantPeer* peer, struct InstantSharedBuffer* buffer, int credit)
+{
+  struct InstantRequestItem* item;
+  struct InstantCard* card;
+  struct ibv_mr* region;
+
+  if ((peer->state != INSTANT_PEER_STATE_CONNECTED) ||
+      !(card = peer->card)                          ||
+      !(item = AllocateRequestItem(replicator)))
+  {
+    // Not connected or out of memory
+    return -1;
+  }
+
+  if ((credit == INSTANT_CREDIT_ACQUIRE) &&
+      (AcquirePeerCredit(peer) < 0))
+  {
+    // The window of the peer is full, a SEND would wait for RNR and block the queue
+    ReleaseRequestItem(replicator, item);
+    return -1;
+  }
+
+  // Every message reports to the peer how many of its messages were received, a held credit was counted in advance
+  peer->credit.sent     += (credit == INSTANT_CREDIT_FREE);
+  peer->credit.reported  = peer->credit.received;
+
+  region                   = card->region2;
+  item->element.addr       = (uintptr_t)buffer->data;
+  item->element.length     = buffer->length;
+  item->element.lkey       = region->lkey;
+  item->request.wr_id      = (uintptr_t)buffer;
+  item->request.sg_list    = &item->element;
+  item->request.num_sge    = 1;
+  item->request.opcode     = IBV_WR_SEND_WITH_IMM;
+  item->request.send_flags = IBV_SEND_SIGNALED;
+  item->request.imm_data   = card->number | (peer->credit.received << INSTANT_CREDIT_SHIFT);
+
+  atomic_fetch_add_explicit(&buffer->count, 1, memory_order_relaxed);
+  AppendRequestQueue(&peer->queue, item);
+  peer->pending ++;
+  return 0;
+}
+
+static struct InstantRequestItem* SubmitReadingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block)
+{
+  struct InstantRequestItem* item;
+
+  // Use ReserveRequestItemList() first to make guaranteed allocation
+  // The local mark keeps the lock, the data is read after it
+
+  item = AllocateRequestItem(replicator);
+
+  item->element.addr                = (uintptr_t)&block->mark + sizeof(uint64_t);
+  item->element.length              = entry->length - sizeof(uint64_t);
+  item->element.lkey                = region->lkey;
+  item->request.sg_list             = &item->element;
+  item->request.num_sge             = 1;
+  item->request.opcode              = IBV_WR_RDMA_READ;
+  item->request.wr.rdma.remote_addr = entry->address + sizeof(uint64_t);
+  item->request.wr.rdma.rkey        = key;
+
+  AppendRequestQueue(&peer->queue, item);
+  return item;
+}
+
+static int UpdateReadingWork(struct InstantRequestItem* item, struct InstantTask* task)
+{
+  if (item != NULL)
+  {
+    item->request.wr_id       = (uintptr_t)task;
+    item->request.send_flags |= IBV_SEND_SIGNALED;
+    return 0;
+  }
+
+  return -1;
+}
+
+static struct InstantRequestItem* SubmitCheckingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, uint32_t key, struct InstantBlockData* entry, uint64_t* result)
+{
+  struct InstantRequestItem* item;
+  struct InstantCard* card;
+  struct ibv_mr* region;
+
+  // Use ReserveRequestItemList() first to make guaranteed allocation
+  // Reads the mark of the source after the data to check that the offered version was kept
+
+  card = peer->card;
+  item = AllocateRequestItem(replicator);
+
+  region                            = card->region2;
+  item->element.addr                = (uintptr_t)result;
+  item->element.length              = sizeof(uint64_t);
+  item->element.lkey                = region->lkey;
+  item->request.sg_list             = &item->element;
+  item->request.num_sge             = 1;
+  item->request.opcode              = IBV_WR_RDMA_READ;
+  item->request.wr.rdma.remote_addr = entry->address;
+  item->request.wr.rdma.rkey        = key;
+
+  AppendRequestQueue(&peer->queue, item);
+  return item;
+}
+
+static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* replicator, struct InstantPeer* peer, uint32_t key, struct InstantBlockData* entry, struct ibv_mr* region, struct ReliableBlock* block, uint64_t* token)
 {
   struct InstantRequestItem* item;
   struct InstantCard* card;
@@ -678,7 +963,9 @@ static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* re
   AppendRequestQueue(&peer->queue, item);
   item = AllocateRequestItem(replicator);
 
-  item->element.addr                = (uintptr_t)&block->mark;
+  // The transfer completes with the token assigned by the receiver, never with the mark of the source
+  region                            = card->region2;
+  item->element.addr                = (uintptr_t)token;
   item->element.length              = sizeof(uint64_t);
   item->element.lkey                = region->lkey;
   item->request.sg_list             = &item->element;
@@ -726,7 +1013,7 @@ static struct InstantRequestItem* SubmitExchangingWork(struct InstantReplicator*
   item->request.wr.atomic.remote_addr = entry->address;
   item->request.wr.atomic.rkey        = key;
   item->request.wr.atomic.compare_add = entry->mark;
-  item->request.wr.atomic.swap        = entry->mark | 1ULL;
+  item->request.wr.atomic.swap        = entry->hint | 1ULL;
 
   AppendRequestQueue(&peer->queue, item);
   return item;
@@ -768,7 +1055,7 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
 
     if ((buffer == NULL) &&
         (cookie  = EnsureCookie(replicator, pool)) &&
-        (buffer  = AllocateSharedBuffer(&replicator->buffers, 1)))
+        (buffer  = AllocateSharedBuffer(&replicator->buffers, INSTANT_RESERVE_COUNT, 0)))
     {
       pthread_mutex_lock(&replicator->lock);
       header         = (struct InstantHeaderData*)buffer->data;
@@ -795,6 +1082,11 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
       buffer->length += sizeof(struct InstantBlockData);
       uuid_copy(entry->identifier, block->identifier);
     }
+    else
+    {
+      // The application thread never waits for a buffer, the peers catch up by a syncing task
+      atomic_fetch_add_explicit(&replicator->loss.count, 1, memory_order_relaxed);
+    }
   }
 
   if ((buffer != NULL) &&
@@ -808,28 +1100,91 @@ static void HandleBlockChange(struct InstantReplicator* replicator, struct Relia
   }
 }
 
-static void HandleBlockRelease(struct InstantReplicator* replicator, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block)
+static int AppendMessage(struct InstantReplicator* replicator, uint32_t type, const void* data, uint32_t length, int wait)
 {
   struct InstantSharedBuffer* buffer;
-  struct InstantRemovalData* removal;
   struct InstantHeaderData* header;
+  struct timespec interval;
+  uint32_t count;
+
+  interval.tv_sec  = 0;
+  interval.tv_nsec = GENERIC_POLL_TIMEOUT * 1000000L;
+  count            = atomic_load_explicit(&replicator->messages.length, memory_order_relaxed);
+
+  while ((count >= INSTANT_MESSAGE_COUNT) ||
+         !atomic_compare_exchange_weak_explicit(&replicator->messages.length, &count, count + 1, memory_order_relaxed, memory_order_relaxed))
+  {
+    if (count < INSTANT_MESSAGE_COUNT)
+    {
+      // Another thread took a place in between
+      continue;
+    }
+
+    if (wait == 0)
+    {
+      // A stalled peer must not take the whole pool
+      return -EBUSY;
+    }
+
+    if ((atomic_load_explicit(&replicator->state, memory_order_relaxed) & (INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_FAILURE)) != INSTANT_REPLICATOR_STATE_ACTIVE)
+    {
+      // The replicator has stopped or failed
+      return -EFAULT;
+    }
+
+    // The waiter is registered before the length is read again, so SendMessageList() wakes it or the length has changed,
+    // a stopped peer releases the queue by its disconnect
+    atomic_fetch_add_explicit(&replicator->messages.waiters, 1, memory_order_seq_cst);
+
+    if ((count = atomic_load_explicit(&replicator->messages.length, memory_order_seq_cst)) >= INSTANT_MESSAGE_COUNT)
+    {
+      // Sleep until a message leaves the queue, on a timeout the state is checked again
+      syscall(SYS_futex, (uint32_t*)&replicator->messages.length, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, count, &interval, NULL, 0);
+      count = atomic_load_explicit(&replicator->messages.length, memory_order_relaxed);
+    }
+
+    atomic_fetch_sub_explicit(&replicator->messages.waiters, 1, memory_order_seq_cst);
+  }
+
+  // The message is built once in a shared buffer and goes through the lock-free sending queue,
+  // the queue has a place for every buffer
+  while (!(buffer = AllocateSharedBuffer(&replicator->buffers, INSTANT_RESERVE_COUNT, wait)))
+  {
+    if ((wait == 0) ||
+        ((atomic_load_explicit(&replicator->state, memory_order_relaxed) & (INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_FAILURE)) != INSTANT_REPLICATOR_STATE_ACTIVE))
+    {
+      // The place is given back
+      atomic_fetch_sub_explicit(&replicator->messages.length, 1, memory_order_relaxed);
+      return (wait == 0) ? -EBUSY : -EFAULT;
+    }
+  }
+
+  header         = (struct InstantHeaderData*)buffer->data;
+  header->type   = type;
+  header->task   = UINT32_MAX;
+  buffer->length = sizeof(struct InstantHeaderData) + length;
+
+  uuid_copy(header->identifier, replicator->identifier);
+  memcpy(buffer->data + sizeof(struct InstantHeaderData), data, length);
+
+  // The replicator thread moves it to the message queue
+  AppendSendingQueue(&replicator->queue, buffer);
+  return 0;
+}
+
+static void HandleBlockRelease(struct InstantReplicator* replicator, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block)
+{
+  struct InstantRemovalData removal;
   struct ReliableMemory* memory;
 
-  if (buffer = AllocateSharedBuffer(&replicator->buffers, 1))
-  {
-    memory         = share->memory;
-    header         = (struct InstantHeaderData*)buffer->data;
-    header->type   = INSTANT_TYPE_REMOVE;
-    header->task   = UINT32_MAX;
-    buffer->length = sizeof(struct InstantHeaderData) + sizeof(struct InstantRemovalData);
-    removal        = (struct InstantRemovalData*)(buffer->data + sizeof(struct InstantHeaderData));
+  memory = share->memory;
 
-    uuid_copy(header->identifier,  replicator->identifier);
-    uuid_copy(removal->identifier, block->identifier);
-    memcpy(removal->name, memory->name, RELIABLE_MEMORY_NAME_LENGTH);
+  uuid_copy(removal.identifier, block->identifier);
+  memcpy(removal.name, memory->name, RELIABLE_MEMORY_NAME_LENGTH);
 
-    AppendSendingQueue(&replicator->queue, buffer);
-  }
+  // Never waits, the replicator thread frees blocks too (ApplyRemoval);
+  // a refused removal leaves a zombie on the peers, as a removal lost with a broken connection does
+  AppendMessage(replicator, INSTANT_TYPE_REMOVE, &removal, sizeof(struct InstantRemovalData), 0);
 }
 
 static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct ReliableShare* share, struct ReliableBlock* block, void* closure)
@@ -862,25 +1217,112 @@ static void HandleMonitorEvent(int event, struct ReliablePool* pool, struct Reli
   }
 }
 
+static void SendMessageList(struct InstantReplicator* replicator)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantPeer* peer;
+  uint32_t sequence;
+  uint32_t credit;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  credit = GetPeerCredit(replicator);
+
+  for (buffer = replicator->messages.head, sequence = replicator->messages.sequence; buffer != NULL; buffer = (struct InstantSharedBuffer*)(uintptr_t)atomic_load_explicit(&buffer->next, memory_order_relaxed), sequence ++)
+  {
+    for (peer = replicator->peers; peer != NULL; peer = peer->next)
+    {
+      if ((peer->state     == INSTANT_PEER_STATE_CONNECTED) &&
+          (peer->delivered == sequence)                     &&
+          (peer->pending   <  credit)                       &&
+          (SubmitSharedBuffer(replicator, peer, buffer, INSTANT_CREDIT_ACQUIRE) == 0))
+      {
+        // Every peer receives the messages in order, SubmitSharedBuffer() increments buffer->count
+        peer->delivered ++;
+      }
+    }
+  }
+
+  while (buffer = replicator->messages.head)
+  {
+    for (peer = replicator->peers; (peer != NULL) && ((peer->state != INSTANT_PEER_STATE_CONNECTED) || ((peer->delivered - replicator->messages.sequence) > 0)); peer = peer->next);
+
+    if (peer != NULL)
+    {
+      // A connected peer has not received the first message yet
+      break;
+    }
+
+    if (!(replicator->messages.head = (struct InstantSharedBuffer*)(uintptr_t)atomic_load_explicit(&buffer->next, memory_order_relaxed)))
+    {
+      // Reset tail when queue is empty
+      replicator->messages.tail = NULL;
+    }
+
+    replicator->messages.sequence ++;
+    replicator->messages.count    --;
+    atomic_fetch_sub_explicit(&replicator->messages.length, 1, memory_order_seq_cst);
+    ReleaseSharedBuffer(&replicator->buffers, buffer);
+
+    if (atomic_load_explicit(&replicator->messages.waiters, memory_order_seq_cst) != 0)
+    {
+      // A thread waits for a place in the queue
+      while ((syscall(SYS_futex, (uint32_t*)&replicator->messages.length, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+             (errno == EINTR));
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
 static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
 {
   struct InstantSharedBuffer* buffer;
+  struct InstantSharedBuffer* other;
+  struct InstantHeaderData* header;
   struct io_uring_sqe* submission;
   struct InstantPeer* peer;
+  uint32_t credit;
 
   while (buffer = AdvanceSendingQueue(&replicator->queue))
   {
+    header = (struct InstantHeaderData*)buffer->data;
+
+    if (header->type != INSTANT_TYPE_NOTIFY)
+    {
+      // Removals and user messages wait in order for the credit of every peer, the queue keeps the reference
+      atomic_store_explicit(&buffer->next, 0ULL, memory_order_relaxed);
+
+      if (other = replicator->messages.tail)  atomic_store_explicit(&other->next, (uintptr_t)buffer, memory_order_relaxed);
+      else                                    replicator->messages.head = buffer;
+
+      replicator->messages.tail = buffer;
+      replicator->messages.count ++;
+      continue;
+    }
+
     pthread_mutex_lock(&replicator->lock);
+
+    credit = GetPeerCredit(replicator);
 
     for (peer = replicator->peers; peer != NULL; peer = peer->next)
     {
       // SubmitSharedBuffer() increments buffer->count
-      SubmitSharedBuffer(replicator, peer, buffer);
+      if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+          ((peer->pending >= credit) ||
+           (SubmitSharedBuffer(replicator, peer, buffer, INSTANT_CREDIT_ACQUIRE) < 0)))
+      {
+        // A stalled peer neither takes the buffers of the others nor gets more messages than it can receive,
+        // it catches up by a syncing task
+        peer->lost ++;
+      }
     }
 
     pthread_mutex_unlock(&replicator->lock);
     ReleaseSharedBuffer(&replicator->buffers, buffer);
   }
+
+  SendMessageList(replicator);
 
   if (submission = io_uring_get_sqe(&replicator->ring))
   {
@@ -921,7 +1363,9 @@ static int ExecuteClockingTask(struct InstantReplicator* replicator, struct Inst
   struct InstantPeer* peer;
   struct timespec* time;
 
-  if (!(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+  if (((peer = task->peer) &&
+       ((peer->credit.sent - peer->credit.acknowledged) >= peer->credit.window)) ||
+      !(buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
   {
     task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
     return 0;
@@ -938,7 +1382,7 @@ static int ExecuteClockingTask(struct InstantReplicator* replicator, struct Inst
 
   if (task->peer != NULL)
   {
-    SubmitSharedBuffer(replicator, task->peer, buffer);
+    SubmitSharedBuffer(replicator, task->peer, buffer, INSTANT_CREDIT_ACQUIRE);
     ReleaseSharedBuffer(&replicator->buffers, buffer);
     return -1;
   }
@@ -947,8 +1391,8 @@ static int ExecuteClockingTask(struct InstantReplicator* replicator, struct Inst
 
   for (peer = replicator->peers; peer != NULL; peer = peer->next)
   {
-    // SubmitSharedBuffer() increments buffer->count
-    SubmitSharedBuffer(replicator, peer, buffer);
+    // Skipped for a peer without a credit, the next tick sends a new one
+    SubmitSharedBuffer(replicator, peer, buffer, INSTANT_CREDIT_ACQUIRE);
   }
 
   pthread_mutex_unlock(&replicator->lock);
@@ -998,8 +1442,10 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
   struct InstantCookie* cookie;
   struct ReliableBlock* block;
   struct ReliableShare* share;
-  uint32_t number;
   uintptr_t limit;
+  uint32_t number;
+  uint64_t mark;
+  uint64_t hint;
 
   if ((task->syncing.list == NULL)                             ||
       (task->syncing.list[task->syncing.cursor] == UINT32_MAX) ||
@@ -1009,8 +1455,11 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
     return -1;
   }
 
-  if (!(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+  if ((task->peer->pending >= (GetPeerCredit(replicator) / 2))                    ||
+      ((task->peer->credit.sent - task->peer->credit.acknowledged) >= task->peer->credit.window) ||
+      !(buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
   {
+    // Syncing takes at most half of the credit of the peer, notifications keep the rest
     task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
     return 0;
   }
@@ -1033,14 +1482,28 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
     number = task->syncing.list[task->syncing.cursor ++];
     block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
 
-    if ((limit > ((uintptr_t)block)) &&
-        (limit > ((uintptr_t)block + sizeof(struct ReliableBlock) + (uintptr_t)block->length)) &&
-        (atomic_load_explicit(&block->count, memory_order_acquire) > 0) &&
-        (~atomic_load_explicit(&block->mark, memory_order_relaxed) & 1ULL))
+    if ((limit <= ((uintptr_t)block)) ||
+        (limit <= ((uintptr_t)block + sizeof(struct ReliableBlock) + (uintptr_t)block->length)) ||
+        (atomic_load_explicit(&block->count, memory_order_acquire) == 0))
     {
+      // Out of the share or released
+      continue;
+    }
+
+    if (CheckBlockOwner(replicator, NULL, task->name, number) != 0)
+    {
+      // Busy with a transfer, counted as lost so a later syncing offers it
+      task->peer->lost ++;
+      continue;
+    }
+
+    if (((mark = atomic_load_explicit(&block->mark, memory_order_acquire)) != 0ULL) &&
+        (~(mark | (hint = atomic_load_explicit(&block->hint, memory_order_relaxed))) & 1ULL))
+    {
+      // Damaged and unpublished blocks are not offered, an install or a tracker flush publishes them later
       entry           = (struct InstantBlockData*)(buffer->data + buffer->length);
-      entry->mark     = atomic_load_explicit(&block->mark, memory_order_acquire);
-      entry->hint     = atomic_load_explicit(&block->hint, memory_order_relaxed);
+      entry->mark     = mark;
+      entry->hint     = hint;
       entry->length   = sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark) + block->length;
       entry->address  = (uintptr_t)&block->mark;
       buffer->length += sizeof(struct InstantBlockData);
@@ -1051,7 +1514,7 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
   if (buffer->length != (sizeof(struct InstantHeaderData) + cookie->data.length))
   {
     // Avoid sending empty messages
-    SubmitSharedBuffer(replicator, task->peer, buffer);
+    SubmitSharedBuffer(replicator, task->peer, buffer, INSTANT_CREDIT_ACQUIRE);
   }
 
   ReleaseSharedBuffer(&replicator->buffers, buffer);
@@ -1064,7 +1527,9 @@ static int TransmitRetrieveRequest(struct InstantReplicator* replicator, struct 
 {
   struct InstantSharedBuffer* buffer;
   struct InstantHeaderData* header;
+  struct InstantBlockData* entries;
   struct InstantCookie* cookie;
+  uint32_t index;
 
   if (!(cookie = FindCookie(replicator, task->name)))
   {
@@ -1073,8 +1538,10 @@ static int TransmitRetrieveRequest(struct InstantReplicator* replicator, struct 
   }
 
   if ( (ReserveRequestItemList(replicator, 1) < 0) ||
-      !(buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+      ((task->peer->credit.sent - task->peer->credit.acknowledged) >= task->peer->credit.window) ||
+      !(buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
   {
+    // Waits for a buffer or for a credit of the peer
     task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
     return 0;
   }
@@ -1086,13 +1553,20 @@ static int TransmitRetrieveRequest(struct InstantReplicator* replicator, struct 
 
   uuid_copy(header->identifier, replicator->identifier);
   memcpy(buffer->data + sizeof(struct InstantHeaderData), &cookie->data, cookie->data.length);
-  memcpy(buffer->data + buffer->length, task->transfer.entries, task->transfer.count * sizeof(struct InstantBlockData));
+  entries = (struct InstantBlockData*)(buffer->data + buffer->length);
+  memcpy(entries, task->transfer.entries, task->transfer.count * sizeof(struct InstantBlockData));
+
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    // The sender does not need the version, the hint carries the token that completes the transfer
+    entries[index].hint = task->transfer.states[index].token;
+  }
 
   buffer->length        += task->transfer.count * sizeof(struct InstantBlockData);
   task->transfer.buffer  = buffer;
   task->state            = INSTANT_TASK_STATE_WAIT_DATA;
 
-  return SubmitSharedBuffer(replicator, task->peer, buffer);
+  return SubmitSharedBuffer(replicator, task->peer, buffer, INSTANT_CREDIT_ACQUIRE);
 }
 
 static struct InstantBlockData* FindStaleInstantBlockData(uuid_t identifier, uint64_t hint, struct InstantBlockData* cursor, uint32_t count)
@@ -1134,8 +1608,7 @@ static void PruneStaleReadingTask(struct InstantReplicator* replicator, const ch
 
         if (FindStaleInstantBlockData(entry->identifier, entry->hint, entries, count) != NULL)
         {
-          task->transfer.count --;
-          memmove(entry, entry + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
+          RemoveTransferEntry(task, index);
           continue;
         }
 
@@ -1151,18 +1624,92 @@ static void PruneStaleReadingTask(struct InstantReplicator* replicator, const ch
   }
 }
 
+static void AbandonReadingEntry(struct InstantReplicator* replicator, struct InstantTask* task, uint32_t index, struct ReliablePool* pool, struct ReliableShare* share)
+{
+  struct InstantEntryState* state;
+  struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct ReliableBlock* block;
+
+  memory = share->memory;
+  entry  = task->transfer.entries + index;
+  state  = task->transfer.states  + index;
+  block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)state->number);
+
+  if ((~state->flags & INSTANT_ENTRY_FLAG_DAMAGED) &&
+      (atomic_load_explicit(&block->mark, memory_order_relaxed) == state->mark))
+  {
+    // Untouched, the saved version comes back
+    atomic_store_explicit(&block->hint, state->hint, memory_order_relaxed);
+    return;
+  }
+
+  // Possibly overwritten, the copy stays damaged and unpublished until an install or RepairReliableBlock()
+  uuid_copy(block->identifier, entry->identifier);
+  atomic_store_explicit(&block->hint, entry->hint | 1ULL, memory_order_relaxed);
+  atomic_store_explicit(&block->mark, 0ULL,               memory_order_release);
+  CallReliableMonitor(RELIABLE_MONITOR_BLOCK_DAMAGE, pool, share, block);
+}
+
+static void AbandonReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantCookie* cookie;
+  struct ReliablePool* pool;
+  uint32_t index;
+
+  if (task != NULL)
+  {
+    pool = NULL;
+
+    if ((task->type  == INSTANT_TASK_TYPE_READING)    &&
+        (task->state != INSTANT_TASK_STATE_IDLE)      &&
+        (task->state != INSTANT_TASK_STATE_WAIT_LOCK) &&
+        (pool   = FindReliablePool(replicator->indexer, task->name, 1)) &&
+        (cookie = EnsureCookie(replicator, pool)))
+    {
+      for (index = 0; index < task->transfer.count; ++ index)
+      {
+        if (task->transfer.states[index].number != UINT32_MAX)
+        {
+          AbandonReadingEntry(replicator, task, index, pool, cookie->share);
+          task->transfer.states[index].number = UINT32_MAX;
+        }
+      }
+    }
+
+    RetireReliablePool(pool);
+  }
+}
+
+static void CompactTransferEntryList(struct InstantTask* task)
+{
+  uint32_t index;
+
+  for (index = 0; index < task->transfer.count; )
+  {
+    if (task->transfer.states[index].number == UINT32_MAX)
+    {
+      // Completed or abandoned entry
+      RemoveTransferEntry(task, index);
+      continue;
+    }
+
+    index ++;
+  }
+}
+
 static int CollectReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
 {
+  struct InstantEntryState* state;
   struct InstantBlockData* entry;
   struct ReliableMemory* memory;
   struct InstantCookie* cookie;
   struct ReliableBlock* block;
-  struct ReliableShare* share;
   struct ReliablePool* pool;
   struct InstantPeer* peer;
   uint32_t number;
   uint32_t index;
-  uint64_t mark;
+  uint32_t other;
   uint64_t hint;
 
   peer = task->peer;
@@ -1186,9 +1733,37 @@ static int CollectReadingBlockList(struct InstantReplicator* replicator, struct 
     return -1;
   }
 
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    entry  = task->transfer.entries + index;
+    number = FindReliableBlockNumber(replicator->indexer, task->name, entry->identifier);
+
+    if ((number != UINT32_MAX) &&
+        (CheckBlockOwner(replicator, task, task->name, number) != 0))
+    {
+      // Acquisition is all or nothing, a busy block makes the whole task wait instead of dropping the offer
+      RetireReliablePool(pool);
+      task->state = INSTANT_TASK_STATE_WAIT_LOCK;
+      return 0;
+    }
+
+    task->transfer.states[index].number = UINT32_MAX;
+  }
+
+  // From here every acquired entry is released by AbandonReadingBlockList() on failure
+  task->state = INSTANT_TASK_STATE_PROGRESS;
+
   for (index = 0; index < task->transfer.count; )
   {
     entry = task->transfer.entries + index;
+    state = task->transfer.states  + index;
+
+    if (entry->hint & 1ULL)
+    {
+      // A pending version is never offered
+      RemoveTransferEntry(task, index);
+      continue;
+    }
 
     if (((number = FindReliableBlockNumber(replicator->indexer, task->name, entry->identifier))   == UINT32_MAX) &&
         (((number = ReserveReliableBlock(pool, entry->identifier, RELIABLE_TYPE_NON_RECOVERABLE)) == UINT32_MAX) ||
@@ -1198,22 +1773,27 @@ static int CollectReadingBlockList(struct InstantReplicator* replicator, struct 
       return -1;
     }
 
-    share  = cookie->share;
-    memory = share->memory;
+    for (other = 0; (other < index) && (task->transfer.states[other].number != number); ++ other);
+
+    memory = cookie->share->memory;
     block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
-    mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
     hint   = atomic_load_explicit(&block->hint, memory_order_relaxed);
 
-    if ((mark & 1ULL) ||
-        (hint >= entry->hint))
+    if ((other < index) ||
+        ((~hint & 1ULL) &&
+         ( hint >= entry->hint)))
     {
-      task->transfer.count --;
-      memmove(entry, entry + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
+      // Repeated in the batch or the local version is not older, a damaged or pending copy accepts any offer
+      RemoveTransferEntry(task, index);
       continue;
     }
 
-    atomic_store_explicit(&block->hint, entry->hint, memory_order_relaxed);
-    task->transfer.numbers[index] = number;
+    state->hint  = hint;
+    state->mark  = atomic_load_explicit(&block->mark, memory_order_relaxed);
+    state->flags = 0;
+
+    atomic_store_explicit(&block->hint, entry->hint | 1ULL, memory_order_relaxed);
+    state->number = number;
     index ++;
   }
 
@@ -1225,53 +1805,52 @@ static int CollectReadingBlockList(struct InstantReplicator* replicator, struct 
     return -1;
   }
 
-  task->state = INSTANT_TASK_STATE_PROGRESS;
   return 1;
 }
 
 static int PrepareReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
 {
+  struct InstantEntryState* state;
   struct InstantBlockData* entry;
   struct ReliableMemory* memory;
   struct InstantCookie* cookie;
   struct ReliableBlock* block;
-  struct ReliableShare* share;
-  uint32_t* number;
+  struct ReliablePool* pool;
+  uint64_t token;
   uint32_t index;
-  uint64_t mark;
-  uint64_t hint;
 
-  if (!(cookie = FindCookie(replicator, task->name)))
+  if (!(pool   = FindReliablePool(replicator->indexer, task->name, 1)) ||
+      !(cookie = EnsureCookie(replicator, pool)))
   {
     // Cannot acquire cookie
+    RetireReliablePool(pool);
     return -1;
   }
 
-  share  = cookie->share;
-  memory = share->memory;
+  memory = cookie->share->memory;
 
   for (index = 0; index < task->transfer.count; )
   {
-    number = task->transfer.numbers + index;
-    entry  = task->transfer.entries + index;
-    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)*number);
-    mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
-    hint   = atomic_load_explicit(&block->hint, memory_order_relaxed);
+    entry = task->transfer.entries + index;
+    state = task->transfer.states  + index;
+    block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)state->number);
 
-    if ((mark & 1ULL) ||
-        (hint > entry->hint))
+    if (!(token = MakeToken(replicator, cookie)))
     {
-      task->transfer.count --;
-      memmove(entry,  entry  + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
-      memmove(number, number + 1, (task->transfer.count - index) * sizeof(uint32_t));
+      // Tokens are exhausted
+      AbandonReadingEntry(replicator, task, index, pool, cookie->share);
+      RemoveTransferEntry(task, index);
       continue;
     }
 
-    entry->hint    = hint;
-    entry->mark    = mark;
+    // The sender locks the destination by CAS from its current mark and completes it with a fresh token
+    state->token   = token;
+    entry->mark    = state->mark;
     entry->address = (uintptr_t)&block->mark;
     index ++;
   }
+
+  RetireReliablePool(pool);
 
   if (task->transfer.count == 0)
   {
@@ -1280,6 +1859,97 @@ static int PrepareReadingBlockList(struct InstantReplicator* replicator, struct 
   }
 
   return TransmitRetrieveRequest(replicator, task);
+}
+
+static int FetchReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantRequestItem* item;
+  struct InstantEntryState* state;
+  struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct InstantPeer* peer;
+  struct InstantCard* card;
+  struct ibv_mr* region;
+  uint64_t token;
+  uint32_t index;
+  int flags;
+
+  peer = task->peer;
+  card = peer->card;
+  item = NULL;
+
+  // One attempt per task, what is not read successfully goes the pessimistic way
+  task->transfer.code = IBV_WC_RDMA_READ;
+
+  if ((peer->state != INSTANT_PEER_STATE_CONNECTED)  ||
+      (card == NULL)                                 ||
+      !(cookie = FindCookie(replicator, task->name)) ||
+      !(region = cookie->regions[card->number])      ||
+      (ReserveRequestItemList(replicator, 2 * task->transfer.count) < 0) ||
+      !(buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
+  {
+    // The pessimistic way only
+    return PrepareReadingBlockList(replicator, task);
+  }
+
+  memory = cookie->share->memory;
+
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    entry = task->transfer.entries + index;
+    state = task->transfer.states  + index;
+    block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)state->number);
+
+    if ((entry->mark & 1ULL)  ||
+        (entry->mark == 0ULL) ||
+        (entry->length < (sizeof(struct ReliableBlock) - offsetof(struct ReliableBlock, mark))) ||
+        (entry->length > (memory->size - offsetof(struct ReliableBlock, mark))) ||
+        !(token = MakeToken(replicator, cookie)))
+    {
+      // Unpublished offer, malformed, does not fit or no token, left to the pessimistic way
+      continue;
+    }
+
+    // The lock holds while the data is read, the read starts after the local mark
+    state->token  = token;
+    state->flags |= INSTANT_ENTRY_FLAG_FETCHED;
+    atomic_store_explicit(&block->mark, token | 1ULL, memory_order_relaxed);
+
+    item = SubmitReadingWork(replicator, peer, task->transfer.key, entry, region, block);
+  }
+
+  if (item == NULL)
+  {
+    // Nothing to read
+    ReleaseSharedBuffer(&replicator->buffers, buffer);
+    return PrepareReadingBlockList(replicator, task);
+  }
+
+  flags = IBV_SEND_FENCE;
+
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    entry = task->transfer.entries + index;
+    state = task->transfer.states  + index;
+
+    if (state->flags & INSTANT_ENTRY_FLAG_FETCHED)
+    {
+      // Every source mark is read after every data read has completed
+      buffer->values[index]    = 0ULL;
+      item                     = SubmitCheckingWork(replicator, peer, task->transfer.key, entry, buffer->values + index);
+      item->request.send_flags = flags;
+      flags                    = 0;
+    }
+  }
+
+  UpdateReadingWork(item, task);
+
+  task->transfer.buffer = buffer;
+  task->state           = INSTANT_TASK_STATE_WAIT_COMPLETION;
+  return 0;
 }
 
 static int ExecuteReadingTask(struct InstantReplicator* replicator, struct InstantTask* task)
@@ -1291,6 +1961,10 @@ static int ExecuteReadingTask(struct InstantReplicator* replicator, struct Insta
       return CollectReadingBlockList(replicator, task);
 
     case INSTANT_TASK_STATE_PROGRESS:
+      if (( replicator->options & INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE) &&
+          (task->transfer.code != IBV_WC_RDMA_READ))
+        return FetchReadingBlockList(replicator, task);
+
       return PrepareReadingBlockList(replicator, task);
 
     case INSTANT_TASK_STATE_WAIT_BUFFER:
@@ -1318,7 +1992,8 @@ static void TransmitTaskComplete(struct InstantReplicator* replicator, struct In
 
     uuid_copy(header->identifier, replicator->identifier);
 
-    SubmitSharedBuffer(replicator, task->peer, buffer);
+    // The writing task took its credit in advance, COMPLETE and RDMA_WRITE_WITH_IMM are the alternatives that use it
+    SubmitSharedBuffer(replicator, task->peer, buffer, INSTANT_CREDIT_HELD);
   }
 }
 
@@ -1340,9 +2015,18 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
     return 0;
   }
 
-  if (!(task->transfer.buffer = AllocateSharedBuffer(&replicator->buffers, 0)))
+  if (!(task->transfer.buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
   {
     task->state = INSTANT_TASK_STATE_WAIT_BUFFER;
+    return 0;
+  }
+
+  if (AcquirePeerCredit(task->peer) < 0)
+  {
+    // The RDMA_WRITE_WITH_IMM or COMPLETE that ends this task needs a receiving buffer of the peer
+    ReleaseSharedBuffer(&replicator->buffers, task->transfer.buffer);
+    task->transfer.buffer = NULL;
+    task->state           = INSTANT_TASK_STATE_WAIT_BUFFER;
     return 0;
   }
 
@@ -1365,16 +2049,18 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
     block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
 
     if ((number == UINT32_MAX) ||
+        ( atomic_load_explicit(&block->mark, memory_order_relaxed) == 0ULL)     ||
+        ((atomic_load_explicit(&block->mark, memory_order_relaxed) | atomic_load_explicit(&block->hint, memory_order_relaxed)) & 1ULL) ||
+        (CheckBlockOwner(replicator, task, task->name, number) != 0)            ||
         (block->length > (memory->size - offsetof(struct ReliableBlock, data))) ||
         (GetCRC32C(block->data, block->length, 0) != atomic_load_explicit(&block->control, memory_order_relaxed)))
     {
-      // Missing or not flushed yet, the next flush offers the new version
-      task->transfer.count --;
-      memmove(entry, entry + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
+      // Missing, unpublished, locked, pending, busy or not flushed yet, the sender never waits
+      RemoveTransferEntry(task, index);
       continue;
     }
 
-    task->transfer.numbers[index] = number;
+    task->transfer.states[index].number = number;
     buffer->values[index]         = 0ULL;
 
     item   = SubmitExchangingWork(replicator, peer, task->transfer.key, entry, buffer->values + index);
@@ -1390,33 +2076,6 @@ static int PrepareWritingBlockList(struct InstantReplicator* replicator, struct 
   task->state         = INSTANT_TASK_STATE_WAIT_COMPLETION;
   task->transfer.code = IBV_WC_COMP_SWAP;
   return 0;
-}
-
-static void ResetReadingBlockList(struct InstantReplicator* replicator, struct InstantTask* task)
-{
-  struct InstantBlockData* entry;
-  struct ReliableMemory* memory;
-  struct InstantCookie* cookie;
-  struct ReliableBlock* block;
-  struct ReliableShare* share;
-  uint32_t number;
-  uint32_t index;
-  uint64_t mark;
-
-  if (cookie = FindCookie(replicator, task->name))
-  {
-    share  = cookie->share;
-    memory = share->memory;
-
-    for (index = 0; index < task->transfer.count; ++ index)
-    {
-      number = task->transfer.numbers[index];
-      entry  = task->transfer.entries + index;
-      block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
-      mark   = entry->mark | 1ULL;
-      atomic_compare_exchange_strong_explicit(&block->mark, &mark, entry->mark, memory_order_relaxed, memory_order_relaxed);
-    }
-  }
 }
 
 static int ExecuteWritingTask(struct InstantReplicator* replicator, struct InstantTask* task)
@@ -1461,14 +2120,14 @@ static void CreateTransferTask(struct InstantReplicator* replicator, struct Inst
     memcpy(task->name, cookie->name, RELIABLE_MEMORY_NAME_LENGTH);
     memcpy(task->transfer.entries, entries, count);
 
-    for (index = 0; index < task->transfer.count; index ++)
-    {
-      // Adjust hint to local epoch
-      task->transfer.entries[index].hint += peer->vector;
-    }
-
     if (task->type == INSTANT_TASK_TYPE_READING)
     {
+      for (index = 0; index < task->transfer.count; index ++)
+      {
+        // Adjust hint to local epoch, the hint of INSTANT_TYPE_RETRIEVE is a token
+        task->transfer.entries[index].hint += peer->vector;
+      }
+
       // Prune outdated entries and tasks
       PruneStaleReadingTask(replicator, task->name, task->transfer.entries, task->transfer.count);
     }
@@ -1520,6 +2179,20 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
           ApplyClock(replicator, peer, (struct timespec*)(data + sizeof(struct InstantHeaderData)));
         break;
 
+      case INSTANT_TYPE_CREDIT:
+        if (length == (sizeof(struct InstantHeaderData) + sizeof(struct InstantCreditData)))
+        {
+          peer->credit.window  = ((struct InstantCreditData*)(data + sizeof(struct InstantHeaderData)))->window;
+          peer->credit.applied = ((struct InstantCreditData*)(data + sizeof(struct InstantHeaderData)))->applied;
+
+          if (peer->credit.applied == peer->credit.advertised)
+          {
+            // Reports arrive in order, the last window applied replaces every earlier one
+            peer->credit.committed = peer->credit.advertised;
+          }
+        }
+        break;
+
       case INSTANT_TYPE_REMOVE:
         if (length == (sizeof(struct InstantHeaderData) + sizeof(struct InstantRemovalData)))
           CreateRemoval(replicator, (struct InstantRemovalData*)(data + sizeof(struct InstantHeaderData)));
@@ -1527,6 +2200,7 @@ static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t*
 
       case INSTANT_TYPE_COMPLETE:
         for (task = replicator->schedule.head; (task != NULL) && (task->number != header->task); task = task->next);
+        AbandonReadingBlockList(replicator, task);
         RemoveTask(replicator, task);
         break;
 
@@ -1559,6 +2233,7 @@ static void TouchReliableBlock(struct ReliableBlock* block, size_t size)
 
 static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t identifier, int status)
 {
+  struct InstantEntryState* state;
   struct InstantBlockData* entry;
   struct ReliableMemory* memory;
   struct InstantCookie* cookie;
@@ -1567,108 +2242,171 @@ static void HandleTranferredData(struct InstantReplicator* replicator, uint32_t 
   struct ReliablePool* pool;
   struct InstantPeer* peer;
   struct InstantTask* task;
-  uint32_t* number;
-  uint32_t count;
   uint32_t index;
   uint64_t mark;
 
-  pool   = NULL;
-  cookie = NULL;
-
   for (task = replicator->schedule.head; (task != NULL) && (task->number != identifier); task = task->next);
 
-  if ((task   != NULL)           &&
-      (status == IBV_WC_SUCCESS) &&
-      (pool    = FindReliablePool(replicator->indexer, task->name, 1)) &&
-      (cookie  = EnsureCookie(replicator, pool)))
+  if (task == NULL)
   {
-    peer   = task->peer;
-    share  = cookie->share;
-    memory = share->memory;
-    count  = 0;
+    // Not really sure how that possible, but, well...
+    return;
+  }
 
-    for (index = 0; index < task->transfer.count; ++ index)
+  if ((status != IBV_WC_SUCCESS) ||
+      !(pool   = FindReliablePool(replicator->indexer, task->name, 1)))
+  {
+    AbandonReadingBlockList(replicator, task);
+    RemoveTask(replicator, task);
+    return;
+  }
+
+  if (!(cookie = EnsureCookie(replicator, pool)))
+  {
+    RetireReliablePool(pool);
+    AbandonReadingBlockList(replicator, task);
+    RemoveTask(replicator, task);
+    return;
+  }
+
+  peer   = task->peer;
+  share  = cookie->share;
+  memory = share->memory;
+
+  for (index = 0; index < task->transfer.count; ++ index)
+  {
+    entry  = task->transfer.entries + index;
+    state  = task->transfer.states  + index;
+    block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)state->number);
+    mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
+
+    if ((mark == state->token) &&
+        (~atomic_load_explicit(&block->hint, memory_order_relaxed) & 1ULL) &&
+        (block->length <= (memory->size - offsetof(struct ReliableBlock, data))) &&
+        (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)))
     {
-      number = task->transfer.numbers + index;
-      entry  = task->transfer.entries + index;
-      block  = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)*number);
-      mark   = atomic_load_explicit(&block->mark, memory_order_relaxed);
-
-      if (mark == (entry->mark | 1ULL))
-      {
-        // Locked by CAS but not written, release the lock and retry
-        atomic_compare_exchange_strong_explicit(&block->mark, &mark, entry->mark, memory_order_relaxed, memory_order_relaxed);
-
-        if (task->transfer.attempt >= READING_ATTEMPT_COUNT)
-        {
-          CallReliableMonitor(RELIABLE_MONITOR_BLOCK_DAMAGE, pool, share, block);
-          *number = UINT32_MAX;
-          continue;
-        }
-
-        count ++;
-        continue;
-      }
-
-      if (mark != entry->mark)
-      {
-        // An odd mark is a lock, never valid data
-        if ((~mark & 1ULL) &&
-            (block->length <= (memory->size - offsetof(struct ReliableBlock, data))) &&
-            (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)))
-        {
-          // Assumption: valid CRC here means the block was updated by this RETRIEVE flow.
-          // If another writer updates the same block concurrently, hint normalization can be wrong.
-          atomic_fetch_add_explicit(&block->hint, peer->vector, memory_order_relaxed);
-          TouchReliableBlock(block, replicator->size);
-          CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
-          *number = UINT32_MAX;
-          continue;
-        }
-
-        if (task->transfer.attempt >= READING_ATTEMPT_COUNT)
-        {
-          CallReliableMonitor(RELIABLE_MONITOR_BLOCK_DAMAGE, pool, share, block);
-          *number = UINT32_MAX;
-          continue;
-        }
-
-        count ++;
-        continue;
-      }
-
-      *number = UINT32_MAX;
+      // Completed by the final token, the version comes from the source
+      atomic_fetch_add_explicit(&block->hint, peer->vector, memory_order_relaxed);
+      TouchReliableBlock(block, replicator->size);
+      CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
+      state->number = UINT32_MAX;
+      continue;
     }
 
-    RetireReliablePool(pool);
-
-    if (count != 0)
+    if (mark == state->mark)
     {
-      for (index = 0; index < task->transfer.count; )
-      {
-        number = task->transfer.numbers + index;
-        entry  = task->transfer.entries + index;
+      // The CAS did not succeed, the content is untouched unless a rejected read overwrote it
+      AbandonReadingEntry(replicator, task, index, pool, share);
+      state->number = UINT32_MAX;
+      continue;
+    }
 
-        if (*number == UINT32_MAX)
-        {
-          task->transfer.count --;
-          memmove(entry,  entry  + 1, (task->transfer.count - index) * sizeof(struct InstantBlockData));
-          memmove(number, number + 1, (task->transfer.count - index) * sizeof(uint32_t));
-          continue;
-        }
+    // Written in part, still locked or unexpected: the copy is damaged until a retry completes it
+    uuid_copy(block->identifier, entry->identifier);
+    atomic_store_explicit(&block->hint, entry->hint | 1ULL, memory_order_relaxed);
+    atomic_store_explicit(&block->mark, 0ULL,               memory_order_release);
 
-        index ++;
-      }
+    state->mark   = 0ULL;
+    state->flags |= INSTANT_ENTRY_FLAG_DAMAGED;
 
-      ReleaseSharedBuffer(&replicator->buffers, task->transfer.buffer);
-      task->state             = INSTANT_TASK_STATE_WAIT_BUFFER;
-      task->transfer.buffer   = NULL;
-      task->transfer.attempt ++;
-      return;
+    if (task->transfer.attempt >= READING_ATTEMPT_COUNT)
+    {
+      AbandonReadingEntry(replicator, task, index, pool, share);
+      state->number = UINT32_MAX;
+      continue;
     }
   }
 
-  RemoveTask(replicator, task);
+  RetireReliablePool(pool);
+  CompactTransferEntryList(task);
+
+  if (task->transfer.count == 0)
+  {
+    RemoveTask(replicator, task);
+    return;
+  }
+
+  // Every retry takes a fresh token
+  ReleaseSharedBuffer(&replicator->buffers, task->transfer.buffer);
+  task->state             = INSTANT_TASK_STATE_PROGRESS;
+  task->transfer.buffer   = NULL;
+  task->transfer.attempt ++;
+}
+
+static void HandleCompletedRead(struct InstantReplicator* replicator, struct InstantTask* task, int status)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantEntryState* state;
+  struct InstantBlockData* entry;
+  struct ReliableMemory* memory;
+  struct InstantCookie* cookie;
+  struct ReliableBlock* block;
+  struct ReliableShare* share;
+  struct ReliablePool* pool;
+  uint32_t index;
+
+  if (task == NULL)
+  {
+    // Not really sure how that possible, but, well...
+    return;
+  }
+
+  pool   = NULL;
+  buffer = task->transfer.buffer;
+
+  if ((pool   = FindReliablePool(replicator->indexer, task->name, 1)) &&
+      (cookie = EnsureCookie(replicator, pool)))
+  {
+    share  = cookie->share;
+    memory = share->memory;
+
+    for (index = 0; index < task->transfer.count; ++ index)
+    {
+      entry = task->transfer.entries + index;
+      state = task->transfer.states  + index;
+      block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)state->number);
+
+      if (~state->flags & INSTANT_ENTRY_FLAG_FETCHED)
+      {
+        // Not read
+        continue;
+      }
+
+      state->flags &= ~INSTANT_ENTRY_FLAG_FETCHED;
+
+      if ((status == IBV_WC_SUCCESS)               &&
+          (buffer->values[index] == entry->mark)   &&
+          (uuid_compare(block->identifier, entry->identifier) == 0) &&
+          (block->length <= (entry->length - sizeof(struct ReliableBlock) + offsetof(struct ReliableBlock, mark))) &&
+          (GetCRC32C(block->data, block->length, 0) == atomic_load_explicit(&block->control, memory_order_relaxed)))
+      {
+        // The source kept the offered mark while the data was read, the state is not older than the offer
+        atomic_store_explicit(&block->hint, entry->hint,       memory_order_relaxed);
+        atomic_store_explicit(&block->mark, state->token, memory_order_release);
+        TouchReliableBlock(block, replicator->size);
+        CallReliableMonitor(RELIABLE_MONITOR_BLOCK_ARRIVAL, pool, share, block);
+        state->number = UINT32_MAX;
+        continue;
+      }
+
+      // Rejected, the read overwrote the copy, the synchronous transfer follows from mark 0
+      uuid_copy(block->identifier, entry->identifier);
+      atomic_store_explicit(&block->hint, entry->hint | 1ULL, memory_order_relaxed);
+      atomic_store_explicit(&block->mark, 0ULL,               memory_order_release);
+
+      state->mark   = 0ULL;
+      state->flags |= INSTANT_ENTRY_FLAG_DAMAGED;
+    }
+
+    CompactTransferEntryList(task);
+  }
+
+  RetireReliablePool(pool);
+  ReleaseSharedBuffer(&replicator->buffers, buffer);
+
+  // The remainder goes the pessimistic way
+  task->transfer.buffer = NULL;
+  task->state           = INSTANT_TASK_STATE_PROGRESS;
 }
 
 static void HandleCompletedExchange(struct InstantReplicator* replicator, struct InstantTask* task, int status)
@@ -1706,27 +2444,32 @@ static void HandleCompletedExchange(struct InstantReplicator* replicator, struct
 
       for (index = 0; index < task->transfer.count; ++ index)
       {
-        number = task->transfer.numbers[index];
+        number = task->transfer.states[index].number;
         entry  = task->transfer.entries + index;
 
         if (buffer->values[index] == entry->mark)
         {
-          block = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
-          item  = SubmitWritingWork(replicator, peer, task->transfer.key, entry, region, block);
+          // The buffer keeps the final token until the WRITE completes or the QP is destroyed
+          buffer->values[index] = entry->hint;
+          block                 = (struct ReliableBlock*)(memory->data + (size_t)memory->size * (size_t)number);
+          item                  = SubmitWritingWork(replicator, peer, task->transfer.key, entry, region, block, buffer->values + index);
         }
       }
     }
+
+    RetireReliablePool(pool);
 
     if (UpdateWritingWork(item, task, task->transfer.task) < 0)
     {
       TransmitTaskComplete(replicator, task);
       RemoveTask(replicator, task);
+      return;
     }
 
-    RetireReliablePool(pool);
-
+    // The CAS has completed, the WRITE gets its own time
     task->state         = INSTANT_TASK_STATE_WAIT_COMPLETION;
     task->transfer.code = IBV_WC_RDMA_WRITE;
+    task->expiration    = replicator->tick + replicator->timeout;
   }
 }
 
@@ -1744,6 +2487,18 @@ static void SubmitReadyStateWait(struct InstantReplicator* replicator)
   {
     io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->state, INSTANT_REPLICATOR_STATE_ACTIVE | INSTANT_REPLICATOR_STATE_LOCK, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
     io_uring_sqe_set_data64(submission, RING_TAG_READY_STATE);
+  }
+}
+
+static void SubmitReturnStateWait(struct InstantReplicator* replicator)
+{
+  struct io_uring_sqe* submission;
+
+  if (submission = io_uring_get_sqe(&replicator->ring))
+  {
+    // Completes when the application returns from the barrier, so the next barrier is raised without waiting for a tick
+    io_uring_prep_futex_wait(submission, (uint32_t*)&replicator->barrier.returns, replicator->barrier.released, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE, 0);
+    io_uring_sqe_set_data64(submission, RING_TAG_RETURN_STATE);
   }
 }
 
@@ -1772,6 +2527,9 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
 
   int result;
   int condition;
+  uint32_t state;
+  uint32_t length;
+  uint32_t admitted;
   struct InstantTask* task;
   struct InstantTask* next;
   ExecuteInstantTaskFunction function;
@@ -1788,7 +2546,18 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
 
     for (task = replicator->schedule.head; task != NULL; task = next)
     {
-      next       = task->next;
+      next = task->next;
+
+      if ((task->type == INSTANT_TASK_TYPE_READING) &&
+          (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK) &&
+          ((int32_t)(task->number - replicator->barrier.boundary) >= 0))
+      {
+        // Arrived after the barrier was raised, waits for the next one;
+        // a writing task is always served, deferring it would make two barriers wait for each other
+        continue;
+      }
+
+      state      = task->state;
       function   = functions[task->type];
       result     = function(replicator, task);
       condition |= (result > 0);
@@ -1796,15 +2565,49 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
       if (result < 0)
       {
         // Negative result means remove immediately
+        AbandonReadingBlockList(replicator, task);
         RemoveTask(replicator, task);
+        continue;
+      }
+
+      if (task->state != state)
+      {
+        // The task has advanced, TrackTaskList() counts the time from here
+        task->expiration = replicator->tick + replicator->timeout;
       }
     }
   }
   while (condition != 0);
 
-  if (((replicator->schedule.count != 0) || CheckRemovalList(replicator)) &&
-      (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
+  for (admitted = 0, task = replicator->schedule.head; task != NULL; task = task->next)
   {
+    // Tasks that the current barrier serves: the reading tasks known when it was raised and every writing task
+    admitted += (task->type == INSTANT_TASK_TYPE_WRITING) ||
+                ((task->type == INSTANT_TASK_TYPE_READING) && ((int32_t)(task->number - replicator->barrier.boundary) < 0));
+  }
+
+  if (((replicator->schedule.count != 0) || CheckRemovalList(replicator)) &&
+      (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK) &&
+      ((replicator->barrier.parked == 0) || (atomic_load_explicit(&replicator->barrier.returns, memory_order_acquire) != replicator->barrier.released)))
+  {
+    // The application has run since the last barrier, the new one serves the oldest reading tasks known now
+    replicator->barrier.boundary = replicator->schedule.number;
+
+    for (length = 0, task = replicator->schedule.head; task != NULL; task = task->next)
+    {
+      if (task->type == INSTANT_TASK_TYPE_READING)
+      {
+        if ((length != 0) &&
+            ((length + task->transfer.count) > INSTANT_BARRIER_COUNT))
+        {
+          // The rest of a backlog waits for the next barrier, so the application runs in between
+          replicator->barrier.boundary = task->number;
+          break;
+        }
+
+        length += task->transfer.count;
+      }
+    }
     atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_LOCK, memory_order_relaxed);
     CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_FLUSH, NULL, NULL, 0);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
@@ -1814,10 +2617,21 @@ static void ExecuteTaskList(struct InstantReplicator* replicator)
     SubmitReadyStateWait(replicator);
   }
 
-  if ((replicator->schedule.count == 0) &&
+  if ((admitted == 0) &&
       (CheckRemovalList(replicator) == 0) &&
-      (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_LOCK))
+      ((atomic_load_explicit(&replicator->state, memory_order_relaxed) & (INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_FAILURE)) == INSTANT_REPLICATOR_STATE_LOCK))
   {
+    // Tasks that arrived during this barrier wait until the application returns from it
+    replicator->barrier.parked   = (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_READY) != 0;
+    replicator->barrier.released = atomic_load_explicit(&replicator->barrier.returns, memory_order_acquire);
+
+    if (replicator->barrier.parked &&
+        (replicator->schedule.count != 0))
+    {
+      // Wake up on the return instead of the next tick
+      SubmitReturnStateWait(replicator);
+    }
+
     atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
     while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
            (errno == EINTR));
@@ -1835,13 +2649,8 @@ static void ClearTaskList(struct InstantReplicator* replicator, struct InstantPe
 
     if (task->peer == peer)
     {
-      if (task->state == INSTANT_TASK_STATE_WAIT_DATA)
-      {
-        // The reading blocks can be blocked by remote CAS
-        ResetReadingBlockList(replicator, task);
-      }
-
-      // Work posted to the destroyed QP never completes
+      // The QP is destroyed, no DMA reaches the blocks anymore and posted work never completes
+      AbandonReadingBlockList(replicator, task);
       RemoveTask(replicator, task);
     }
   }
@@ -1901,9 +2710,9 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
       (!(other = replicator->cards) ||
         (other->number < (INSTANT_CARD_COUNT - 1)))  &&
       (ibv_query_device(context, &information) == 0) &&
-      (information.atomic_cap          != IBV_ATOMIC_NONE)                           &&
-      (information.max_qp_init_rd_atom >= replicator->parameter.initiator_depth)     &&
-      (information.max_qp_rd_atom      >= replicator->parameter.responder_resources) &&
+      (information.atomic_cap          != IBV_ATOMIC_NONE) &&
+      (information.max_qp_init_rd_atom >  0)               &&
+      (information.max_qp_rd_atom      >  0)               &&
       (card = (struct InstantCard*)calloc(1, sizeof(struct InstantCard))))
   {
     memset(&attribute, 0, sizeof(struct ibv_srq_init_attr));
@@ -1961,6 +2770,10 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
 
     replicator->cards = card;
 
+    // Connections use the depth of the weakest card
+    if (replicator->parameter.initiator_depth     > information.max_qp_init_rd_atom)  replicator->parameter.initiator_depth     = information.max_qp_init_rd_atom;
+    if (replicator->parameter.responder_resources > information.max_qp_rd_atom)       replicator->parameter.responder_resources = information.max_qp_rd_atom;
+
     pthread_mutex_unlock(&replicator->lock);
 
     UpdateCookieList(replicator);
@@ -2005,7 +2818,7 @@ static int EnsureWorkOperationCode(struct InstantReplicator* replicator, struct 
   return -1;
 }
 
-static void DisconnectQueuePair(struct InstantReplicator* replicator, uint32_t number)
+static void DisconnectQueuePair(struct InstantReplicator* replicator, struct InstantCard* card, uint32_t number)
 {
   struct InstantPeer* peer;
   struct rdma_cm_id* descriptor;
@@ -2015,11 +2828,12 @@ static void DisconnectQueuePair(struct InstantReplicator* replicator, uint32_t n
 
   for (peer = replicator->peers; peer != NULL; peer = peer->next)
   {
-    if ((descriptor = peer->descriptor) &&
+    if ((peer->card     == card)        &&
+        (descriptor = peer->descriptor) &&
         (pair       = descriptor->qp)   &&
         (pair->qp_num == number))
     {
-      // Found the connection that owns the failed QP
+      // Found the connection that owns the failed QP, QP numbers are unique only within a card
       break;
     }
   }
@@ -2036,6 +2850,7 @@ static void DisconnectQueuePair(struct InstantReplicator* replicator, uint32_t n
 
 static void HandleCompletionChannel(struct InstantReplicator* replicator, struct InstantCard* card, int result)
 {
+  uint32_t number;
   void* context;
   struct ibv_cq* queue;
   struct ibv_wc* completion;
@@ -2057,23 +2872,30 @@ static void HandleCompletionChannel(struct InstantReplicator* replicator, struct
             (completion->status != IBV_WC_WR_FLUSH_ERR))
         {
           // Flush errors are only the consequence of the first failure
-          DisconnectQueuePair(replicator, completion->qp_num);
+          DisconnectQueuePair(replicator, card, completion->qp_num);
         }
 
         switch (EnsureWorkOperationCode(replicator, card, completion))
         {
           case IBV_WC_SEND:
+            ReleasePeerCredit(replicator, card, completion->qp_num, completion->wr_id);
             ReleaseSharedBuffer(&replicator->buffers, (struct InstantSharedBuffer*)completion->wr_id);
             break;
 
           case IBV_WC_RECV:
             ReplaceReceivingBuffer(card, completion->wr_id);
-            HandleReceivedMessage(replicator, (uint8_t*)completion->wr_id, completion->byte_len, completion->imm_data, completion->status, completion->wc_flags & IBV_WC_WITH_IMM);
+            number = UpdatePeerCredit(replicator, card, completion);
+            HandleReceivedMessage(replicator, (uint8_t*)completion->wr_id, completion->byte_len, number, completion->status, completion->wc_flags & IBV_WC_WITH_IMM);
             break;
 
           case IBV_WC_RECV_RDMA_WITH_IMM:
             ReplaceReceivingBuffer(card, completion->wr_id);
+            UpdatePeerCredit(replicator, card, completion);
             HandleTranferredData(replicator, completion->imm_data, completion->status);
+            break;
+
+          case IBV_WC_RDMA_READ:
+            HandleCompletedRead(replicator, (struct InstantTask*)completion->wr_id, completion->status);
             break;
 
           case IBV_WC_RDMA_WRITE:
@@ -2181,6 +3003,7 @@ static int HandleConnectRequest(struct InstantReplicator* replicator, struct rdm
 {
   struct InstantCard* card;
   struct InstantPeer* peer;
+  struct rdma_conn_param acceptance;
   struct InstantHandshakeData* handshake;
   uint8_t digest[SHA_DIGEST_LENGTH];
 
@@ -2202,10 +3025,19 @@ static int HandleConnectRequest(struct InstantReplicator* replicator, struct rdm
     pthread_mutex_unlock(&replicator->lock);
   }
 
+  if (peer != NULL)
+  {
+    // The accepting side must not exceed the depths requested by the initiator
+    acceptance = replicator->parameter;
+
+    if (acceptance.responder_resources > parameter->initiator_depth)      acceptance.responder_resources = parameter->initiator_depth;
+    if (acceptance.initiator_depth     > parameter->responder_resources)  acceptance.initiator_depth     = parameter->responder_resources;
+  }
+
   if ((peer == NULL) ||
       (peer->state != INSTANT_PEER_STATE_DISCONNECTED) ||
       (rdma_create_qp(descriptor, card->domain, &card->attribute) != 0) ||
-      (rdma_accept(descriptor, &replicator->parameter) != 0))
+      (rdma_accept(descriptor, &acceptance) != 0))
   {
     rdma_reject(descriptor, NULL, 0);
     return -1;
@@ -2224,9 +3056,12 @@ static int HandleEstablished(struct InstantReplicator* replicator, struct rdma_c
 
   peer = (struct InstantPeer*)descriptor->context;
 
-  peer->state      = INSTANT_PEER_STATE_CONNECTED;
-  peer->fails      = 0;
+  peer->state                    = INSTANT_PEER_STATE_CONNECTED;
+  peer->fails                    = 0;
   peer->points[peer->round].rank = 0;
+  peer->last                     = peer->lost;  // The initial syncing covers every notification lost before, removals are sent from now on
+  peer->delivered                = replicator->messages.sequence + replicator->messages.count;
+  peer->credit.expiration        = replicator->tick + replicator->timeout;
 
   CreateClockingTask(replicator, peer);
   CreateSyncingTask(replicator, peer);
@@ -2247,13 +3082,30 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
     {
       CallEventFunction(replicator, INSTANT_REPLICATOR_EVENT_DISCONNECTED, peer, NULL, reason);
 
-      // Refuse new work, queued work completes its tasks before ClearTaskList()
+      // Refuse new work
       peer->state = INSTANT_PEER_STATE_DISCONNECTED;
-
-      ClearRequestQueue(replicator, &peer->queue);
-      ClearTaskList(replicator, peer);
     }
 
+    if (descriptor->qp != NULL)
+    {
+      if (ibv_destroy_qp(descriptor->qp) != 0)
+      {
+        // DMA into pool memory may be still in progress, nothing is released and the barrier is never lifted
+        peer->state = INSTANT_PEER_STATE_FAILED;
+        atomic_fetch_or_explicit(&replicator->state, INSTANT_REPLICATOR_STATE_FAILURE, memory_order_relaxed);
+        return 0;
+      }
+
+      // Destroyed without rdma_destroy_qp() to check the result, DestroyDescriptor() skips it
+      descriptor->qp = NULL;
+    }
+
+    ClearRequestQueue(replicator, &peer->queue);
+    ClearTaskList(replicator, peer);
+
+    memset(&peer->credit, 0, sizeof(struct InstantCredit));
+
+    peer->pending    = 0;
     peer->state      = INSTANT_PEER_STATE_DISCONNECTED;
     peer->descriptor = NULL;
     peer->card       = NULL;
@@ -2423,6 +3275,199 @@ static void TrackPeerList(struct InstantReplicator* replicator)
   pthread_mutex_unlock(&replicator->lock);
 }
 
+static void TrackLossList(struct InstantReplicator* replicator)
+{
+  struct InstantPeer* peer;
+  struct InstantTask* task;
+  uint32_t credit;
+  uint32_t lost;
+
+  lost   = atomic_load_explicit(&replicator->loss.count, memory_order_relaxed);
+  credit = GetPeerCredit(replicator);
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    // A notification dropped on the application thread is lost for every peer
+    peer->lost += lost - replicator->loss.last;
+
+    for (task = replicator->schedule.head; (task != NULL) && ((task->type != INSTANT_TASK_TYPE_SYNCING) || (task->peer != peer)); task = task->next);
+
+    if ((peer->state   == INSTANT_PEER_STATE_CONNECTED) &&
+        (peer->lost    != peer->last)                   &&
+        (peer->pending <  (credit / 2))                 &&
+        (task          == NULL))
+    {
+      // Starts once the queue of the peer has drained, notifications lost during this syncing start the next one
+      peer->last = peer->lost;
+      CreateSyncingTask(replicator, peer);
+    }
+  }
+
+  replicator->loss.last = lost;
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
+static void TrackTaskList(struct InstantReplicator* replicator)
+{
+  struct rdma_cm_id* descriptor;
+  struct InstantTask* task;
+  struct InstantPeer* peer;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (task = replicator->schedule.head; task != NULL; )
+  {
+    if ((task->type >= INSTANT_TASK_TYPE_READING)             &&
+        ((task->state == INSTANT_TASK_STATE_WAIT_DATA)        ||
+         (task->state == INSTANT_TASK_STATE_WAIT_BUFFER)      ||
+         (task->state == INSTANT_TASK_STATE_WAIT_COMPLETION)) &&
+        (replicator->tick > task->expiration)                 &&
+        (peer       = task->peer)                             &&
+        (peer->state == INSTANT_PEER_STATE_CONNECTED)         &&
+        (descriptor = peer->descriptor))
+    {
+      // The peer stopped answering without breaking the connection and the transfer holds the barrier;
+      // a stopped peer never answers DREQ either, so the connection is closed here as by ClosePeerList(),
+      // ClearTaskList() removes the tasks of the peer and the peer is caught up after a reconnect
+      DestroyDescriptor(descriptor, HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED));
+      task = replicator->schedule.head;
+      continue;
+    }
+
+    task = task->next;
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
+static void TrackCreditList(struct InstantReplicator* replicator)
+{
+  struct InstantSharedBuffer* buffer;
+  struct InstantHeaderData* header;
+  struct InstantCreditData* data;
+  struct rdma_cm_id* descriptor;
+  struct InstantPeer* other;
+  struct InstantPeer* peer;
+  uint32_t capacity;
+  uint32_t window;
+  uint32_t count;
+  uint32_t used;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (count = 0, peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    // Connected peers share the receiving queue
+    count += (peer->state == INSTANT_PEER_STATE_CONNECTED);
+  }
+
+  capacity = INSTANT_QUEUE_LENGTH - INSTANT_CREDIT_RESERVE;
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
+        (descriptor  = peer->descriptor))
+    {
+      if (((peer->credit.sent - peer->credit.acknowledged) < peer->credit.window) ||
+          (peer->credit.stalled != peer->credit.received))
+      {
+        // The window is open or the peer has sent something: a live peer announces its first window after the connect
+        // and reports at the latest when half of the window is used, a zero window alone is no progress
+        peer->credit.stalled    = peer->credit.received;
+        peer->credit.expiration = replicator->tick + replicator->timeout;
+      }
+      else if (replicator->tick > peer->credit.expiration)
+      {
+        // The peer stopped receiving without breaking the connection, the messages and the transfers wait for it;
+        // a stopped peer never answers DREQ either, so the connection is closed here as by ClosePeerList(),
+        // that releases them and the peer is caught up after a reconnect
+        DestroyDescriptor(descriptor, HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED));
+      }
+    }
+
+    if ((peer->state         != INSTANT_PEER_STATE_CONNECTED) ||
+        (peer->credit.buffer != NULL))
+    {
+      // At most one report is in flight
+      continue;
+    }
+
+    for (used = 0, other = replicator->peers; other != NULL; other = other->next)
+    {
+      if ((other        != peer) &&
+          (other->state == INSTANT_PEER_STATE_CONNECTED))
+      {
+        // A peer may use any window announced to it until it confirms the last one
+        used += other->credit.committed;
+      }
+    }
+
+    // A fair share, limited by what the windows still usable by the other peers leave free
+    window = capacity / (count | !count);
+    window = (used < capacity) ? ((window < (capacity - used)) ? window : (capacity - used)) : 0;
+
+    if (peer->credit.applied != peer->credit.advertised)
+    {
+      // Only one change of the window is unconfirmed at a time, so a confirmation cannot be taken for a later change with the same value
+      window = peer->credit.advertised;
+    }
+
+    if (((peer->credit.advertised  != window)              ||
+         (peer->credit.echoed      != peer->credit.window) ||
+         ((peer->credit.advertised != 0) &&
+          ((peer->credit.received - peer->credit.reported) >= ((peer->credit.advertised + 1) / 2)))) &&
+        (buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
+    {
+      // The window has changed, the window of the peer must be confirmed, or nothing else carried the report in time
+      header         = (struct InstantHeaderData*)buffer->data;
+      header->type   = INSTANT_TYPE_CREDIT;
+      header->task   = UINT32_MAX;
+      buffer->length = sizeof(struct InstantHeaderData) + sizeof(struct InstantCreditData);
+      data           = (struct InstantCreditData*)(buffer->data + sizeof(struct InstantHeaderData));
+      data->window   = window;
+      data->applied  = peer->credit.window;
+
+      uuid_copy(header->identifier, replicator->identifier);
+
+      if (SubmitSharedBuffer(replicator, peer, buffer, INSTANT_CREDIT_FREE) == 0)
+      {
+        // The report fits into the buffers kept for the reports
+        peer->credit.buffer     = buffer;
+        peer->credit.advertised = window;
+        peer->credit.committed  = (peer->credit.committed > window) ? peer->credit.committed : window;
+        peer->credit.echoed     = peer->credit.window;
+      }
+
+      ReleaseSharedBuffer(&replicator->buffers, buffer);
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
+static void ClosePeerList(struct InstantReplicator* replicator)
+{
+  struct rdma_cm_id* descriptor;
+  struct InstantPeer* peer;
+
+  pthread_mutex_lock(&replicator->lock);
+
+  for (peer = replicator->peers; peer != NULL; peer = peer->next)
+  {
+    if ((descriptor  = peer->descriptor) &&
+        (peer->state != INSTANT_PEER_STATE_FAILED))
+    {
+      // The same order as for a lost connection: stop DMA, abandon unfinished transfers, then release the barrier
+      DestroyDescriptor(descriptor, HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED));
+    }
+  }
+
+  pthread_mutex_unlock(&replicator->lock);
+}
+
 // Routines
 
 static void* DoWork(void* closure)
@@ -2472,12 +3517,18 @@ static void* DoWork(void* closure)
         case RING_TAG_TIMEOUT:
           replicator->tick ++;
           TrackPeerList(replicator);
+          TrackLossList(replicator);
+          TrackTaskList(replicator);
+          SendMessageList(replicator);
           TrackCookieList(replicator);
           CreateClockingTask(replicator, NULL);
           break;
 
         case RING_TAG_READY_STATE:
           WaitForReadyState(replicator);
+          break;
+
+        case RING_TAG_RETURN_STATE:
           break;
 
         case RING_TAG_SENDING_QUEUE:
@@ -2498,10 +3549,17 @@ static void* DoWork(void* closure)
     }
 
     ExecuteTaskList(replicator);
+    TrackCreditList(replicator);
     DrainRequestQueueList(replicator);
   }
 
-  atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
+  ClosePeerList(replicator);
+
+  if (~atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_FAILURE)
+  {
+    // After a failure DMA may still be in progress, the barrier stays and FlushInstantReplicator() reports -EFAULT
+    atomic_fetch_and_explicit(&replicator->state, ~(INSTANT_REPLICATOR_STATE_LOCK | INSTANT_REPLICATOR_STATE_READY), memory_order_relaxed);
+  }
 
   while ((syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
          (errno == EINTR));
@@ -2509,7 +3567,7 @@ static void* DoWork(void* closure)
   return NULL;
 }
 
-struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, HandleInstantEventFunction function, void* closure, struct ReliableMonitor* next)
+struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, const char* name, const char* secret, uint32_t options, uint32_t timeout, HandleInstantEventFunction function, void* closure, struct ReliableMonitor* next)
 {
   struct InstantReplicator* replicator;
   struct rdma_addrinfo* information;
@@ -2528,18 +3586,20 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
     pthread_mutex_init(&replicator->lock, &attribute);
     pthread_mutexattr_destroy(&attribute);
 
-    replicator->super.next     = next;
-    replicator->super.closure  = replicator;
-    replicator->super.function = HandleMonitorEvent;
-    replicator->function       = function;
-    replicator->closure        = closure;
-    replicator->secret         = strdup(secret);
-    replicator->name           = strdup(name);
-    replicator->size           = sysconf(_SC_PAGESIZE);
-
+    if (timeout    == 0)     timeout = PEER_EXPIRATION_TIMEOUT;
     if (identifier == NULL)  uuid_generate(replicator->identifier);
     else                     uuid_copy(replicator->identifier, identifier);
 
+    replicator->super.next      = next;
+    replicator->super.closure   = replicator;
+    replicator->super.function  = HandleMonitorEvent;
+    replicator->function        = function;
+    replicator->closure         = closure;
+    replicator->secret          = strdup(secret);
+    replicator->name            = strdup(name);
+    replicator->size            = sysconf(_SC_PAGESIZE);
+    replicator->options         = options;
+    replicator->timeout         = ((uint64_t)timeout + GENERIC_POLL_TIMEOUT - 1) / GENERIC_POLL_TIMEOUT;
     replicator->handshake.magic = INSTANT_MAGIC;
 
     getrandom((uint8_t*)&replicator->handshake.nonce, sizeof(uint16_t), 0);
@@ -2563,8 +3623,8 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
         (rdma_listen(replicator->descriptor, 16)                          == 0) &&
         (rdma_migrate_id(replicator->descriptor, replicator->channel)     == 0))
     {
-      replicator->parameter.responder_resources = 2;
-      replicator->parameter.initiator_depth     = 2;
+      replicator->parameter.responder_resources = INSTANT_ATOMIC_COUNT;
+      replicator->parameter.initiator_depth     = INSTANT_ATOMIC_COUNT;
       replicator->parameter.retry_count         = 5;
       replicator->parameter.rnr_retry_count     = 5;
       replicator->parameter.private_data        = &replicator->handshake;
@@ -2588,11 +3648,7 @@ struct InstantReplicator* CreateInstantReplicator(int port, uuid_t identifier, c
 void ReleaseInstantReplicator(struct InstantReplicator* replicator)
 {
   struct InstantPeer* peer;
-  struct InstantCard* card;
   struct InstantTask* task;
-  struct InstantCookie* cookie;
-  struct InstantRemoval* removal;
-  struct InstantRequestItem* item;
 
   if (replicator != NULL)
   {
@@ -2600,6 +3656,12 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
     {
       // Thread might be not started
       pthread_join(replicator->thread, NULL);
+    }
+
+    if (atomic_load_explicit(&replicator->state, memory_order_relaxed) & INSTANT_REPLICATOR_STATE_FAILURE)
+    {
+      // DMA may still reach the buffers and the pools, everything is kept until the process exits
+      return;
     }
 
     while (peer = replicator->peers)
@@ -2616,41 +3678,12 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
       RemoveTask(replicator, task);
     }
 
-    while (task = replicator->tasks)
-    {
-      replicator->tasks = task->next;
-      free(task);
-    }
-
-    while (removal = replicator->removals.head)
-    {
-      replicator->removals.head = removal->next;
-      free(removal);
-    }
-
-    while (removal = replicator->removals.stack)
-    {
-      replicator->removals.stack = removal->next;
-      free(removal);
-    }
-
-    while (cookie = replicator->cookies.head)
-    {
-      replicator->cookies.head = cookie->next;
-      DestroyCookie(cookie);
-    }
-
-    while (card = replicator->cards)
-    {
-      replicator->cards = card->next;
-      DestroyCard(card);
-    }
-
-    while (item = replicator->items)
-    {
-      replicator->items = item->next;
-      free(item);
-    }
+    RELEASE(replicator->tasks,          free);
+    RELEASE(replicator->removals.head,  free);
+    RELEASE(replicator->removals.stack, free);
+    RELEASE(replicator->cookies.head,   DestroyCookie);
+    RELEASE(replicator->cards,          DestroyCard);
+    RELEASE(replicator->items,          free);
 
     if (replicator->descriptor != NULL)  rdma_destroy_ep(replicator->descriptor);
     if (replicator->channel    != NULL)  rdma_destroy_event_channel(replicator->channel);
@@ -2687,6 +3720,11 @@ int FlushInstantReplicator(struct InstantReplicator* replicator)
         // Any wake-up is rechecked against the state, only the barrier release lets the caller go
         syscall(SYS_futex, (uint32_t*)&replicator->state, FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG, state, NULL, NULL, FUTEX_BITSET_MATCH_ANY);
       }
+
+      // The replicator raises the next barrier only after the application has returned from this one
+      atomic_fetch_add_explicit(&replicator->barrier.returns, 1, memory_order_release);
+      while ((syscall(SYS_futex, (uint32_t*)&replicator->barrier.returns, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, INT_MAX, NULL, NULL, FUTEX_BITSET_MATCH_ANY) < 0) &&
+             (errno == EINTR));
 
       state = atomic_load_explicit(&replicator->state, memory_order_relaxed);
     }
@@ -2727,6 +3765,7 @@ int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t
 
     uuid_copy(peer->identifier, identifier);
 
+
     if (other = replicator->peers)
     {
       peer->next      = other;
@@ -2764,9 +3803,6 @@ int RegisterRemoteInstantReplicator(struct InstantReplicator* replicator, uuid_t
 
 int TransmitInstantReplicatorUserMessage(struct InstantReplicator* replicator, const char* data, uint32_t length, int wait)
 {
-  struct InstantSharedBuffer* buffer;
-  struct InstantHeaderData* header;
-
   if ((replicator == NULL) ||
       (data       == NULL) &&
       (length != 0)        ||
@@ -2776,19 +3812,9 @@ int TransmitInstantReplicatorUserMessage(struct InstantReplicator* replicator, c
     return -EINVAL;
   }
 
-  if (buffer = AllocateSharedBuffer(&replicator->buffers, wait))
-  {
-    header         = (struct InstantHeaderData*)buffer->data;
-    header->type   = INSTANT_TYPE_USER;
-    header->task   = UINT32_MAX;
-    buffer->length = sizeof(struct InstantHeaderData) + length;
+  // Delivered in order within the credit of every connected peer, lost only with a broken connection;
+  // the replicator thread (event handlers) never waits, it is the one that empties the queue
+  wait = wait && !pthread_equal(pthread_self(), replicator->thread);
 
-    uuid_copy(header->identifier,  replicator->identifier);
-    memcpy(buffer->data + sizeof(struct InstantHeaderData), data, length);
-
-    AppendSendingQueue(&replicator->queue, buffer);
-    return 0;
-  }
-
-  return -EBUSY;
+  return AppendMessage(replicator, INSTANT_TYPE_USER, data, length, wait);
 }
