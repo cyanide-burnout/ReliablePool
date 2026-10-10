@@ -141,7 +141,7 @@ Main API:
 
 - `CreateInstantReplicator(port, identifier, name, secret, options, timeout, function, closure, next)` (`timeout` in milliseconds: how long a peer may go without progress before its connection is closed, 0 = 1 000 ms, rounded up to 200 ms ticks)
 - `ReleaseInstantReplicator(replicator)`
-- `RegisterRemoteInstantReplicator(replicator, identifier, address, length)`
+- `RegisterRemoteInstantReplicator(replicator, identifier, address, length)` (a peer that cannot be reached for `CONNECTION_ATTEMPT_COUNT` (128) attempts in a row, at most one per 200 ms tick, so after at least about 25 s, is forgotten: this is the regular way dead peers are retired. The intended setup is `InstantDiscovery`, which registers a peer again as soon as it announces itself; an application that registers peers statically re-registers them itself when it wants them back)
 - `TransmitInstantReplicatorUserMessage(replicator, data, length, wait)` (queued and delivered in order to every connected peer, lost only with a broken connection; with `wait` it sleeps until the queue has a place and a buffer is free, otherwise returns `-EBUSY`; `-EFAULT` when the replicator has stopped or failed; event handlers run on the replicator thread and never wait)
 
 Options:

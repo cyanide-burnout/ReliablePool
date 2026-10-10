@@ -840,9 +840,12 @@ ms):
 
 The latency covers the whole path from the write to the version seen by the application of the
 peer: change detection by the tracker, the queues, the network, the read or the transfer and the
-barrier of the receiver. The median at 5 000 ops/s is the same as on `d39b85d` (~0.3 ms), while the
-p99 is higher (~3.2 ms there) and varied between 4.8 and 7.5 ms in the runs of 2026-10-09; the
-cause was not analyzed. At 20 000 ops/s the
+barrier of the receiver. The median at 5 000 ops/s is the same as on `d39b85d` (~0.3 ms). The p99
+varied between 4.8 and 7.5 ms in these runs, with 2 000 user messages per second on top of the
+writes; three runs per mode on 2026-10-10 under the conditions of `d39b85d`, without user
+messages, gave 3.5–5.5 ms optimistic and 3.6–6.2 ms synchronous, with the same medians. The p99
+spreads widely between runs, and the lowest runs match the ~3.2 ms of `d39b85d`, so no regression
+of the tail is shown. At 20 000 ops/s the
 optimistic mode halves the median, since most blocks arrive without waiting for the barrier of the
 sender.
 
@@ -954,18 +957,22 @@ there; it was not measured.
 
 ## Known Issues
 
-These issues were reproduced on the testbed and are open.
+These issues were reproduced on the testbed and are open; issues 1 and 2 have not been
+reproduced since defect 8 was fixed, but their cause was not determined, so they stay listed.
 
 1. **Rare corrupt arrival after a reconnect.** At most one per run, only in runs with
    disconnects: a zero-filled reserved block is accepted as an arrival. Observed before defect 8
-   was fixed; the kill, freeze and timeout runs with disconnects since then had no corrupt
-   arrivals. Not enough to call it fixed.
+   was fixed. The runs of 2026-10-09 and 2026-10-10, about 250 on InfiniBand and RoCE in both
+   modes, about 115 of them with a disconnect (kill, stops, freezes, timeouts and injected
+   faults), had no corrupt arrival.
 2. **`IBV_WC_REM_ACCESS_ERR` at 20 000 ops/s.** Before defect 8 was fixed, a remote access error
    occurred within the first seconds in most runs at 20 000 ops/s and in every run with payloads
    up to 4 000 B; the session recovers from it since defect 5. Since defect 8 was fixed it has not
    occurred in 20 runs: 12 at 20 000 ops/s, 4 at 10 000 ops/s with payloads up to 4 000 B and 4 at
-   higher rates. The cause was not determined, so it is only likely, not
-   shown, that defect 8 was the trigger.
+   higher rates. On 2026-10-09 and 2026-10-10 about 80 load runs without failures, among them about
+   10 at 20 000 ops/s and 20 at 10 000 ops/s, had no disconnect, which such an error would cause;
+   the error itself is not logged by the test. It is only likely, not shown, that defect 8 was the
+   trigger.
 3. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
    (see [Replication Model Boundaries](README.md#replication-model-boundaries)). A zombie can
@@ -1206,13 +1213,16 @@ across a disconnect were those sent while the connection was down (1 040–23 32
 restarted node received the stream of its peer from the point of its connection. A dump with one
 more sent message than was received was reported by `Compare.py` as a lost tail.
 
-16. **A connection request without a device context crashed the replicator.** `EnsureCard()`
-    passed `descriptor->verbs` to `ibv_query_device()` without a check. librdmacm leaves it `NULL`
-    when it cannot map the request to a local device; on the testbed the RoCE function of node B, a
-    virtual function without an administrative MAC, had a zero node GUID, and the replicator thread
-    of node B crashed with `SIGSEGV` on the first request from node A. Such a request is rejected
-    now, and an outgoing connection resolved to such a device fails the same way. With a MAC
-    assigned to the virtual function the node GUID is derived from it and the connection works.
+16. **A connection request rdma_cm could not map to a local device crashed the replicator.**
+    `EnsureCard()` passed `descriptor->verbs` to `ibv_query_device()` without a check. librdmacm
+    finds the local device of a connection by its node GUID and leaves `verbs` `NULL` when none
+    matches. On the testbed the RoCE function of node B, a virtual function in Ethernet mode
+    without an administrative MAC, had a zero node GUID: Ethernet worked on the port and the device
+    was usable through verbs, but rdma_cm could not tie a connection to it, and the replicator
+    thread of node B crashed with `SIGSEGV` on the first request from node A. Such a request is
+    rejected now, and an outgoing connection resolved to such a device fails the same way. With a
+    MAC assigned to the virtual function on the host the node GUID is derived from it and the
+    connection works.
 
 
 17. **Shared buffers of posted SENDs leaked on a disconnect.** A SEND holds a reference to its
