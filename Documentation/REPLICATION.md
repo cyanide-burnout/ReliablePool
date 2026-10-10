@@ -58,7 +58,7 @@ Peers can lag, intermediate versions can be skipped, and recent changes can be l
 source fails. Reconnection provides an opportunity to synchronize live state, but does not imply
 unconditional eventual delivery: the current selector can suppress a repeated offer after an
 abandoned transfer. Removals also have no persistent tombstones. The precise convergence, clock
-and trust boundaries are documented in [Replication Model Boundaries](README.md#replication-model-boundaries).
+and trust boundaries are documented in [Replication Model Boundaries](../README.md#replication-model-boundaries).
 
 ### Synchronous Transfer Within Asynchronous Replication
 
@@ -1002,7 +1002,7 @@ reproduced since defect 8 was fixed, but their cause was not determined, so they
    trigger.
 3. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
-   (see [Replication Model Boundaries](README.md#replication-model-boundaries)). A zombie can
+   (see [Replication Model Boundaries](../README.md#replication-model-boundaries)). A zombie can
    also be damaged: a transfer abandoned by the disconnect leaves its copy damaged in either mode,
    and when the object is gone at its author no later version repairs it. After a restart the
    author has lost its list of released objects, so `Compare.py` cannot confirm that the object

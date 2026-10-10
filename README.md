@@ -1,467 +1,418 @@
 # ReliablePool
 
-ReliablePool was introduced in **2022** as part of the **BrandMeister** and **TetraPack** projects.
-
-## Background
-
-ReliablePool started as an internal building block inside BrandMeister and TetraPack and
-remains actively used by both projects. The standalone repository tracks the same
-implementation used there rather than a detached experimental fork. Over time it evolved
-into a standalone subsystem with its own API and supporting components such as tracking,
-monitoring and event integration.
-
-## What it is
-
-ReliablePool is not a conventional memory allocator. It is a persistent shared-memory
-object model built around stable mappings, explicit ownership, restart recovery, change
-tracking and replication. It is intended for systems that need:
-
-- stable addresses over time (even as the pool grows),
-- explicit lifetime management and controlled ownership,
-- integration points for replication/monitoring and idempotent processing,
-- capability to recover data on restart (through using `memfd` or an opened file as backends and systemd's **FDSTORE** feature),
-- capability for inter-process sharing.
-
-FastRing provides asynchronous event integration for ReliablePool through
-`ReliableWaiter` and `InstantWaiter`.
-
-## Related Components
-
-ReliablePool is commonly used together with:
-
-- **Reliable components**: `ReliableMonitor`, `ReliableIndexer`, `ReliableTracker`, `ReliableWaiter`
-- **Instant components**: `InstantReplicator`, `InstantWaiter`, `InstantDiscovery`
-- **Restart tools**: `Rescue`, `Collapse`, `Epoch` (in `Tools/`)
-
-## Reliable Components
-
-### ReliableMonitor
-
-Role:
-
-- Linked monitor chain (`next`) attached to `ReliablePool`.
-- Entry point for lifecycle and block events.
-- A single monitor chain can be shared across multiple pools when this is intentional and lifetime/synchronization are controlled by the application.
-
-Callback:
-
-- `ReliableMonitorFunction(event, pool, share, block, closure)`
-
-Core events:
-
-- `RELIABLE_MONITOR_POOL_CREATE` / `RELIABLE_MONITOR_POOL_RELEASE`
-- `RELIABLE_MONITOR_SHARE_CREATE` / `RELIABLE_MONITOR_SHARE_DESTROY`
-- `RELIABLE_MONITOR_BLOCK_ALLOCATE` / `RELIABLE_MONITOR_BLOCK_ATTACH`
-- `RELIABLE_MONITOR_BLOCK_RELEASE` / `RELIABLE_MONITOR_BLOCK_FREE`
-- `RELIABLE_MONITOR_BLOCK_RESERVE` / `RELIABLE_MONITOR_BLOCK_RECOVER`
-
-`RELIABLE_MONITOR_POOL_RELEASE` is delivered as the last event for a pool monitor chain.
-
-### ReliableIndexer
-
-Role:
-
-- Monitor implementation that maintains a pool index: `name -> ReliablePool*`.
-- Monitor implementation that maintains a block index: `(name, block_uuid) -> block_number`.
-
-Main API:
-
-- `CreateReliableIndexer(next)` / `ReleaseReliableIndexer(indexer)`
-- `GetReliableIndexer(pool)`
-- `FindReliablePool(indexer, name, acquire)`
-- `FindReliableBlockNumber(indexer, name, identifier)`
-- `CollectReliableBlockList(indexer, pool, time, flags)`
-- `RemoveUnusedReliableBlockList(indexer, pool, time)`
-
-Used by replication logic to resolve remote identifiers into local block numbers and to collect candidate block sets.
-
-### ReliableTracker
-
-Role:
-
-- Monitor + background worker based on `userfaultfd` write-protection.
-- Tracks dirty pages, calculates block CRC32C, updates replication marks/hints.
-- Emits replication-oriented monitor events.
-
-Main API:
-
-- `CreateReliableTracker(flags, next)` / `ReleaseReliableTracker(tracker)`
-- `FlushReliableTracker(tracker)` (must be called in idempotent/safe state)
-- `LockReliableShare(share)` / `UnlockReliableShare(share)`
-- `GetReliableTrackerClockVector(remote_timespec)`
-- `VerifyReliableBlockIntegrity(block)` — returns non-zero when the block is neither `NULL` nor free and its data matches the CRC32C stored by the tracker in `block->control`; intended for validation in application and recovery code
-
-Tracker-specific events:
-
-- `RELIABLE_MONITOR_SHARE_CHANGE` (page-level dirty signal from tracking thread; also serves as fallback wake signal when waiter/futex activation path is not used)
-- `RELIABLE_MONITOR_BLOCK_CHANGE` (block changed after flush analysis)
-- `RELIABLE_MONITOR_FLUSH_COMMIT` (flush commit barrier for downstream monitors)
-
-### ReliableFlusher
-
-Role:
-
-- Optional thin consumer of `ReliableTracker` in the `ReliableMonitor` chain.
-- Adds an explicit durability step for file-backed pools by collecting `RELIABLE_MONITOR_BLOCK_CHANGE` reports and synchronizing each completed share with `msync(MS_SYNC)`.
-- On `msync()` failure raises the sticky `RELIABLE_FLUSHER_STATE_FAILURE` flag.
-
-Main API:
-
-- `CreateReliableFlusher(next)` / `ReleaseReliableFlusher(flusher)`
-
-Notes:
-
-- Useful only for pools backed by a real file; `msync()` is a no-op on `memfd` (tmpfs).
-- Coalesces consecutive block-change reports for the same share and synchronizes it when another share begins or `RELIABLE_MONITOR_FLUSH_COMMIT` closes the cycle.
-- Deferring `msync()` until the share is complete ensures that tracker metadata updates for all reported blocks are included.
-- Reports synchronization failures without blocking delivery of monitor events to downstream consumers.
-
-### ReliableWaiter
-
-Role:
-
-- `FastRing` adapter for `ReliableTracker`.
-- Waits on tracker state via io_uring futex and calls `FlushReliableTracker(...)` on wake.
-
-Main API:
-
-- `SubmitReliableWaiter(ring, tracker)`
-- `CancelReliableWaiter(descriptor)`
-
-## Instant Components
-
-### InstantReplicator
-
-Role:
-
-- RDMA replication monitor in the `ReliableMonitor` chain.
-- Synchronizes pool changes between peers.
-
-Main API:
-
-- `CreateInstantReplicator(port, identifier, name, secret, options, timeout, function, closure, next)` (`timeout` in milliseconds: how long a peer may go without progress before its connection is closed, 0 = 1 000 ms, rounded up to 200 ms ticks)
-- `ReleaseInstantReplicator(replicator)`
-- `RegisterRemoteInstantReplicator(replicator, identifier, address, length)` (a peer that cannot be reached for `CONNECTION_ATTEMPT_COUNT` (128) attempts in a row, at most one per 200 ms tick, so after at least about 25 s, is forgotten: this is the regular way dead peers are retired. The intended setup is `InstantDiscovery`, which registers a peer again as soon as it announces itself; an application that registers peers statically re-registers them itself when it wants them back)
-- `TransmitInstantReplicatorUserMessage(replicator, data, length, wait)` (queued and delivered in order to every connected peer, lost only with a broken connection; with `wait` it sleeps until the queue has a place and a buffer is free, otherwise returns `-EBUSY`; `-EFAULT` when the replicator has stopped or failed; event handlers run on the replicator thread and never wait)
-
-Options:
-
-- `INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE`: under the receiver barrier, offered blocks are first read by RDMA READ straight into the locked local blocks, without involving the sender's barrier, and the source `mark` is read after the data. A block is accepted when the source still shows the offered `mark`, the identifier matches and the CRC32C matches the control; the rest go through the synchronous CAS/WRITE transfer. The synchronous transfer stays the default: the option trades a part of the parking of the main thread for DAMAGE on copies overwritten by a rejected read, mostly of objects already released at the source. The design, its correctness argument and the measurements are in [REPLICATION.md](REPLICATION.md#optimistic-mode).
-
-Buffers:
-
-- The application thread never waits for replication buffers, except in `TransmitInstantReplicatorUserMessage()` with `wait`, and cannot take the last `INSTANT_RESERVE_COUNT` of them, which stay for the replicator thread. A block change notification that does not fit is counted as lost and the affected peers are synchronized again; removals and user messages are built once in a shared buffer, queued and sent in order to every peer.
-- Every peer grants a window of messages that consume its receiving buffers, so a stopped or slow peer never gets more than it can receive: a SEND never waits for `RNR` and never holds up the reads and writes posted after it on the same connection. The count of received messages returns in `imm_data` of every SEND, windows are announced and confirmed by `INSTANT_TYPE_CREDIT`.
-- A peer that stops answering without breaking the connection is disconnected by the replicator after about 1 s by default: when a transfer waiting for it does not advance or its credit window stays used up while it sends nothing. The barrier and the queued messages never wait longer for a stopped peer; it is caught up after it connects again. The time is the `timeout` of `CreateInstantReplicator()`, a failure budget of the instance, see [Timeouts](REPLICATION.md#timeouts).
-
-Requirements:
-
-- `InstantReplicator` requires RDMA remote atomic support for its compare-and-swap transfer path.
-- The HCA must expose atomic capabilities. Up to `INSTANT_ATOMIC_COUNT` (16) RDMA READ and atomic operations are kept in flight per connection, limited by the weakest local card and by the depths the peer requests.
-- Adapters that do not satisfy these capabilities are rejected during card setup and are treated as unavailable; they will not be considered connected peers.
-
-Protocol format:
-
-- Header: `InstantHeaderData`
-- Payload (type-specific):
-  - `INSTANT_TYPE_CLOCK`: `struct timespec`
-  - `INSTANT_TYPE_NOTIFY` / `INSTANT_TYPE_RETRIEVE`: transfer metadata and registered keys
-  - `INSTANT_TYPE_COMPLETE`: task completion marker
-  - `INSTANT_TYPE_REMOVE`: `InstantRemovalData`
-  - `INSTANT_TYPE_CREDIT`: `InstantCreditData` (window granted to the peer, window of the peer being applied)
-  - `INSTANT_TYPE_USER`: arbitrary user payload
-
-`INSTANT_TYPE_REMOVE` message format:
-
-- `InstantHeaderData + InstantRemovalData`
-
-Callback events (`HandleInstantEventFunction`):
-
-- `INSTANT_REPLICATOR_EVENT_FLUSH` - requests external flush/ready handshake.
-  Contract: call `FlushInstantReplicator(replicator)` from another thread/event-loop context; do not block by calling it re-entrantly from the same replicator callback thread.
-  While the caller is parked in `FlushInstantReplicator()`, no other thread may modify pool objects: parking the event-loop thread alone does not protect against unrelated writers.
-- `INSTANT_REPLICATOR_EVENT_CONNECTED`
-- `INSTANT_REPLICATOR_EVENT_DISCONNECTED`
-- `INSTANT_REPLICATOR_EVENT_USER_MESSAGE`
-
-Additional `ReliableMonitor` events emitted by `InstantReplicator`:
-
-- `RELIABLE_MONITOR_BLOCK_DAMAGE` - emitted after transfer retries are exhausted and block validation still fails.
-- `RELIABLE_MONITOR_BLOCK_ARRIVAL` - emitted when transferred block data is validated and accepted.
-- `RELIABLE_MONITOR_BLOCK_REMOVAL` - emitted when deferred remote removal reaches a busy local block and requires application-level handling.
-
-### InstantWaiter
-
-Role:
-
-- `FastRing` adapter for waiting on `InstantReplicator` state transitions through io_uring futex operations.
-
-Main API:
-
-- `SubmitInstantWaiter(ring, replicator)` - creates and submits a waiter descriptor.
-- `CancelInstantWaiter(descriptor)` - cancels the waiter and releases callback linkage.
-
-Use when the application already runs a `FastRing` loop and needs non-blocking integration with replicator wakeups.
-
-### InstantDiscovery
-
-Role:
-
-- Avahi/mDNS helper for automatic peer discovery and local service publication for `InstantReplicator`.
-
-Main API:
-
-- `CreateInstantDiscovery(poll, replicator)`
-- `ReleaseInstantDiscovery(discovery)`
-
-Behavior:
-
-- Publishes local service as `_replicator._tcp` with TXT key `instance=<uuid>`.
-- Browses matching services and resolves endpoints.
-- Calls `RegisterRemoteInstantReplicator(...)` for discovered remote instances.
-- Restarts Avahi client on transient daemon/DBus failures using delayed retry.
-
-## Durability and Crash Consistency
-
-There is no WAL, so `msync()` does not make blocks atomically persistent. A flush cycle is the durability boundary: `FlushReliableTracker()` runs in an idempotent state and updates `control` CRC32C plus `mark`/`hint` for the consistent pool state observed by that cycle. CRC allows recovery to detect a block whose data and metadata were persisted inconsistently.
-
-Persistence behavior:
-
-- `ReliableFlusher` gives the lower bound: everything confirmed by a completed flush cycle survives a crash, provided it did not set `RELIABLE_FLUSHER_STATE_FAILURE`.
-- There is no upper bound: kernel background writeback persists dirty pages between cycles at arbitrary moments, so after a crash the file may additionally contain partial state of later, unconfirmed changes ("torn" blocks).
-- A `memfd`-backed pool has no filesystem writeback tearing. With **FDSTORE** it retains the exact in-memory state across a service restart, including an update interrupted by the dying process; it does not survive a host reboot at all.
-
-Torn blocks come in two kinds:
-
-- Data newer than metadata: the block looks stale to peers and replication re-fetches it — heals itself.
-- Metadata newer than data (or `mark` still carrying the in-flight low bit of an interrupted transfer): the block looks fresh while its data is stale — this kind must be handled explicitly.
-
-Healing is deliberately left to the application. Whether a pool is tracked and replicated is the application's choice, and `block->control` is maintained only under tracking, so no component can decide validity on its own. The right hook is `ReliableRecoveryFunction`: when an existing pool is opened with `RELIABLE_FLAG_RESET`, it runs once for every recoverable block before that block is published through `RELIABLE_MONITOR_BLOCK_RECOVER`. This keeps crash validation on the restart path instead of adding runtime cost.
-
-Recipe for a tracked (and optionally replicated) pool, inside the recovery callback:
-
-- Keep the block as is when `hint & 1` is clear and `VerifyReliableBlockIntegrity(block)` returns non-zero. Opening the pool already turns the lock of a transfer interrupted by the crash (`mark & 1`) into the damaged state: `mark` 0 and a pending `hint` (`hint & 1`).
-- Otherwise pick one of two outcomes:
-  - return `RELIABLE_TYPE_FREE` — discard the block when the data model does not tolerate partial writes;
-  - keep the allocation but zero `mark` and `hint` — the block is declared stale, and startup synchronization can re-fetch it from a peer with a newer valid copy.
-
-Torn blocks cannot poison other nodes either way: receivers validate CRC on every arrival and reject mismatching transfers.
-
-A transfer that ended after it may have overwritten a block reports `RELIABLE_MONITOR_BLOCK_DAMAGE` and leaves the block damaged: `mark` 0 and a pending `hint`. Neither the tracker nor the replicator publishes such a block. It leaves this state when a later transfer from a peer installs a version, or when the application rewrites the content and calls `RepairReliableBlock(pool, block)`, which clears the pending `hint` and inverts `control`, so the next tracker flush sees a changed checksum and publishes the block even when the content was restored to the bytes that matched the old `control`.
-
-## Restart Recovery Tools
-
-A `memfd`-backed pool survives a service restart only while its descriptor is kept by systemd in the unit's fd store. Three helpers in `Tools/` cover this.
-
-### Rescue
-
-`Rescue` owns the fd store of the process:
-
-- at startup (a constructor, when running under systemd with `NOTIFY_SOCKET`) it takes over `LISTEN_FDS` / `LISTEN_FDNAMES`, relocates the descriptors above `FD_SETSIZE` and indexes them by name;
-- `GetRescuedHandle(name)` returns a descriptor restored from the previous run, or `-1`;
-- `AddRescuedHandle(handle, name)` puts a descriptor into the fd store (`FDSTORE=1`, `FDNAME=name`);
-- `RemoveRescuedHandle(handle, RESCUE_REMOVE_CLOSE)` removes it from the fd store (`FDSTOREREMOVE=1`);
-- `CloseUnusedRescuedHandleList()` closes and removes restored descriptors that nobody claimed.
-
-Names must not contain `:` or control characters. A name without `%` is stored by pointer, not copied.
-
-### Collapse
-
-On `SIGTERM` the service has to decide whether to keep its state (and not tear down connections) or to perform a regular destructive stop. systemd does not tell this to the service ([systemd#43880](https://github.com/systemd/systemd/issues/43880)), so `Collapse` asks PID 1 (`ListJobs` over sd-bus) why the unit is being stopped:
-
-- `GetCollapseCause()` returns a bit field of `COLLAPSE_RESTART` (restart job of the unit itself), `COLLAPSE_KEXEC`, `COLLAPSE_SOFT_REBOOT`, `COLLAPSE_REBOOT`, `COLLAPSE_POWEROFF`, `COLLAPSE_HALT`, or a negative errno;
-- `IsLiveUpdateAvailable()` reports whether LUO (Live Update Orchestrator) is active in the running kernel, by checking only that `/dev/liveupdate` exists;
-- `CanSurvive()` returns `1` when the state survives (unit restart, soft-reboot, kexec with LUO), `0` when it does not, or a negative errno — treat an error as "does not survive".
-
-```c
-int cause = CanSurvive();
-
-if (cause > 0)
-  /* keep connections, leave descriptors in the fd store */;
-else
-  /* regular stop, RemoveRescuedHandle(..., RESCUE_REMOVE_CLOSE) */;
+ReliablePool is a C library for keeping the live state of a service, its objects, in shared
+memory that outlives the process and can be replicated to other nodes. Objects are fixed-size
+blocks of a pool mapped from a `memfd` or a file. They keep stable addresses while the pool grows,
+survive a restart of the service, can be opened by several processes, and, with the optional
+components, have their changes detected and copied to peers over RDMA without the application
+writing update messages.
+
+It was introduced in 2022 as part of the BrandMeister and TetraPack projects and is still used by
+both; this repository carries the same implementation.
+
+- [The Problem](#the-problem)
+- [Architecture](#architecture)
+- [Getting Started](#getting-started)
+- [Execution Contract](#execution-contract)
+- [Replication Model Boundaries](#replication-model-boundaries)
+- [Requirements and Build](#requirements-and-build)
+- [Examples](#examples)
+- [Repository Layout](#repository-layout)
+- [Documentation](#documentation)
+
+## The Problem
+
+A service such as a radio network core holds per-connection and per-call contexts in memory. When
+it is restarted for an update, or crashes, that state is lost, and every client has to reconnect
+and start over. Keeping the state in a database or serializing it on shutdown costs latency on the
+hot path or does not help after a crash.
+
+ReliablePool keeps such objects directly in a shared mapping instead:
+
+- The object is the memory. The application works with plain structures through pointers; there
+  is no serialization step.
+- The memory outlives the process. A `memfd` handed to the systemd fd store comes back to the next
+  instance of the service; a file survives a reboot. On start, the application is called for every
+  surviving object to validate it and rebuild its own indexes.
+- Ownership is explicit. Blocks are reference-counted, and the type a block is released with
+  decides whether the object is gone or kept for the next start.
+- Changes can be observed without instrumenting the code. `ReliableTracker` detects writes with
+  `userfaultfd` write protection and turns them into versioned, checksummed block changes.
+- Changes can be replicated. `InstantReplicator` delivers the latest version of every changed
+  block to other nodes over InfiniBand or RoCE, so a peer can continue serving an object when its
+  node disappears.
+
+ReliablePool is not a general-purpose allocator: all blocks of a pool have the same size, and the
+pool is meant for long-lived state objects, not for arbitrary heap allocations.
+
+## Architecture
+
+### Pool, Shares and Blocks
+
+A **pool** (`ReliablePool`) is one descriptor, a regular file or a `memfd`, divided into blocks of
+one size chosen at creation. It grows by 1 024 blocks at a time; each growth maps the descriptor
+again as a new **share**, and old shares stay mapped while objects in them are referenced, so a
+pointer to an object never moves.
+
+A **block** has a small header followed by the application data. The header carries the local
+bookkeeping (type, number, generation tag, reference count) and the part used by tracking and
+replication: a global UUID, a CRC32C of the data, and the `mark` and `hint` version fields. An
+application holds a block through a **descriptor** (`ReliableDescriptor`), which is one counted
+reference to the block, its share and its pool.
+
+The pool itself is enough for restart survival and for sharing between processes; everything else
+is optional.
+
+### The Monitor Chain
+
+Every component that extends the pool is a **monitor**: a `ReliableMonitor` linked into a chain
+that is passed to `CreateReliablePool()`. The pool and the components deliver events (pool and
+share creation, block allocation, release, change, arrival, ...) to every monitor of the chain in
+order, on the thread that causes them. An application adds its own monitor to the chain to observe
+the same events.
+
+```
+CreateReliablePool(..., &tracker->super, ...)
+
+  ReliableTracker ──▶ ReliableFlusher ──▶ ReliableIndexer ──▶ InstantReplicator ──▶ application monitor
+  change detection    msync() of files    UUID ⇄ block        RDMA replication      ARRIVAL, DAMAGE, ...
 ```
 
-Unit requirements (systemd 254 or newer):
+| Component | Role | Needs |
+|---|---|---|
+| `ReliablePool` | Pool, blocks, descriptors, recovery on open | — |
+| `ReliableTracker` | Detects writes with `userfaultfd`, computes CRC32C, stamps versions in flush cycles | — |
+| `ReliableFlusher` | Writes a file-backed pool to disk with `msync()` at the end of each flush cycle | Tracker |
+| `ReliableIndexer` | Assigns block UUIDs; indexes pools by name and blocks by UUID | — |
+| `ReliableWaiter` | Runs tracker flushes from a FastRing (io_uring) event loop | Tracker, FastRing |
+| `InstantReplicator` | Replicates block versions, removals and user messages over RDMA | Tracker, Indexer |
+| `InstantWaiter` | Answers replicator barriers from a FastRing event loop | Replicator, FastRing |
+| `InstantDiscovery` | Finds and announces replicator peers with Avahi (mDNS) | Replicator, Avahi |
 
-```ini
-[Unit]
-After=dbus.service
+The order of the chain matters: the indexer assigns the UUID on allocation, so it must come before
+the replicator, and the tracker comes first so that shares are protected before anyone else sees
+them.
 
-[Service]
-Type=notify
-FileDescriptorStoreMax=4096
-FileDescriptorStorePreserve=yes
-```
+### How a Change Travels
 
-`After=dbus.service` makes the service stop before dbus-daemon, so the query still works during shutdown. `FileDescriptorStorePreserve=yes` keeps the fd store across `stop` + `start` and `soft-reboot`.
+1. The application writes to an object. The first write to a page faults into the tracker thread,
+   which marks the page dirty, lifts its protection and wakes the application loop.
+2. At a safe point the loop runs a **flush cycle**, `FlushReliableTracker()`. Every block on a
+   dirty page whose checksum changed gets a new CRC32C and a new version, and is reported as
+   `RELIABLE_MONITOR_BLOCK_CHANGE`; the cycle ends with `RELIABLE_MONITOR_FLUSH_COMMIT`.
+3. The flusher, if present, synchronizes the changed file. The replicator collects the changes
+   into NOTIFY messages for its peers.
+4. A peer that finds the offered version newer than its own copy asks for the block. Under a
+   barrier on both sides, which the application threads honour by calling
+   `FlushInstantReplicator()`, the block is locked by RDMA compare-and-swap and written into the
+   peer's pool, validated there, and reported as `RELIABLE_MONITOR_BLOCK_ARRIVAL`.
 
-The fd store survives kexec only through LUO, which requires systemd 262 or newer, both kernels built with `CONFIG_KEXEC_HANDOVER`, `CONFIG_LIVEUPDATE` and `CONFIG_LIVEUPDATE_MEMFD` (disabled in stock Debian kernels), `liveupdate=on` on the kernel command line, and the new kernel loaded with `kexec -s` (`kexec_file_load`). `IsLiveUpdateAvailable()` sees only the running kernel.
+Repeated writes between flushes are combined: replication carries versions of state, not a log of
+operations. The design and its measured cost are described in
+[REPLICATION.md](Documentation/REPLICATION.md).
 
-`GetCollapseCause()` was verified on systemd 257 and 262 in arm64 and x86 virtual machines for restart, stop, kill, soft-reboot, kexec, reboot, halt, poweroff and forced reboot, and for restart, stop and kill on x86 bare metal; memfd survival across kexec was verified with a LUO kernel on systemd 262. `IsLiveUpdateAvailable()` and `CanSurvive()` were added after these runs.
+## Getting Started
 
-### Epoch
+The library is a set of C sources without a build of its own: an application compiles the
+components it needs, as the examples do. The steps below follow the examples from the simplest.
 
-Blocks often keep `CLOCK_MONOTONIC` timestamps (last access, expiration). Within one boot they stay valid across restarts and soft-reboot, since the kernel and its clock are the same. After kexec the new kernel starts its own clock: whether it continues the old one depends on the platform and its clock source, and is not guaranteed. A recovered timestamp can then lie far in the future (the entry never expires) or in the past (everything expires at once).
-
-`Epoch` keeps a small record in a memfd named `Epoch`, held by `Rescue`: the boot identifier (`sd_id128_get_boot()`), `CLOCK_MONOTONIC` and `CLOCK_REALTIME` taken as a pair.
-
-- at startup (a constructor, after `Rescue`) it reads the record of the previous instance, computes the correction and immediately stores its own record;
-- at exit (a destructor) it stores the record again, which only narrows the error: any pair of the previous boot is enough;
-- within the same boot the correction is exactly zero; after a boot change it is `monotonic_now − (monotonic_saved + max(0, realtime_now − realtime_saved))`, so the downtime is measured by `CLOCK_REALTIME` and a clock step backwards counts as zero;
-- `GetEpochState()` returns `EPOCH_SAME_BOOT`, `EPOCH_NEW_BOOT`, `EPOCH_UNKNOWN` (no previous record) or a negative errno (the correction stays zero then);
-- `FixEpochTime(time_t)`, `FixEpochCertainTime(struct timeval*)` and `FixEpochPreciseTime(struct timespec*)` apply the correction to a stored value. Zero means "not set" and is kept as is, a result before the start of the current boot is clamped to the smallest non-zero value, so unsigned fields do not wrap around.
-
-The correction has to be applied inside the recovery function, before a recovered timestamp is indexed or compared:
+### 1. A Pool That Survives a Restart
 
 ```c
-static int RecoverSession(struct ReliablePool* pool, struct ReliableBlock* block, void* closure)
+#include "ReliablePool.h"
+
+struct Session
 {
-  struct SessionData* data = (struct SessionData*)block->data;
+  uint32_t client;
+  char state[64];
+};
 
-  FixEpochPreciseTime(&data->time);
-  data->expires = FixEpochTime(data->expires);
+static int Recover(struct ReliablePool* pool, struct ReliableBlock* block, void* closure)
+{
+  struct ReliableDescriptor descriptor;
+  struct Session* session = (struct Session*)block->data;
 
-  /* index the block */
+  if (session->client == 0)
+    return RELIABLE_TYPE_FREE;                         /* not worth keeping */
+
+  RecoverReliableBlock(&descriptor, pool, block);      /* take a reference */
+  /* store the descriptor in the application's own index */
   return RELIABLE_TYPE_RECOVERABLE;
 }
+
+int handle = memfd_create("Sessions", MFD_CLOEXEC);   /* or GetRescuedHandle(), or open() a file */
+struct ReliablePool* pool = CreateReliablePool(handle, "Sessions", sizeof(struct Session),
+                                               RELIABLE_FLAG_RESET, NULL, Recover, NULL);
+
+struct ReliableDescriptor descriptor;
+struct Session* session = AllocateReliableBlock(&descriptor, pool, RELIABLE_TYPE_RECOVERABLE);
+
+/* ... use session ... */
+
+ReleaseReliableBlock(&descriptor, RELIABLE_TYPE_FREE);        /* the object is gone */
+/* or RELIABLE_TYPE_RECOVERABLE: keep it for the next start */
+
+ReleaseReliablePool(pool);                                    /* the handle is closed with the last reference */
 ```
 
-The record of the new instance is stored before any pool is recovered, so a crash inside recovery never applies the correction twice; the price is that blocks left unrecovered by such a crash keep the old time base, and lifetime checks should bound them. The first start of a version that links `Epoch` sees no record and applies no correction.
+`RELIABLE_FLAG_RESET` makes this process the owner: when the descriptor already holds a pool, all
+reference counts are reset and the recovery function is called for every recoverable block. A
+`memfd` survives a restart only when it is kept by systemd; `Tools/Rescue` does that, and
+`Tools/Collapse` tells on `SIGTERM` whether the state will survive. How to validate recovered
+objects and how to stop is described in [RECOVERY.md](Documentation/RECOVERY.md). C++ code can
+use `ReliableHolder<T>` and `ReliableAllocator<T>` ([API.md](Documentation/API.md#c-helpers)).
+
+See `Examples/Basic` and `Examples/CPP`.
+
+### 2. Tracking Changes
+
+Put a tracker (and optionally an indexer and your own monitor) in the chain and let the
+event loop run flush cycles:
+
+```c
+struct ReliableIndexer* indexer = CreateReliableIndexer(&monitor);
+struct ReliableTracker* tracker = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
+struct ReliablePool* pool       = CreateReliablePool(handle, "Test", 50, RELIABLE_FLAG_RESET, &tracker->super, NULL, NULL);
+
+struct FastRing* ring = CreateFastRing(0);
+struct FastRingDescriptor* waiter = SubmitReliableWaiter(ring, tracker);   /* calls FlushReliableTracker() */
+```
+
+`CreateReliableTracker()` returns an object even without `userfaultfd`; check that
+`RELIABLE_TRACKER_STATE_ACTIVE` is set and `RELIABLE_TRACKER_STATE_FAILURE` is clear in
+`tracker->state`. The pool must be backed by shmem (`memfd`, tmpfs) or hugetlbfs. Without FastRing, wake the loop from
+`RELIABLE_MONITOR_SHARE_CHANGE` and call `FlushReliableTracker()` there (`Examples/UV`).
+
+See `Examples/Advanced`.
+
+### 3. Replicating Between Nodes
+
+Add a replicator after the indexer, answer its barrier from the loop and let discovery find the
+peers:
+
+```c
+struct InstantReplicator* replicator = CreateInstantReplicator(0, NULL, "Test", "Secret", 0, 0, HandleReplicatorEvent, NULL, &monitor);
+struct ReliableIndexer* indexer      = CreateReliableIndexer(&replicator->super);
+struct ReliableTracker* tracker      = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
+struct ReliablePool* pool            = CreateReliablePool(handle, "Test", 50, 0, &tracker->super, NULL, NULL);
+
+SubmitReliableWaiter(ring, tracker);
+SubmitInstantWaiter(ring, replicator);                    /* calls FlushInstantReplicator() */
+CreateInstantDiscovery(CreateFastAvahiPoll(ring), replicator);
+```
+
+All nodes use the same replication group name and secret. Blocks of the peers appear in the local
+pool without a reference and are announced by `RELIABLE_MONITOR_BLOCK_ARRIVAL`; a node that takes
+over an object takes a reference with `RecoverReliableBlock()`, as in recovery. Releasing the stack goes in reverse,
+with the replicator before the indexer it uses.
+
+See `Examples/RDMA` and, for a libuv loop, `Examples/UV`.
+
+## Execution Contract
+
+Change detection is transparent to the code that writes objects, but not to the code that runs
+the loop. An application using the tracker or the replicator must follow these rules.
+
+**A flush cycle is a consistency point.** `FlushReliableTracker()` reads the objects and publishes
+what it reads as a version, so it must be called when the objects are in a consistent, idempotent
+state: from the main loop between events, or under the application's global lock. No other thread
+may modify pool objects during the call. There is no WAL and no deferred flushing: the cycle is
+the checkpoint.
+
+**Flushes are driven by the loop.** The tracker thread only signals that pages became dirty. The
+loop reacts with `ReliableWaiter` or, without FastRing, with its own wake-up from
+`RELIABLE_MONITOR_SHARE_CHANGE`, which runs on the tracker thread and must do nothing more than
+signal. A busy loop flushes less often with larger batches, an idle one flushes often with small
+batches; no tuning is needed.
+
+**The replicator barrier is answered by the writers.** To transfer blocks the replicator raises a
+barrier and delivers `INSTANT_REPLICATOR_EVENT_FLUSH` on its own thread. The application forwards
+it to its loop (`InstantWaiter` does this), which calls `FlushInstantReplicator()` at a safe
+point and stays parked there until the barrier is released. Calling it from the event handler
+itself would deadlock. While the caller is parked, the replicator writes into pool memory and
+delivers `RELIABLE_MONITOR_BLOCK_ARRIVAL` and `RELIABLE_MONITOR_BLOCK_REMOVAL` on its thread;
+no other thread may modify pool objects, since parking one thread does not stop the others.
+
+**The barrier waits for the peers.** A receiver keeps its barrier raised while the sender reaches
+its own, so the parked time of one node includes the response time of the other, and a failed
+peer holds the barrier until its `timeout` (1 s by default) closes the connection. An application
+that cannot afford its thread waiting on that path should move the writers and the safe point to
+a thread of their own; see [Timeouts](Documentation/REPLICATION.md#timeouts).
+
+**Monitors are called synchronously.** Event handlers run on the thread that causes the event
+and must be short. A monitor that keeps state for the duration of a flush cycle keeps it in
+thread-local storage.
+
+**Shutdown.** Stop the loop, run a last `FlushReliableTracker()`, cancel the waiters and release
+discovery, then release the objects, the pools, the replicator, the tracker and the indexer, in
+this order.
 
 ## Replication Model Boundaries
 
-`InstantReplicator` is a consensus-free monotonic version-selection replication with per-block granularity. Its guarantees end at well-defined boundaries; they are design choices, not defects.
+`InstantReplicator` is a consensus-free monotonic version-selection replication with per-block
+granularity. It brings the latest version of each block to the peers on a best-effort basis and
+protects the integrity of what a receiver accepts. Replication is asynchronous to the application:
+a local write is not an acknowledgment that any peer has it, several blocks delivered together are
+not a transaction, and recent changes can be lost when their node fails. The protocol does not
+elect owners; which node modifies an object is up to the application and its clients. The design
+is explained in [REPLICATION.md](Documentation/REPLICATION.md#design-context).
+
+Replication and restart recovery are two ways to keep the same state. Using both for one pool is
+not recommended: choose either recovery or replication.
+
+Its guarantees end at well-defined boundaries; they are design choices, not defects.
 
 Trust boundary:
 
-- The HMAC handshake authenticates a peer at connect time, but the handshake blob is static: the nonce and the digest are generated once per replicator instance and resent on every connect — there is no challenge/response and no replay cache. A captured blob is sufficient to authenticate as that peer while the real peer is disconnected.
-- After the handshake the data plane is raw RC verbs, and every authenticated peer holds RDMA write access to entire shares.
-- The effective trust boundary is therefore the fabric itself: the protocol is intended for a closed RDMA fabric (a single network segment) where the ability to capture or inject traffic already implies full compromise.
+- The HMAC handshake authenticates a peer at connect time, but the handshake blob is static: the
+  nonce and the digest are generated once per replicator instance and resent on every connect.
+  There is no challenge/response and no replay cache. A captured blob is sufficient to
+  authenticate as that peer while the real peer is disconnected.
+- After the handshake the data plane is raw RC verbs, and every authenticated peer holds RDMA
+  write access to entire shares.
+- The effective trust boundary is therefore the fabric itself: the protocol is intended for a
+  closed RDMA fabric (a single network segment) where the ability to capture or inject traffic
+  already implies full compromise.
 
 Convergence boundary:
 
-- Version selection is monotone per block: a node never accepts a version older than the one it committed to. Delivery of the selected version is a separate matter — see the next point.
-- The offered version is recorded before the transfer completes; when the transfer is abandoned (peer death, disconnect), the block lock is rolled back but the recorded version is not, so re-offers of the same and older versions are pruned until the block changes again anywhere. This is an accepted tradeoff, not a fundamental limit: local bookkeeping could allow retrying an equal version after a failure, at the cost of extra state in the selector invariant.
-- At runtime the application-visible signal is `RELIABLE_MONITOR_BLOCK_DAMAGE` (transfer validation retries exhausted); a fetch abandoned by disconnect is silent and heals with the next change. Across restarts, stale-data decisions belong to the recovery callback.
+- Version selection is monotone per block: a node never accepts a version older than the one it
+  committed to. Delivery of the selected version is a separate matter; see the next point.
+- The offered version is recorded before the transfer completes; when the transfer is abandoned
+  (peer death, disconnect), the block lock is rolled back but the recorded version is not, so
+  re-offers of the same and older versions are pruned until the block changes again anywhere.
+  This is an accepted tradeoff, not a fundamental limit: local bookkeeping could allow retrying an
+  equal version after a failure, at the cost of extra state in the selector invariant.
+- Removals have no tombstones: they are sent only to connected peers and the removal queue is not
+  persistent, so a peer that was away keeps copies of objects released meanwhile ("zombies").
+  `RemoveUnusedReliableBlockList()` can drop unreferenced copies that have not changed since a
+  given time.
+- At runtime the application-visible signal is `RELIABLE_MONITOR_BLOCK_DAMAGE` (transfer
+  validation retries exhausted); a fetch abandoned by disconnect is silent and heals with the next
+  change. Across restarts, stale-data decisions belong to the recovery function.
+
+Peers and timeouts:
+
+- Connections are accepted only from registered peers with the same group name and secret.
+  `InstantDiscovery` is the intended way peers are found. A peer that cannot be reached for
+  `CONNECTION_ATTEMPT_COUNT` (128) attempts in a row, one per 200 ms tick at most, so after at
+  least about 25 s, is forgotten; discovery registers it again when it announces itself, while an
+  application that registers peers statically has to register them again itself.
+- A peer that stops answering without breaking the connection is disconnected after the
+  `timeout` of `CreateInstantReplicator()`, 1 s by default, when a transfer waiting for it does
+  not advance or its credit window stays used up while it sends nothing. It is caught up by
+  syncing after it connects again. See [Timeouts](Documentation/REPLICATION.md#timeouts).
 
 Clocks:
 
 - A deployment using `InstantReplicator` should provide every node with a stable,
-  well-synchronized `CLOCK_REALTIME`. PTP is preferred; NTP is suitable only when
-  its worst-case offset and jitter stay comfortably below the 16.7 ms epoch
-  quantum. Bring the clocks into agreement before starting the replicators and
-  avoid backward wall-clock steps while they are running.
-- For KVM guests, synchronize the physical hosts and carry each host clock into its
-  guests through the `ptp_kvm` PHC (commonly `/dev/ptp0`), using `chronyd` or
-  `phc2sys` to discipline the guest `CLOCK_REALTIME`. `kvm-clock` by itself is a
-  clocksource, not wall-clock synchronization. Guests on different physical hosts
-  remain only as well synchronized as those hosts are.
-- Cross-node version comparison relies on a one-way CLOCK exchange driven by the periodic 200 ms timer; there is no RTT correction, so every measurement is lowered by its transport, queueing and processing delay. The receiver takes the vector from the largest of the last `INSTANT_CLOCK_COUNT` (8) measurements of a peer, about 1.6 s, which is the one with the smallest delay; a backward step of the remote clock is therefore followed only after the window has passed.
-- The ideal clock-offset component of the normalization telescopes across relay chains, but the one-way measurement error does not: it accumulates per hop, so the same version delivered via different routes carries different jitter. Comparisons between versions authored by different nodes additionally see the static clock offset doubled rather than cancelled. The vector is the measured offset rounded to the epoch (16.7 ms), so offsets well below half an epoch (8.3 ms) yield a stable vector unless every measurement of the window is delayed by the rest of the half epoch; an offset near half an epoch still flips the vector by one epoch between measurements, and a flip between two close versions of the same author can make the newer one look older, so it is skipped until the block changes again. Larger offsets skew cross-author freshness decisions until the clocks are fixed.
-- After a backward wall-clock step, the epoch counter keeps ratcheting forward with flush activity, so normalization of that node's versions stays skewed until its wall clock overtakes the counter — a window at least as long as the step, extended by the minting rate.
+  well-synchronized `CLOCK_REALTIME`. PTP is preferred; NTP is suitable only when its worst-case
+  offset and jitter stay comfortably below the 16.7 ms epoch quantum. Bring the clocks into
+  agreement before starting the replicators and avoid backward wall-clock steps while they are
+  running.
+- For KVM guests, synchronize the physical hosts and carry each host clock into its guests through
+  the `ptp_kvm` PHC (commonly `/dev/ptp0`), using `chronyd` or `phc2sys` to discipline the guest
+  `CLOCK_REALTIME`. `kvm-clock` by itself is a clocksource, not wall-clock synchronization. Guests
+  on different physical hosts remain only as well synchronized as those hosts are.
+- Cross-node version comparison relies on a one-way CLOCK exchange driven by the periodic 200 ms
+  timer; there is no RTT correction, so every measurement is lowered by its transport, queueing
+  and processing delay. The receiver takes the vector from the largest of the last
+  `INSTANT_CLOCK_COUNT` (8) measurements of a peer, about 1.6 s, which is the one with the smallest
+  delay; a backward step of the remote clock is therefore followed only after the window has
+  passed.
+- The ideal clock-offset component of the normalization telescopes across relay chains, but the
+  one-way measurement error does not: it accumulates per hop, so the same version delivered via
+  different routes carries different jitter. Comparisons between versions authored by different
+  nodes additionally see the static clock offset doubled rather than cancelled. The vector is the
+  measured offset rounded to the epoch (16.7 ms), so offsets well below half an epoch (8.3 ms)
+  yield a stable vector unless every measurement of the window is delayed by the rest of the half
+  epoch; an offset near half an epoch still flips the vector by one epoch between measurements,
+  and a flip between two close versions of the same author can make the newer one look older, so
+  it is skipped until the block changes again. Larger offsets skew cross-author freshness
+  decisions until the clocks are fixed.
+- After a backward wall-clock step, the epoch counter keeps ratcheting forward with flush
+  activity, so normalization of that node's versions stays skewed until its wall clock overtakes
+  the counter: a window at least as long as the step, extended by the minting rate.
 
-Design and testing:
+Optimistic mode:
 
-- The design of the replication, its load testing on an InfiniBand testbed, the measured cost of the synchronous transfer and the open issues are described in [REPLICATION.md](REPLICATION.md); the test tool is `Tests/Replication`.
+- `INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE` lets the receiver read offered blocks by RDMA READ
+  under its own barrier, without the sender's barrier, and falls back to the synchronous transfer
+  for blocks that fail validation. It reduces the parking of the application thread at the price
+  of DAMAGE on copies overwritten by a rejected read. It is off by default; see
+  [Optimistic Mode](Documentation/REPLICATION.md#optimistic-mode).
+
+Testing:
+
+- The replication was load-tested on an InfiniBand and RoCE testbed; throughput, latency, barrier
+  cost, failure scenarios, known issues and fixed defects are reported in
+  [REPLICATION.md](Documentation/REPLICATION.md). The test tool is `Tests/Replication`.
+
+## Requirements and Build
+
+| Component | Requires |
+|---|---|
+| `ReliablePool` | Linux (`memfd`, OFD locks), libuuid |
+| `ReliableTracker` | `userfaultfd` with synchronous write protection (`UFFD_FEATURE_PAGEFAULT_FLAG_WP`), implemented by the kernel for shmem (`memfd`, tmpfs, Linux 5.19 or newer) and hugetlbfs mappings but not by disk file systems such as ext4, xfs and btrfs (see [Supported Memory](Documentation/API.md#supported-memory)); libsystemd (machine ID), `Tools/CRC32C` |
+| `ReliableIndexer` | `Tools/HashMap`, `Tools/RedBlackTree` |
+| `ReliableWaiter`, `InstantWaiter` | [FastRing](https://github.com/cyanide-burnout/FastRing), io_uring futex operations (Linux 6.7 or newer) |
+| `InstantReplicator` | liburing (io_uring futex operations, Linux 6.7 or newer; multishot timeouts, 6.4), libibverbs, librdmacm, OpenSSL (HMAC-SHA1), an RDMA adapter with remote atomics |
+| `InstantDiscovery` | avahi-client and a running avahi-daemon |
+| `Tools/Rescue`, `Collapse`, `Epoch` | libsystemd; systemd 254 or newer for the fd store setup in [RECOVERY.md](Documentation/RECOVERY.md#collapse) |
+
+Privileges:
+
+- `userfaultfd` needs `CAP_SYS_PTRACE` when `vm.unprivileged_userfaultfd` is 0, which is the
+  default. Without it the tracker stays inactive.
+- RDMA memory registration of the pools and buffers needs `CAP_IPC_LOCK` or a sufficient
+  `RLIMIT_MEMLOCK`.
+
+The examples expect FastRing checked out next to this repository (`../FastRing`) and use
+`pkg-config` for the other dependencies:
+
+```bash
+make -C Examples/RDMA
+```
+
+```bash
+sudo setcap cap_sys_ptrace,cap_ipc_lock=ep Examples/RDMA/test
+```
 
 ## Examples
 
-All examples are self-contained and have their own `Makefile`.
+The examples are didactic: they show the wiring and leave out error handling. Each has its own
+`Makefile` and builds `test` in its directory.
 
-Build and run pattern:
+| Example | Shows |
+|---|---|
+| `Examples/Basic` | Pool lifecycle on a file (`test.dat`), recovery function, allocation and release |
+| `Examples/CPP` | `ReliableHolder<T>` and recovery into C++ objects |
+| `Examples/Advanced` | Local tracking without RDMA: tracker, indexer and `ReliableWaiter` on a FastRing loop over a `memfd` pool, printing allocations, releases and changes |
+| `Examples/RDMA` | Full replication stack on a `memfd`: tracker, indexer, replicator, both waiters and Avahi discovery |
+| `Examples/UV` | The replication stack on libuv, bridging `RELIABLE_MONITOR_SHARE_CHANGE` and `INSTANT_REPLICATOR_EVENT_FLUSH` through `uv_async_send()` |
 
-- `make -C Examples/<Name>`
-- `./Examples/<Name>/test`
+`Lua/` contains a Lua binding of the core pool, described in [LUA.md](Documentation/LUA.md).
 
-### Basic (`Examples/Basic`)
+## Repository Layout
 
-- Minimal `ReliablePool` lifecycle.
-- Uses file-backed pool (`test.dat`), recovery callback, allocation/release flow.
-- Good first step to verify persistence and recovery semantics.
+| Path | Content |
+|---|---|
+| `Pool/` | The library components |
+| `Tools/` | CRC32C, HashMap and RedBlackTree used by the components; Rescue, Collapse and Epoch for restarts under systemd |
+| `Examples/` | Examples, see above |
+| `Tests/Replication` | Load generator and verifier for replication, `Compare.py` for the dumps |
+| `Lua/` | Lua module |
+| `Documentation/` | Reference and design documents |
 
-### CPP (`Examples/CPP`)
+## Documentation
 
-- C++ wrapper usage through `ReliableHolder<T>`.
-- Demonstrates RAII-style block ownership and recovery callback integration.
-- Good first step for C++ API consumers.
+- [API.md](Documentation/API.md): functions, events, constants and limits of every component.
+- [RECOVERY.md](Documentation/RECOVERY.md): durability, the recovery function, stop or restart,
+  Rescue, Collapse and Epoch, sharing a pool between processes.
+- [REPLICATION.md](Documentation/REPLICATION.md): the replication design, optimistic mode, the
+  testbed results, known issues and fixed defects.
+- [LUA.md](Documentation/LUA.md): the Lua module.
 
-### Advanced (`Examples/Advanced`)
+## License
 
-- Local tracking pipeline without RDMA.
-- Combines `ReliableTracker` + `ReliableFlusher` + `ReliableIndexer` + `ReliableWaiter` on a `FastRing` loop.
-- Generates random block activity on a file-backed pool (`test.dat`), prints monitor events and reports `ReliableFlusher` confirmation status on shutdown.
-- Requires FastRing: https://github.com/cyanide-burnout/FastRing
-
-### RDMA (`Examples/RDMA`)
-
-- Full replication stack example.
-- Combines `ReliableTracker`/`ReliableIndexer` with `InstantReplicator`, `InstantWaiter`, and `InstantDiscovery` (`avahi`).
-- Use to validate peer discovery and block replication behavior across nodes.
-- Requires an RDMA adapter with remote atomic support; adapters without the required atomic capabilities are rejected before the peer is considered connected.
-- Requires FastRing: https://github.com/cyanide-burnout/FastRing
-
-### UV (`Examples/UV`)
-
-- Event-loop integration variant based on `libuv`.
-- Uses `uv_async_send` bridge callbacks for:
-  - `RELIABLE_MONITOR_SHARE_CHANGE -> FlushReliableTracker(...)`
-  - `INSTANT_REPLICATOR_EVENT_FLUSH -> FlushInstantReplicator(...)`
-- Use when embedding ReliablePool/InstantReplicator into a `libuv` runtime.
-
-## Lua Module
-
-Location:
-
-- `Lua/Module.c`
-- `Lua/Test.lua`
-
-Build:
-
-- `make -C Lua`
-
-Run example:
-
-- `cd Lua && ./Test.lua`
-
-Lua API:
-
-- `local module = require("ReliablePool")`
-- `pool = module.open(path_or_fd, name, length[, recover])`
-- `block = pool:allocate([type])`
-- `block = pool:attach(number[, tag])`
-- `result = pool:update()`
-- `pool:close()`
-- `block:release([type])`
-- `valid = block:verify()`
-
-Open semantics:
-
-- If `path_or_fd` is string, module opens file with `O_RDWR | O_CREAT` and mode `0660`.
-- If `path_or_fd` is number, it is treated as file descriptor.
-- Pool owns descriptor lifetime and closes it on `pool:close()` / `__gc`.
-- If `recover` callback is provided, module automatically sets `RELIABLE_FLAG_RESET`.
-
-Recover callback:
-
-- Signature: `recover(block)`.
-- Use `block:verify()` to check the CRC32C previously stored by `ReliableTracker` before keeping a recovered block.
-- Return value is ignored.
-- C callback always returns `RELIABLE_TYPE_RECOVERABLE`.
-- Callback errors are swallowed (do not abort `open`).
-- Keep `block` in Lua scope/table if it must survive callback scope.
-
-Block properties:
-
-- Read-only: `type`, `number`, `count`, `mark`, `tag`, `identifier`
-- Read/write: `length`, `data` (binary Lua string)
-
-Pool properties:
-
-- Read-only: `size`, `length`
-
-Defaults:
-
-- `pool:allocate()` default type: `RELIABLE_TYPE_NON_RECOVERABLE`
-- `pool:attach(number)` default tag: `UINT32_MAX`
-- `block:release()` default type: `RELIABLE_TYPE_FREE`
+See [LICENSE](LICENSE).
