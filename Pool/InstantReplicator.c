@@ -2844,7 +2844,7 @@ static void DisconnectQueuePair(struct InstantReplicator* replicator, struct Ins
   if ((peer != NULL) &&
       (peer->state == INSTANT_PEER_STATE_CONNECTED))
   {
-    // Only a new connection recovers the QP in the error state
+    // Only a new connection recovers the QP in the error state, TrackPeerList() closes it if the peer does not answer
     rdma_disconnect(descriptor);
   }
 }
@@ -3244,15 +3244,31 @@ static int TryConnect(struct InstantReplicator* replicator, struct InstantPeer* 
 
 static void TrackPeerList(struct InstantReplicator* replicator)
 {
+  struct ibv_qp_init_attr initialization;
+  struct rdma_cm_id* descriptor;
+  struct ibv_qp_attr attribute;
+  struct InstantPeer* previous;
   struct InstantPeer* peer;
   struct InstantPeer* next;
-  struct InstantPeer* previous;
+  int result;
 
   pthread_mutex_lock(&replicator->lock);
 
   for (previous = NULL, peer = replicator->peers; peer != NULL; peer = next)
   {
     next = peer->next;
+
+    if ((peer->state  == INSTANT_PEER_STATE_CONNECTED) &&
+        (descriptor   = peer->descriptor)              &&
+        (descriptor->qp != NULL)                       &&
+        (ibv_query_qp(descriptor->qp, &attribute, IBV_QP_STATE, &initialization) == 0) &&
+        (attribute.qp_state == IBV_QPS_ERR))
+    {
+      // A QP failed by DisconnectQueuePair() is closed on the next tick, after its flushed completions have been handled:
+      // a peer that does not answer DREQ would otherwise keep the connection until RDMA_CM_EVENT_DISCONNECTED times out
+      result = HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED);
+      DestroyDescriptor(descriptor, result);
+    }
 
     if ((peer->descriptor == NULL) &&
         (peer->state      == INSTANT_PEER_STATE_DISCONNECTED))
@@ -3316,6 +3332,7 @@ static void TrackTaskList(struct InstantReplicator* replicator)
   struct rdma_cm_id* descriptor;
   struct InstantTask* task;
   struct InstantPeer* peer;
+  int result;
 
   pthread_mutex_lock(&replicator->lock);
 
@@ -3333,7 +3350,8 @@ static void TrackTaskList(struct InstantReplicator* replicator)
       // The peer stopped answering without breaking the connection and the transfer holds the barrier;
       // a stopped peer never answers DREQ either, so the connection is closed here as by ClosePeerList(),
       // ClearTaskList() removes the tasks of the peer and the peer is caught up after a reconnect
-      DestroyDescriptor(descriptor, HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED));
+      result = HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED);
+      DestroyDescriptor(descriptor, result);
       task = replicator->schedule.head;
       continue;
     }
@@ -3356,6 +3374,7 @@ static void TrackCreditList(struct InstantReplicator* replicator)
   uint32_t window;
   uint32_t count;
   uint32_t used;
+  int result;
 
   pthread_mutex_lock(&replicator->lock);
 
@@ -3385,7 +3404,8 @@ static void TrackCreditList(struct InstantReplicator* replicator)
         // The peer stopped receiving without breaking the connection, the messages and the transfers wait for it;
         // a stopped peer never answers DREQ either, so the connection is closed here as by ClosePeerList(),
         // that releases them and the peer is caught up after a reconnect
-        DestroyDescriptor(descriptor, HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED));
+        result = HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED);
+        DestroyDescriptor(descriptor, result);
       }
     }
 
@@ -3453,6 +3473,7 @@ static void ClosePeerList(struct InstantReplicator* replicator)
 {
   struct rdma_cm_id* descriptor;
   struct InstantPeer* peer;
+  int result;
 
   pthread_mutex_lock(&replicator->lock);
 
@@ -3462,7 +3483,8 @@ static void ClosePeerList(struct InstantReplicator* replicator)
         (peer->state != INSTANT_PEER_STATE_FAILED))
     {
       // The same order as for a lost connection: stop DMA, abandon unfinished transfers, then release the barrier
-      DestroyDescriptor(descriptor, HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED));
+      result = HandleDisconnected(replicator, descriptor, RDMA_CM_EVENT_DISCONNECTED);
+      DestroyDescriptor(descriptor, result);
     }
   }
 

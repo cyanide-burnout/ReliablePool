@@ -968,7 +968,12 @@ These issues were reproduced on the testbed and are open.
    shown, that defect 8 was the trigger.
 3. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
-   (see [Replication Model Boundaries](README.md#replication-model-boundaries)).
+   (see [Replication Model Boundaries](README.md#replication-model-boundaries)). A zombie can
+   also be damaged: a transfer abandoned by the disconnect leaves its copy damaged in either mode,
+   and when the object is gone at its author no later version repairs it. After a restart the
+   author has lost its list of released objects, so `Compare.py` cannot confirm that the object
+   was released and reports such a copy as unknown (exit `3`), as in a synchronous kill over
+   [RoCE](#roce).
 
 ## Defects Found and Fixed
 
