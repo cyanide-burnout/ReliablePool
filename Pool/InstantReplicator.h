@@ -289,15 +289,16 @@ struct InstantPeer
   struct rdma_cm_id* descriptor;
 
   struct InstantCard* card;
-  struct InstantRequestQueue queue;
+  struct InstantRequestQueue pending;    // Work requests not posted yet
+  struct InstantRequestQueue submitted;  // Posted SENDs until their completion, their buffers are released if the QP is destroyed
   struct InstantCredit credit;
 
   uint32_t state;         // INSTANT_PEER_STATE_*
   uint32_t round;         // Round-robin index of points
   uint32_t fails;         // Connection failures count
-  uint32_t pending;       // SEND work requests in flight
   uint32_t lost;          // Count of notifications not sent to the peer
   uint32_t last;          // Value of lost at the start of the last syncing
+  uint32_t outstanding;   // SEND work requests queued or posted and not completed yet
   uint32_t delivered;     // Sequence of the next queued message to send
   int64_t vector;         // Clock vector in units of mark epoch
 

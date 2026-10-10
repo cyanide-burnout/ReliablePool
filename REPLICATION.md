@@ -906,7 +906,7 @@ Since the timeouts of defect 15, a stop longer than about 1 s closes the connect
 the frozen node is used within a fraction of a second at 5 000 ops/s, the survivor closes the
 connection about 1 s later and connects again after `SIGCONT`, when the initial syncing catches the
 frozen node up. The removals of the survivor during the stop are lost with the connection, so a
-15 s freeze leaves about 2 200 zombies of the survivor on the frozen node (Known Issue 3), where a
+15 s freeze leaves about 2 200 zombies of the survivor on the frozen node (Known Issue 4), where a
 connection kept open had left none.
 
 The final series of 2026-10-09 repeated the scenarios in both modes at 5 000 ops/s with 30 % frees
@@ -966,7 +966,12 @@ These issues were reproduced on the testbed and are open.
    occurred in 20 runs: 12 at 20 000 ops/s, 4 at 10 000 ops/s with payloads up to 4 000 B and 4 at
    higher rates. The cause was not determined, so it is only likely, not
    shown, that defect 8 was the trigger.
-3. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
+3. **A stale copy in a run without failures.** One optimistic load run at 5 000 ops/s on
+   2026-10-10 left one block on node B with an older version than its author held: the author
+   wrote the newer version about 0.4 s before it stopped writing, and it did not arrive during the
+   15 s quiescence, with no task left, no DAMAGE and no disconnect. Five repeated runs, and about
+   25 load runs before, converged. The cause was not determined.
+4. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
    (see [Replication Model Boundaries](README.md#replication-model-boundaries)). A zombie can
    also be damaged: a transfer abandoned by the disconnect leaves its copy damaged in either mode,
@@ -980,7 +985,8 @@ These issues were reproduced on the testbed and are open.
 The following defects were found by this test: 1–4 are fixed in `d39b85d`, 5–7 in `eacacff`,
 8 and 9 after `eacacff`. Defects 10 and 11 were found by code review while specifying the
 [Optimistic Mode](#optimistic-mode) and are fixed in both modes by the token revision, defects
-12–15 after it, and defect 16 was found by the first run over RoCE.
+12–15 after it, defect 16 was found by the first run over RoCE and defect 17 by a count of free
+shared buffers added to the test afterwards.
 
 1. **Removals raced the tracker flush.** `ApplyRemoval()` freed blocks on the replicator tick
    outside the LOCK/READY barrier. A concurrent `FlushReliableTracker()` could see the block as
@@ -1162,7 +1168,7 @@ the runs: parking 5.0–5.5 s optimistic and 9.5–10.2 s synchronous per node o
 delivered versions.
 
 15. **A stopped peer held the barrier and the queues without a limit.** The barrier waited for its
-    transfers without a timeout (formerly Known Issue 3): a RETRIEVE lost without a QP error, or a
+    transfers without a timeout (formerly a known issue): a RETRIEVE lost without a QP error, or a
     peer that stopped while its HCA still acknowledged the transport, kept LOCK and READY raised
     until the peer resumed. With the credit of defect 14 a stopped peer no longer breaks the
     connection by `RNR`, so the queued messages for it, and a user message waiting for a place in the
@@ -1211,3 +1217,14 @@ more sent message than was received was reported by `Compare.py` as a lost tail.
     of node B crashed with `SIGSEGV` on the first request from node A. Such a request is rejected
     now, and an outgoing connection resolved to such a device fails the same way. With a MAC
     assigned to the virtual function the node GUID is derived from it and the connection works.
+
+
+17. **Shared buffers of posted SENDs leaked on a disconnect.** A SEND holds a reference to its
+    shared buffer until its completion, and the request item was released right after
+    `ibv_post_send()`. `ibv_destroy_qp()` removes the completions of the QP from the shared CQ, so
+    every SEND still in flight when a connection was closed kept its buffer for good: a `kill -9`
+    of node B cost node A 51 of its 2 048 buffers in one run, and repeated disconnects would have
+    drained the pool. The posted SENDs of a peer are now kept in order (`submitted`) until their
+    completions, and `HandleDisconnected()` releases the rest after the QP is destroyed. With the
+    fix all 2 048 buffers were free again after three kills in both modes and five 3 s stops in a
+    row, and load runs were unchanged.

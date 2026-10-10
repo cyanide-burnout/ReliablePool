@@ -760,6 +760,7 @@ static void PrintCounters(const char* label, struct Context* context, struct Cou
   uint32_t delay;
   uint32_t state;
   uint32_t tasks;
+  uint32_t buffers;
   struct timespec time;
   struct InstantRemoval* removal;
 
@@ -788,19 +789,20 @@ static void PrintCounters(const char* label, struct Context* context, struct Cou
   // Replicator internals are read without its lock, the values are for diagnostics only
   state   = atomic_load_explicit(&context->replicator->state, memory_order_relaxed);
   tasks   = context->replicator->schedule.count;
+  buffers = atomic_load_explicit(&context->replicator->buffers.count, memory_order_relaxed);
   removal = context->replicator->removals.head;
   delay   = (removal != NULL) ? (context->replicator->tick - removal->expiration) : 0;
 
   printf(
     "%s t=%.1f writes=%llu frees=%llu arrivals=%llu removals=%llu damages=%llu corrupts=%llu stales=%llu repeats=%llu "
-    "connects=%llu disconnects=%llu latency_us(min=%lld p50=%lld p99=%lld max=%lld) blocks=%u own=%u stamped=%u damaged=%u digest=%016llx state=%x tasks=%u removal_delay=%d "
+    "connects=%llu disconnects=%llu latency_us(min=%lld p50=%lld p99=%lld max=%lld) blocks=%u own=%u stamped=%u damaged=%u digest=%016llx state=%x tasks=%u buffers=%u removal_delay=%d "
     "messages=%llu refused=%llu received=%llu skipped=%llu lost=%llu disorders=%llu wait_max_ms=%.1f\n",
     label, GetElapsedTime(&context->start, &time) / 1e9,
     (unsigned long long)values[0], (unsigned long long)values[1], (unsigned long long)values[2], (unsigned long long)values[3],
     (unsigned long long)values[4], (unsigned long long)values[5], (unsigned long long)values[6], (unsigned long long)values[7],
     (unsigned long long)values[8], (unsigned long long)values[9],
     (long long)latencies[0], (long long)latencies[1], (long long)latencies[2], (long long)latencies[3],
-    blocks, own, stamped, damaged, (unsigned long long)digest, state, tasks, (int32_t)delay,
+    blocks, own, stamped, damaged, (unsigned long long)digest, state, tasks, buffers, (int32_t)delay,
     (unsigned long long)values[10], (unsigned long long)values[11], (unsigned long long)values[12], (unsigned long long)values[13],
     (unsigned long long)values[16], (unsigned long long)values[14], values[15] / 1e6);
 

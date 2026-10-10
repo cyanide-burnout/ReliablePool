@@ -780,6 +780,7 @@ static int AcquirePeerCredit(struct InstantPeer* peer)
 static void ReleasePeerCredit(struct InstantReplicator* replicator, struct InstantCard* card, uint32_t number, uint64_t work)
 {
   struct InstantPeer* peer;
+  struct InstantRequestItem* item;
   struct rdma_cm_id* descriptor;
   struct ibv_qp* pair;
 
@@ -791,11 +792,20 @@ static void ReleasePeerCredit(struct InstantReplicator* replicator, struct Insta
         (descriptor = peer->descriptor) &&
         (pair       = descriptor->qp)   &&
         (pair->qp_num == number)        &&
-        (peer->pending > 0))
+        (peer->outstanding > 0))
     {
       // A SEND of this connection has completed
       peer->credit.buffer = (peer->credit.buffer == (struct InstantSharedBuffer*)work) ? NULL : peer->credit.buffer;
-      peer->pending --;
+      peer->outstanding --;
+
+      if ((item = peer->submitted.head) &&
+          (item->request.wr_id == work))
+      {
+        // SENDs of a QP complete in the order they were posted, the caller releases the buffer
+        AdvanceRequestQueue(&peer->submitted);
+        ReleaseRequestItem(replicator, item);
+      }
+
       break;
     }
   }
@@ -875,8 +885,8 @@ static int SubmitSharedBuffer(struct InstantReplicator* replicator, struct Insta
   item->request.imm_data   = card->number | (peer->credit.received << INSTANT_CREDIT_SHIFT);
 
   atomic_fetch_add_explicit(&buffer->count, 1, memory_order_relaxed);
-  AppendRequestQueue(&peer->queue, item);
-  peer->pending ++;
+  AppendRequestQueue(&peer->pending, item);
+  peer->outstanding ++;
   return 0;
 }
 
@@ -898,7 +908,7 @@ static struct InstantRequestItem* SubmitReadingWork(struct InstantReplicator* re
   item->request.wr.rdma.remote_addr = entry->address + sizeof(uint64_t);
   item->request.wr.rdma.rkey        = key;
 
-  AppendRequestQueue(&peer->queue, item);
+  AppendRequestQueue(&peer->pending, item);
   return item;
 }
 
@@ -936,7 +946,7 @@ static struct InstantRequestItem* SubmitCheckingWork(struct InstantReplicator* r
   item->request.wr.rdma.remote_addr = entry->address;
   item->request.wr.rdma.rkey        = key;
 
-  AppendRequestQueue(&peer->queue, item);
+  AppendRequestQueue(&peer->pending, item);
   return item;
 }
 
@@ -960,7 +970,7 @@ static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* re
   item->request.wr.rdma.remote_addr = entry->address + sizeof(uint64_t);
   item->request.wr.rdma.rkey        = key;
 
-  AppendRequestQueue(&peer->queue, item);
+  AppendRequestQueue(&peer->pending, item);
   item = AllocateRequestItem(replicator);
 
   // The transfer completes with the token assigned by the receiver, never with the mark of the source
@@ -974,7 +984,7 @@ static struct InstantRequestItem* SubmitWritingWork(struct InstantReplicator* re
   item->request.wr.rdma.remote_addr = entry->address;
   item->request.wr.rdma.rkey        = key;
 
-  AppendRequestQueue(&peer->queue, item);
+  AppendRequestQueue(&peer->pending, item);
   return item;
 }
 
@@ -1015,7 +1025,7 @@ static struct InstantRequestItem* SubmitExchangingWork(struct InstantReplicator*
   item->request.wr.atomic.compare_add = entry->mark;
   item->request.wr.atomic.swap        = entry->hint | 1ULL;
 
-  AppendRequestQueue(&peer->queue, item);
+  AppendRequestQueue(&peer->pending, item);
   return item;
 }
 
@@ -1232,9 +1242,9 @@ static void SendMessageList(struct InstantReplicator* replicator)
   {
     for (peer = replicator->peers; peer != NULL; peer = peer->next)
     {
-      if ((peer->state     == INSTANT_PEER_STATE_CONNECTED) &&
-          (peer->delivered == sequence)                     &&
-          (peer->pending   <  credit)                       &&
+      if ((peer->state       == INSTANT_PEER_STATE_CONNECTED) &&
+          (peer->delivered   == sequence)                     &&
+          (peer->outstanding <  credit)                       &&
           (SubmitSharedBuffer(replicator, peer, buffer, INSTANT_CREDIT_ACQUIRE) == 0))
       {
         // Every peer receives the messages in order, SubmitSharedBuffer() increments buffer->count
@@ -1309,7 +1319,7 @@ static void HandleSendingQueue(struct InstantReplicator* replicator, int result)
     {
       // SubmitSharedBuffer() increments buffer->count
       if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
-          ((peer->pending >= credit) ||
+          ((peer->outstanding >= credit) ||
            (SubmitSharedBuffer(replicator, peer, buffer, INSTANT_CREDIT_ACQUIRE) < 0)))
       {
         // A stalled peer neither takes the buffers of the others nor gets more messages than it can receive,
@@ -1455,7 +1465,7 @@ static int ExecuteSyncingTask(struct InstantReplicator* replicator, struct Insta
     return -1;
   }
 
-  if ((task->peer->pending >= (GetPeerCredit(replicator) / 2))                    ||
+  if ((task->peer->outstanding >= (GetPeerCredit(replicator) / 2))                                ||
       ((task->peer->credit.sent - task->peer->credit.acknowledged) >= task->peer->credit.window) ||
       !(buffer = AllocateSharedBuffer(&replicator->buffers, 0, 0)))
   {
@@ -2964,16 +2974,24 @@ static void DrainRequestQueueList(struct InstantReplicator* replicator)
     if ((peer->state == INSTANT_PEER_STATE_CONNECTED) &&
         (descriptor   = peer->descriptor))
     {
-      if (item = peer->queue.head)
+      if (item = peer->pending.head)
       {
         request = NULL;
         result  = ibv_post_send(descriptor->qp, &item->request, &request);
 
-        while ((item = peer->queue.head) &&
+        while ((item = peer->pending.head) &&
                ((result  == 0) ||
                 (request != &item->request)))
         {
-          AdvanceRequestQueue(&peer->queue);
+          AdvanceRequestQueue(&peer->pending);
+
+          if (item->request.opcode == IBV_WR_SEND_WITH_IMM)
+          {
+            // Only its completion releases the buffer, the item keeps it in case the QP is destroyed before
+            AppendRequestQueue(&peer->submitted, item);
+            continue;
+          }
+
           ReleaseRequestItem(replicator, item);
         }
       }
@@ -3101,15 +3119,17 @@ static int HandleDisconnected(struct InstantReplicator* replicator, struct rdma_
       descriptor->qp = NULL;
     }
 
-    ClearRequestQueue(replicator, &peer->queue);
+    // The destroyed QP never completes the posted SENDs, their completions are removed from the shared CQ
+    ClearRequestQueue(replicator, &peer->pending);
+    ClearRequestQueue(replicator, &peer->submitted);
     ClearTaskList(replicator, peer);
 
     memset(&peer->credit, 0, sizeof(struct InstantCredit));
 
-    peer->pending    = 0;
-    peer->state      = INSTANT_PEER_STATE_DISCONNECTED;
-    peer->descriptor = NULL;
-    peer->card       = NULL;
+    peer->outstanding = 0;
+    peer->state       = INSTANT_PEER_STATE_DISCONNECTED;
+    peer->descriptor  = NULL;
+    peer->card        = NULL;
 
     peer->points[peer->round].rank ++;
     peer->fails ++;
@@ -3311,10 +3331,10 @@ static void TrackLossList(struct InstantReplicator* replicator)
 
     for (task = replicator->schedule.head; (task != NULL) && ((task->type != INSTANT_TASK_TYPE_SYNCING) || (task->peer != peer)); task = task->next);
 
-    if ((peer->state   == INSTANT_PEER_STATE_CONNECTED) &&
-        (peer->lost    != peer->last)                   &&
-        (peer->pending <  (credit / 2))                 &&
-        (task          == NULL))
+    if ((peer->state       == INSTANT_PEER_STATE_CONNECTED) &&
+        (peer->lost        != peer->last)                   &&
+        (peer->outstanding <  (credit / 2))                 &&
+        (task              == NULL))
     {
       // Starts once the queue of the peer has drained, notifications lost during this syncing start the next one
       peer->last = peer->lost;
@@ -3690,7 +3710,8 @@ void ReleaseInstantReplicator(struct InstantReplicator* replicator)
     while (peer = replicator->peers)
     {
       replicator->peers = peer->next;
-      ClearRequestQueue(replicator, &peer->queue);
+      ClearRequestQueue(replicator, &peer->pending);
+      ClearRequestQueue(replicator, &peer->submitted);
       DestroyDescriptor(peer->descriptor, 1);
       free(peer);
     }
