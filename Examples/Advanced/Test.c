@@ -12,7 +12,6 @@
 
 #include "ReliablePool.h"
 #include "ReliableTracker.h"
-#include "ReliableFlusher.h"
 #include "ReliableIndexer.h"
 #include "ReliableWaiter.h"
 
@@ -93,7 +92,6 @@ int main(int count, char** arguments)
   struct ReliablePool* pool;
   struct ReliableMonitor monitor;
   struct ReliableTracker* tracker;
-  struct ReliableFlusher* flusher;
   struct ReliableIndexer* indexer;
 
   struct FastRing* ring;
@@ -113,11 +111,10 @@ int main(int count, char** arguments)
 
   monitor.function = HandleMonitorEvent;
 
-  // ReliableFlusher requires a file-backed pool, msync() is a no-op on memfd (tmpfs)
-  handle  = open("test.dat", O_RDWR | O_CREAT, 0666);
+  // ReliableTracker protects shmem (memfd, tmpfs) and hugetlbfs, disk file systems do not implement uffd-wp
+  handle  = memfd_create("Test", MFD_CLOEXEC);
   indexer = CreateReliableIndexer(&monitor);
-  flusher = CreateReliableFlusher(&indexer->super);
-  tracker = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &flusher->super);
+  tracker = CreateReliableTracker(RELIABLE_TRACKER_FLAG_ID_HOST | RELIABLE_TRACKER_FLAG_ID_PROCESS, &indexer->super);
   pool    = CreateReliablePool(handle, "Test", 50, RELIABLE_FLAG_RESET, &tracker->super, NULL, NULL);
 
   ring    = CreateFastRing(0);
@@ -142,16 +139,12 @@ int main(int count, char** arguments)
 
   FlushReliableTracker(tracker);
 
-  if (atomic_load_explicit(&flusher->state, memory_order_relaxed) & RELIABLE_FLUSHER_STATE_FAILURE)  printf("Flusher reported msync() failure\n");
-  else                                                                                               printf("Flusher confirmed all changes on test.dat\n");
-
   SetFastRingTimeout(ring, timeout, -1, 0, NULL, NULL);
   CancelReliableWaiter(waiter);
   ReleaseFastRing(ring);
 
   ReleaseReliablePool(pool);
   ReleaseReliableTracker(tracker);
-  ReleaseReliableFlusher(flusher);
   ReleaseReliableIndexer(indexer);
   close(handle);
 
