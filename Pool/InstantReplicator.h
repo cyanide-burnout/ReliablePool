@@ -125,6 +125,7 @@ struct InstantHeaderData
 #define INSTANT_RESERVE_COUNT   256   // Shared buffers the application thread cannot take, kept for the replicator thread
 #define INSTANT_ATOMIC_COUNT    16    // RDMA READ and atomic operations in flight per QP, limited by the weakest card and the peer
 #define INSTANT_BARRIER_COUNT   1024  // Entries of reading tasks served by one barrier, a backlog is split into several barriers
+#define INSTANT_CLOCK_COUNT     8     // Clock measurements of a peer the vector is taken from, the largest has the smallest delay
 
 #define INSTANT_CREDIT_SHIFT    6     // imm_data of SEND carries the card number in the low bits and the count of received messages above
 #define INSTANT_CREDIT_RESERVE  64    // Receiving buffers kept for credit reports, at most one is in flight per peer
@@ -298,11 +299,13 @@ struct InstantPeer
   uint32_t fails;         // Connection failures count
   uint32_t lost;          // Count of notifications not sent to the peer
   uint32_t last;          // Value of lost at the start of the last syncing
-  uint32_t outstanding;   // SEND work requests queued or posted and not completed yet
   uint32_t delivered;     // Sequence of the next queued message to send
+  uint32_t outstanding;   // SEND work requests queued or posted and not completed yet
+  uint32_t measurements;  // Count of clock measurements since the connect
   int64_t vector;         // Clock vector in units of mark epoch
 
   uuid_t identifier;
+  int64_t differences[INSTANT_CLOCK_COUNT];         // Last clock measurements, each lowered by its delivery delay
   struct InstantPoint points[INSTANT_POINT_COUNT];
 };
 

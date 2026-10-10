@@ -906,7 +906,7 @@ Since the timeouts of defect 15, a stop longer than about 1 s closes the connect
 the frozen node is used within a fraction of a second at 5 000 ops/s, the survivor closes the
 connection about 1 s later and connects again after `SIGCONT`, when the initial syncing catches the
 frozen node up. The removals of the survivor during the stop are lost with the connection, so a
-15 s freeze leaves about 2 200 zombies of the survivor on the frozen node (Known Issue 4), where a
+15 s freeze leaves about 2 200 zombies of the survivor on the frozen node (Known Issue 3), where a
 connection kept open had left none.
 
 The final series of 2026-10-09 repeated the scenarios in both modes at 5 000 ops/s with 30 % frees
@@ -966,12 +966,7 @@ These issues were reproduced on the testbed and are open.
    occurred in 20 runs: 12 at 20 000 ops/s, 4 at 10 000 ops/s with payloads up to 4 000 B and 4 at
    higher rates. The cause was not determined, so it is only likely, not
    shown, that defect 8 was the trigger.
-3. **A stale copy in a run without failures.** One optimistic load run at 5 000 ops/s on
-   2026-10-10 left one block on node B with an older version than its author held: the author
-   wrote the newer version about 0.4 s before it stopped writing, and it did not arrive during the
-   15 s quiescence, with no task left, no DAMAGE and no disconnect. Five repeated runs, and about
-   25 load runs before, converged. The cause was not determined.
-4. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
+3. **Zombies after a peer restart or reconnect** are expected: there are no tombstones, removals
    are sent only to connected peers and the removal queue is not persistent
    (see [Replication Model Boundaries](README.md#replication-model-boundaries)). A zombie can
    also be damaged: a transfer abandoned by the disconnect leaves its copy damaged in either mode,
@@ -986,7 +981,8 @@ The following defects were found by this test: 1–4 are fixed in `d39b85d`, 5�
 8 and 9 after `eacacff`. Defects 10 and 11 were found by code review while specifying the
 [Optimistic Mode](#optimistic-mode) and are fixed in both modes by the token revision, defects
 12–15 after it, defect 16 was found by the first run over RoCE and defect 17 by a count of free
-shared buffers added to the test afterwards.
+shared buffers added to the test afterwards, and defect 18 by tracing a stale copy left in a load
+run without failures.
 
 1. **Removals raced the tracker flush.** `ApplyRemoval()` freed blocks on the replicator tick
    outside the LOCK/READY barrier. A concurrent `FlushReliableTracker()` could see the block as
@@ -1228,3 +1224,17 @@ more sent message than was received was reported by `Compare.py` as a lost tail.
     completions, and `HandleDisconnected()` releases the rest after the QP is destroyed. With the
     fix all 2 048 buffers were free again after three kills in both modes and five 3 s stops in a
     row, and load runs were unchanged.
+
+18. **A delayed CLOCK flipped the vector and dropped a newer version.** The vector was taken from
+    the last CLOCK message alone, and every measurement is lowered by its delivery delay. With the
+    clocks of the testbed about 2.2 ms apart, a CLOCK delayed by more than about 6 ms in a queue or
+    in the processing moved the vector of node A for node B by one epoch (16.7 ms) for 200–400 ms,
+    five times in a 30 s optimistic run at 5 000 ops/s (4 % of the offers). A version offered in
+    such a window, written less than an epoch after the previous version of the same block, looked
+    older than the installed one and was dropped by `CollectReadingBlockList()`; when it was the
+    last write of the block, the copy stayed stale. One load run without failures ended this way
+    (an older version on node B, the newer one written 10 ms later and 0.4 s before the writes
+    stopped). The receiver now takes the vector from the largest of the last 8 measurements, the
+    one with the smallest delay, so a single delayed CLOCK no longer moves it; nothing changes on
+    the wire. With the fix the trace showed no change of the vector in optimistic runs at 5 000
+    and 20 000 ops/s on either node.

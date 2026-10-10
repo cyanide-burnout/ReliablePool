@@ -2148,7 +2148,39 @@ static void CreateTransferTask(struct InstantReplicator* replicator, struct Inst
 
 static void ApplyClock(struct InstantReplicator* replicator, struct InstantPeer* peer, struct timespec* time)
 {
-  peer->vector = GetReliableTrackerClockVector(time);
+  struct timespec now;
+  int64_t difference;
+  int64_t maximum;
+  uint32_t index;
+
+  clock_gettime(CLOCK_REALTIME, &now);
+
+  // The delivery delay of the remote time is included and only lowers the difference
+  difference =
+    (int64_t)((uint64_t)time->tv_sec * 1000000000ULL + (uint64_t)time->tv_nsec) -
+    (int64_t)((uint64_t)now.tv_sec   * 1000000000ULL + (uint64_t)now.tv_nsec);
+
+  for (index = 0; (peer->measurements == 0) && (index < INSTANT_CLOCK_COUNT); ++ index)
+  {
+    // The first measurement of a connection stands for the whole window
+    peer->differences[index] = difference;
+  }
+
+  peer->differences[peer->measurements % INSTANT_CLOCK_COUNT] = difference;
+  peer->measurements ++;
+
+  for (maximum = difference, index = 0; index < INSTANT_CLOCK_COUNT; ++ index)
+  {
+    // A delay in a queue or in the processing only lowers a measurement, the largest recent one is the closest to the offset,
+    // so a single delayed CLOCK does not move the vector by an epoch
+    maximum = (peer->differences[index] > maximum) ? peer->differences[index] : maximum;
+  }
+
+  // The remote time with the smallest delay, the tracker converts it to the vector
+  maximum     += (int64_t)((uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec);
+  now.tv_sec   = maximum / 1000000000LL;
+  now.tv_nsec  = maximum % 1000000000LL;
+  peer->vector = GetReliableTrackerClockVector(&now);
 }
 
 static void HandleReceivedMessage(struct InstantReplicator* replicator, uint8_t* data, uint32_t length, uint32_t number, int status, int flags)
@@ -3078,6 +3110,7 @@ static int HandleEstablished(struct InstantReplicator* replicator, struct rdma_c
   peer->state                    = INSTANT_PEER_STATE_CONNECTED;
   peer->fails                    = 0;
   peer->points[peer->round].rank = 0;
+  peer->measurements             = 0;           // Measurements of an earlier connection are not mixed in
   peer->last                     = peer->lost;  // The initial syncing covers every notification lost before, removals are sent from now on
   peer->delivered                = replicator->messages.sequence + replicator->messages.count;
   peer->credit.expiration        = replicator->tick + replicator->timeout;
