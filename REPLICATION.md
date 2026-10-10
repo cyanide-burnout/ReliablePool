@@ -11,7 +11,8 @@ scenarios; `eacacff` (session recovery fixes) and `eacacff` with defect 8 fixed 
 [20 000 ops/s](#20-000-opss) results; the revision that adds the [Optimistic Mode](#optimistic-mode)
 and the fixes 10–15 for the final series of 2026-10-09 in [Latency](#latency) and
 [Failure Scenarios](#failure-scenarios); the same revision with fix 16 for the
-[RoCE](#roce) runs of 2026-10-10.
+[RoCE](#roce) runs of 2026-10-10; `3b3e73f` (fixes 10–18) for the final series of 2026-10-10 on
+InfiniBand and RoCE.
 The fixes are listed in [Defects Found and Fixed](#defects-found-and-fixed).
 
 ## Design Context
@@ -838,6 +839,22 @@ ms):
 | 20 000 ops/s | optimistic | ~0.66 ms | ~21 ms | 43 / 41 ms |
 | 20 000 ops/s | synchronous | ~1.2 ms | ~22 ms | 66 / 66 ms |
 
+The final series of 2026-10-10 on `3b3e73f`, with fixes 16–18, repeated these runs on InfiniBand
+and the 5 000 ops/s runs on RoCE:
+
+| Rate per node | Fabric | Mode | One-way p50 | One-way p99 | Max (raw, A→B / B→A) |
+|---|---|---|---|---|---|
+| 5 000 ops/s | InfiniBand | optimistic | ~0.23 ms | ~4.8 ms | 27 / 22 ms |
+| 5 000 ops/s | InfiniBand | synchronous | ~0.29 ms | ~5.4 ms | 29 / 32 ms |
+| 20 000 ops/s | InfiniBand | optimistic | ~0.64 ms | ~24 ms | 175 / 53 ms |
+| 20 000 ops/s | InfiniBand | synchronous | ~1.2 ms | ~32 ms | 98 / 100 ms |
+| 5 000 ops/s | RoCE | optimistic | ~0.22 ms | ~4.5 ms | 17 / 17 ms |
+| 5 000 ops/s | RoCE | synchronous | ~0.28 ms | ~5.5 ms | 27 / 30 ms |
+
+The medians repeat. The p99 at 20 000 ops/s is longer than on 2026-10-09 (24–32 ms against
+21–22 ms), each from a single run; at 5 000 ops/s single runs spread by a factor of almost two
+(see below), the spread at 20 000 ops/s was not measured.
+
 The latency covers the whole path from the write to the version seen by the application of the
 peer: change detection by the tracker, the queues, the network, the read or the transfer and the
 barrier of the receiver. The median at 5 000 ops/s is the same as on `d39b85d` (~0.3 ms). The p99
@@ -929,6 +946,16 @@ node A (3 125–3 142), and those of node A on node B after a stop, 483–1 130 
 2 280–2 287 after 7 s and 2 622–2 632 after 15 s. The longest one-way latency on node B, up to
 7.2 s after the 7 s stop and 15.2 s after the freeze, is the age of the versions node A wrote while
 node B was stopped, delivered by the syncing after the reconnect.
+
+The final series of 2026-10-10 on `3b3e73f` repeated all of these scenarios in both modes on
+InfiniBand, and a freeze and a synchronous kill on RoCE, with the stricter check of user messages
+and the count of free shared buffers. All 16 runs converged for the live objects with no corrupt
+or stale arrivals and no damaged blocks left; synchronous runs had no DAMAGE. No user message
+arrived out of order or was lost within a connection, and every stream ended with the last
+message sent. The sender waited 1.0–1.2 s in a stop, and all 2 048 shared buffers were free on
+both nodes at the end of every run. The zombies were those of the killed incarnation
+(3 100–3 145) and, after a stop, 493–620 after 2 s, 2 298–2 318 after 7 s and 2 568–2 643 after
+15 s.
 
 ### RoCE
 
