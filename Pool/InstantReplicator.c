@@ -2706,7 +2706,8 @@ static struct InstantCard* EnsureCard(struct InstantReplicator* replicator, stru
 
   for (card = replicator->cards; (card != NULL) && (card->context != context); card = card->next);
 
-  if ((card == NULL) &&
+  if ((card    == NULL) &&
+      (context != NULL) &&
       (!(other = replicator->cards) ||
         (other->number < (INSTANT_CARD_COUNT - 1)))  &&
       (ibv_query_device(context, &information) == 0) &&

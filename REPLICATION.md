@@ -5,12 +5,13 @@ behaves under load. It explains the design choices behind the protocol and backs
 measurements on a two-node InfiniBand testbed: replication throughput, delivery latency, the cost
 of the replicator barrier, convergence of pool contents and behavior under peer failures.
 
-Testing dates: 2026-10-08 and 2026-10-09.
+Testing dates: 2026-10-08 to 2026-10-10.
 Tested revisions: `d39b85d` (replication barrier fixes) for the load sweep, latency and failure
 scenarios; `eacacff` (session recovery fixes) and `eacacff` with defect 8 fixed for the
 [20 000 ops/s](#20-000-opss) results; the revision that adds the [Optimistic Mode](#optimistic-mode)
 and the fixes 10–15 for the final series of 2026-10-09 in [Latency](#latency) and
-[Failure Scenarios](#failure-scenarios).
+[Failure Scenarios](#failure-scenarios); the same revision with fix 16 for the
+[RoCE](#roce) runs of 2026-10-10.
 The fixes are listed in [Defects Found and Fixed](#defects-found-and-fixed).
 
 ## Design Context
@@ -627,10 +628,11 @@ Node identifiers are derived from the node name (`uuid_generate_sha1()` in the O
 so a restarted process keeps its identity.
 
 Exit status: `0` passed, `1` setup or runtime failure, `2` verification failure
-(corrupt or stale arrivals, DAMAGE without `-O`, user messages out of order or lost without a
-disconnect, or no peer connected). With `-O` a rejected
-optimistic read overwrites the copy, so DAMAGE is expected; the blocks left damaged are judged by
-`Compare.py`, which knows whether the object is still alive at its author.
+(corrupt or stale arrivals, DAMAGE without `-O` in a run without a disconnect, user messages out
+of order or lost within a connection, or no peer connected). With `-O` a rejected optimistic read
+overwrites the copy, and in either mode a disconnect leaves a block locked by the sender written
+in part, so DAMAGE is expected there; the blocks left damaged are judged by `Compare.py`, which
+knows whether the object is still alive at its author.
 
 Example (node A, node B is symmetric):
 
@@ -925,6 +927,31 @@ node A (3 125–3 142), and those of node A on node B after a stop, 483–1 130 
 7.2 s after the 7 s stop and 15.2 s after the freeze, is the age of the versions node A wrote while
 node B was stopped, delivered by the syncing after the reconnect.
 
+### RoCE
+
+On 2026-10-10 the same hosts, adapters and switch were also run over RoCE v2: the second ports of
+the ConnectX-4 cards, in Ethernet mode, on the Ethernet half of the switch (active MTU 1 024 instead
+of 4 096), with the peers given by their Ethernet addresses; the queue pairs were created on the
+RoCE devices. The first run found [defect 16](#defects-found-and-fixed): the RoCE virtual function
+of node B had a zero node GUID until an administrative MAC was assigned to it.
+
+At 5 000 ops/s with 30 % frees and 2 000 user messages per second both modes converged without a
+disconnect, every message arrived, and the one-way median was about 0.22 ms optimistic and
+0.36 ms synchronous. A 15 s freeze in the optimistic mode closed the connection after the timeout,
+the sender waited 1.21 s, and the pair converged after `SIGCONT`. Five `kill -9` runs with a
+restart, four synchronous and one optimistic, converged for the live objects with no corrupt or
+stale arrivals; user messages were missing only across the disconnect and every stream ended with
+the last message sent.
+
+One synchronous kill left 5 DAMAGE on node A, all at the moment of the disconnect: transfers whose
+blocks node B had already locked by CAS when it was killed. The specification requires this (an
+entry locked by `Tk | 1` is touched on a disconnect), so the test now accepts DAMAGE without `-O`
+in a run with a disconnect and leaves the damaged blocks to `Compare.py`. All 5 were copies of
+objects of the killed incarnation that the restarted node no longer held, so `Compare.py` reported
+them as unknown (exit `3`); the other synchronous kills had no DAMAGE. Synchronous DAMAGE was not
+seen on InfiniBand, likely because the window between the CAS and the end of the WRITE is shorter
+there; it was not measured.
+
 ## Known Issues
 
 These issues were reproduced on the testbed and are open.
@@ -948,7 +975,7 @@ These issues were reproduced on the testbed and are open.
 The following defects were found by this test: 1–4 are fixed in `d39b85d`, 5–7 in `eacacff`,
 8 and 9 after `eacacff`. Defects 10 and 11 were found by code review while specifying the
 [Optimistic Mode](#optimistic-mode) and are fixed in both modes by the token revision, defects
-12–15 after it.
+12–15 after it, and defect 16 was found by the first run over RoCE.
 
 1. **Removals raced the tracker flush.** `ApplyRemoval()` freed blocks on the replicator tick
    outside the LOCK/READY barrier. A concurrent `FlushReliableTracker()` could see the block as
@@ -1171,3 +1198,11 @@ within a connection, every stream ended with the last message sent, and the mess
 across a disconnect were those sent while the connection was down (1 040–23 320 per run); a
 restarted node received the stream of its peer from the point of its connection. A dump with one
 more sent message than was received was reported by `Compare.py` as a lost tail.
+
+16. **A connection request without a device context crashed the replicator.** `EnsureCard()`
+    passed `descriptor->verbs` to `ibv_query_device()` without a check. librdmacm leaves it `NULL`
+    when it cannot map the request to a local device; on the testbed the RoCE function of node B, a
+    virtual function without an administrative MAC, had a zero node GUID, and the replicator thread
+    of node B crashed with `SIGSEGV` on the first request from node A. Such a request is rejected
+    now, and an outgoing connection resolved to such a device fails the same way. With a MAC
+    assigned to the virtual function the node GUID is derived from it and the connection works.

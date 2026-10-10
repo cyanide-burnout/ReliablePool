@@ -906,7 +906,8 @@ static void PrintUsage(const char* name)
     "                   and the identifiers of released own blocks (released IDENTIFIER) at exit\n"
     "SIGUSR1 prints totals with the current digest\n"
     "Exit status: 0 = passed, 1 = setup or runtime failure, 2 = verification failure (corrupt or stale arrivals,\n"
-    "DAMAGE without -O, user messages out of order or lost without a disconnect, no peer connected)\n",
+    "DAMAGE without -O and without a disconnect, user messages out of order or lost within a connection,\n"
+    "no peer connected)\n",
     name);
 }
 
@@ -1198,10 +1199,12 @@ int main(int count, char** arguments)
     }
     else if (atomic_load_explicit(&context.total.corrupts, memory_order_relaxed) ||
              atomic_load_explicit(&context.total.stales,   memory_order_relaxed) ||
-             (atomic_load_explicit(&context.total.damages, memory_order_relaxed) &&
+             (atomic_load_explicit(&context.total.damages,     memory_order_relaxed) &&
+              (atomic_load_explicit(&context.total.disconnects, memory_order_relaxed) == 0) &&
               (~options & INSTANT_REPLICATOR_OPTION_OPTIMISTIC_MODE)))
     {
-      // A rejected optimistic read overwrites the copy, so DAMAGE is expected in this mode until a later version repairs it
+      // A rejected optimistic read overwrites the copy, and a disconnect leaves a block locked by the sender written in part,
+      // so DAMAGE is expected in these cases until a later version repairs it
       printf("FAILED: corrupt, damaged or stale arrivals\n");
       result = 2;
     }
